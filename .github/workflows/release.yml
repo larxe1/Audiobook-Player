@@ -114,7 +114,9 @@ jobs:
           mkdir -p android/app/src/main/res/xml
           cp android-auto/AudiobookOAuthBridge.java android/app/src/main/java/com/audiobook/player/AudiobookOAuthBridge.java
           cp android-auto/AudiobookUpdaterBridge.java android/app/src/main/java/com/audiobook/player/AudiobookUpdaterBridge.java
+          cp android-auto/AudiobookMediaBrowserService.java android/app/src/main/java/com/audiobook/player/AudiobookMediaBrowserService.java
           cp android-auto/res/xml/file_paths.xml android/app/src/main/res/xml/file_paths.xml
+          cp android-auto/res/xml/automotive_app_desc.xml android/app/src/main/res/xml/automotive_app_desc.xml
           node << 'EOF'
           const fs = require('fs');
 
@@ -122,7 +124,7 @@ jobs:
           const buildCode = Number(versionMeta.build) || 1;
           const versionName = String(versionMeta.version || '1.0.0');
 
-          // 1. Patch android/app/build.gradle: versionCode/versionName + androidx.browser:browser
+          // 1. Patch android/app/build.gradle: versionCode/versionName + androidx dependencies
           const gradlePath = 'android/app/build.gradle';
           let gradle = fs.readFileSync(gradlePath, 'utf8');
           if (!/\bversionCode\s+\d+/.test(gradle) || !/\bversionName\s+"[^"]*"/.test(gradle)) {
@@ -131,13 +133,20 @@ jobs:
           gradle = gradle.replace(/\bversionCode\s+\d+/, `versionCode ${buildCode}`);
           gradle = gradle.replace(/\bversionName\s+"[^"]*"/, `versionName "${versionName}"`);
 
-          if (!gradle.includes('androidx.browser:browser')) {
+          const extraDeps = [
+            ['androidx.browser:browser:', '    implementation "androidx.browser:browser:1.8.0"'],
+            ['androidx.core:core:', '    implementation "androidx.core:core:1.13.1"'],
+            ['androidx.media:media:', '    implementation "androidx.media:media:1.7.0"']
+          ]
+            .filter(([coord]) => !gradle.includes(coord))
+            .map(([, line]) => line);
+          if (extraDeps.length > 0) {
             if (!/dependencies\s*\{/.test(gradle)) {
               throw new Error('Could not find dependencies block in android/app/build.gradle');
             }
             gradle = gradle.replace(
               /dependencies\s*\{/,
-              'dependencies {\n    implementation "androidx.browser:browser:1.8.0"'
+              `dependencies {\n${extraDeps.join('\n')}`
             );
           }
           fs.writeFileSync(gradlePath, gradle);
@@ -178,18 +187,20 @@ jobs:
           `.replace(/^          /gm, '');
           fs.writeFileSync(mainActivityPath, mainActivitySrc);
 
-          // 3. Patch AndroidManifest.xml: preserve 5 permissions, enforce singleTask, add OAuth deep-link + FileProvider
+          // 3. Patch AndroidManifest.xml: preserve 7 permissions, enforce singleTask, add OAuth deep-link, Android Auto / MediaBrowserService, MediaButtonReceiver & FileProvider
           const manifestPath = 'android/app/src/main/AndroidManifest.xml';
           let xml = fs.readFileSync(manifestPath, 'utf8');
           const perms = [
             'android.permission.WAKE_LOCK',
             'android.permission.FOREGROUND_SERVICE',
             'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK',
+            'android.permission.BLUETOOTH',
+            'android.permission.BLUETOOTH_CONNECT',
             'android.permission.POST_NOTIFICATIONS',
             'android.permission.REQUEST_INSTALL_PACKAGES'
           ];
           const addPerms = perms
-            .filter((n) => !xml.includes(n))
+            .filter((n) => !xml.includes('"' + n + '"'))
             .map((n) => '    <uses-permission android:name="' + n + '" />')
             .join('\n');
           if (addPerms) {
@@ -223,6 +234,56 @@ jobs:
             xml = xml.replace(activityBlockRe, `$1${oauthFilter}\n        $2`);
           }
 
+          if (!xml.includes('</application>')) {
+            throw new Error('Could not find </application> in AndroidManifest.xml');
+          }
+
+          if (!xml.includes('com.google.android.gms.car.application')) {
+            const carAppMetaXml = [
+              '        <meta-data',
+              '            android:name="com.google.android.gms.car.application"',
+              '            android:resource="@xml/automotive_app_desc" />'
+            ].join('\n');
+            xml = xml.replace('</application>', `${carAppMetaXml}\n    </application>`);
+          }
+
+          if (!xml.includes('com.google.android.gms.car.notification.SmallIcon')) {
+            const carIconMetaXml = [
+              '        <meta-data',
+              '            android:name="com.google.android.gms.car.notification.SmallIcon"',
+              '            android:resource="@mipmap/ic_launcher" />'
+            ].join('\n');
+            xml = xml.replace('</application>', `${carIconMetaXml}\n    </application>`);
+          }
+
+          if (!xml.includes('AudiobookMediaBrowserService')) {
+            const serviceXml = [
+              '        <service',
+              '            android:name=".AudiobookMediaBrowserService"',
+              '            android:enabled="true"',
+              '            android:exported="true"',
+              '            android:foregroundServiceType="mediaPlayback">',
+              '            <intent-filter>',
+              '                <action android:name="android.media.browse.MediaBrowserService" />',
+              '            </intent-filter>',
+              '        </service>'
+            ].join('\n');
+            xml = xml.replace('</application>', `${serviceXml}\n    </application>`);
+          }
+
+          if (!xml.includes('androidx.media.session.MediaButtonReceiver')) {
+            const receiverXml = [
+              '        <receiver',
+              '            android:name="androidx.media.session.MediaButtonReceiver"',
+              '            android:exported="true">',
+              '            <intent-filter>',
+              '                <action android:name="android.intent.action.MEDIA_BUTTON" />',
+              '            </intent-filter>',
+              '        </receiver>'
+            ].join('\n');
+            xml = xml.replace('</application>', `${receiverXml}\n    </application>`);
+          }
+
           if (!xml.includes('androidx.core.content.FileProvider')) {
             const providerXml = [
               '        <provider',
@@ -235,15 +296,18 @@ jobs:
               '                android:resource="@xml/file_paths" />',
               '        </provider>'
             ].join('\n');
-            if (!xml.includes('</application>')) {
-              throw new Error('Could not find </application> in AndroidManifest.xml');
-            }
             xml = xml.replace('</application>', `${providerXml}\n    </application>`);
           }
 
           if (
             !xml.includes('android:launchMode="singleTask"') ||
             !xml.includes('android:scheme="com.audiobook.player"') ||
+            !xml.includes('"android.permission.BLUETOOTH"') ||
+            !xml.includes('"android.permission.BLUETOOTH_CONNECT"') ||
+            !xml.includes('com.google.android.gms.car.application') ||
+            !xml.includes('com.google.android.gms.car.notification.SmallIcon') ||
+            !xml.includes('.AudiobookMediaBrowserService') ||
+            !xml.includes('androidx.media.session.MediaButtonReceiver') ||
             !xml.includes('androidx.core.content.FileProvider')
           ) {
             throw new Error('AndroidManifest.xml patch verification failed');

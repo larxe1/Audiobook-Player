@@ -1,6 +1,6 @@
 [package]
 name = "audiobook-player"
-version = "1.0.11"
+version = "1.0.12"
 description = "Audiobook Player Standalone Windows Desktop App (Tauri 2)"
 authors = ["Audiobook Player"]
 edition = "2021"

@@ -1405,3 +1405,82 @@ test('SupabaseSyncService sends live Postgres schema columns and refreshes expir
 
   sync.destroy();
 });
+
+test('SupabaseSyncService AudiobookOAuthNative passes promptValue as 6th arg for forceConsent and falls back cleanly for 5-arg bridges', async () => {
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://localhost';
+  fakeWindow.Capacitor = { isNativePlatform: () => true };
+
+  const calls = [];
+  fakeWindow.AudiobookOAuthNative = {
+    consumePendingResult: () => null,
+    startGoogleOAuth(clientId, scope, loginHint, state, redirectUri, prompt) {
+      calls.push(Array.from(arguments));
+      queueMicrotask(() => {
+        fakeWindow.__onAndroidGoogleOAuthResult({
+          access_token: 'ya29.consent_android_token',
+          state
+        });
+      });
+    }
+  };
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { sub: '6677', email: 'consent@gmail.com', name: 'Consent User' };
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const consentRes = await sync.signInWithGooglePopup({ forceConsent: true });
+  assert.equal(consentRes.ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].length, 6);
+  assert.equal(calls[0][5], 'select_account consent');
+
+  const defaultRes = await sync.signInWithGooglePopup();
+  assert.equal(defaultRes.ok, true);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1][5], 'select_account');
+
+  // Legacy 5-arg bridge throwing arity error falls back to 5-arg invocation
+  const fallbackCalls = [];
+  fakeWindow.AudiobookOAuthNative = {
+    consumePendingResult: () => null,
+    startGoogleOAuth() {
+      fallbackCalls.push(Array.from(arguments));
+      if (arguments.length === 6) {
+        throw new Error('Wrong number of arguments for startGoogleOAuth');
+      }
+      const state = arguments[3];
+      queueMicrotask(() => {
+        fakeWindow.__onAndroidGoogleOAuthResult({
+          access_token: 'ya29.legacy_5arg_token',
+          state
+        });
+      });
+    }
+  };
+
+  const legacyRes = await sync.signInWithGooglePopup({ forceConsent: true });
+  assert.equal(legacyRes.ok, true);
+  assert.equal(fallbackCalls.length, 2);
+  assert.equal(fallbackCalls[0].length, 6);
+  assert.equal(fallbackCalls[1].length, 5);
+  assert.equal(sync.getGoogleAccessToken(), 'ya29.legacy_5arg_token');
+
+  sync.destroy();
+});

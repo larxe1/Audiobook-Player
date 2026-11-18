@@ -23,12 +23,14 @@ public class AudiobookOAuthBridge {
 
     private static final String DEFAULT_SCOPE =
         "https://www.googleapis.com/auth/drive.readonly "
+            + "https://www.googleapis.com/auth/drive.appdata "
             + "https://www.googleapis.com/auth/userinfo.email "
             + "https://www.googleapis.com/auth/userinfo.profile";
     private static final String DEFAULT_REDIRECT_URI =
         "https://larxe1.github.io/Audiobook-Player/oauth-callback.html";
     private static final String DEEP_LINK_SCHEME = "com.audiobook.player";
     private static final String DEEP_LINK_HOST = "oauth";
+    private static final String DEFAULT_PROMPT = "select_account";
 
     private final BridgeActivity activity;
     private String pendingResultJson;
@@ -45,6 +47,18 @@ public class AudiobookOAuthBridge {
         String state,
         String redirectUri
     ) {
+        startGoogleOAuth(clientId, scope, loginHint, state, redirectUri, DEFAULT_PROMPT);
+    }
+
+    @JavascriptInterface
+    public void startGoogleOAuth(
+        String clientId,
+        String scope,
+        String loginHint,
+        String state,
+        String redirectUri,
+        String prompt
+    ) {
         synchronized (this) {
             pendingResultJson = null;
         }
@@ -57,6 +71,7 @@ public class AudiobookOAuthBridge {
                 : DEFAULT_REDIRECT_URI;
         String safeState = state != null ? state.trim() : "";
         String safeHint = loginHint != null ? loginHint.trim() : "";
+        String safePrompt = normalizePrompt(prompt);
 
         Uri.Builder builder = Uri.parse("https://accounts.google.com/o/oauth2/v2/auth")
             .buildUpon()
@@ -65,7 +80,7 @@ public class AudiobookOAuthBridge {
             .appendQueryParameter("response_type", "token")
             .appendQueryParameter("scope", safeScope)
             .appendQueryParameter("include_granted_scopes", "true")
-            .appendQueryParameter("prompt", "select_account");
+            .appendQueryParameter("prompt", safePrompt);
 
         if (!safeState.isEmpty()) {
             builder.appendQueryParameter("state", safeState);
@@ -211,6 +226,19 @@ public class AudiobookOAuthBridge {
                 out.put(key, val);
             }
         }
+    }
+
+    private static String normalizePrompt(String prompt) {
+        if (prompt == null) {
+            return DEFAULT_PROMPT;
+        }
+        String normalized = prompt.trim().replaceAll("\\s+", " ");
+        if ("select_account".equals(normalized)
+            || "select_account consent".equals(normalized)
+            || "consent".equals(normalized)) {
+            return normalized;
+        }
+        return DEFAULT_PROMPT;
     }
 
     private static String urlDecode(String value) {

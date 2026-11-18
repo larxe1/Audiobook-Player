@@ -1,11 +1,11 @@
 {
-  "version": "1.0.11",
-  "build": 12,
+  "version": "1.0.12",
+  "build": 13,
   "channel": "stable",
-  "publishedAt": "2026-11-18T15:05:00Z",
+  "publishedAt": "2026-11-18T15:25:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": ""
+  "releaseNotes": "Fix Android OAuth forceConsent prompt forwarding, Android Auto MediaBrowserService & manifest wiring, and Android APK installer cancel recovery"
 }

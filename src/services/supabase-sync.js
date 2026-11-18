@@ -1497,13 +1497,34 @@ export class SupabaseSyncService {
         }, 180000);
 
         try {
-          const started = nativeOAuthBridge.startGoogleOAuth(
-            clientId,
-            scopes,
-            options.hint || '',
-            state,
-            redirectUri
-          );
+          let started;
+          try {
+            started = nativeOAuthBridge.startGoogleOAuth(
+              clientId,
+              scopes,
+              options.hint || '',
+              state,
+              redirectUri,
+              promptValue
+            );
+          } catch (bridgeErr) {
+            const msg = String(bridgeErr?.message || bridgeErr || '');
+            if (
+              /wrong number of arguments|method not found|no such method|overload|parameter count|argument/i.test(
+                msg
+              )
+            ) {
+              started = nativeOAuthBridge.startGoogleOAuth(
+                clientId,
+                scopes,
+                options.hint || '',
+                state,
+                redirectUri
+              );
+            } else {
+              throw bridgeErr;
+            }
+          }
           if (started === false) {
             finish({
               ok: false,

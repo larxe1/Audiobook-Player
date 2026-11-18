@@ -322,6 +322,7 @@ class AudiobookApp {
     this._lastLocalPlayAt = 0;
     this._dismissedRemotePromptSig = null;
     this._globalInputsBound = false;
+    this._androidUpdateReturnCleanup = null;
     this._destroyed = false;
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
@@ -910,6 +911,7 @@ class AudiobookApp {
       clearTimeout(this._statusToastTimer);
       this._statusToastTimer = null;
     }
+    this._clearAndroidUpdateReturnListener();
     this.syncService?.destroy?.();
     this.audioEngine?.destroy?.();
   }
@@ -2670,15 +2672,67 @@ class AudiobookApp {
     }
   }
 
+  _clearAndroidUpdateReturnListener() {
+    if (typeof this._androidUpdateReturnCleanup === 'function') {
+      this._androidUpdateReturnCleanup();
+      this._androidUpdateReturnCleanup = null;
+    }
+  }
+
   async handleInstallUpdate() {
     const us = this.state.updateState;
     if (us.installing) return;
+
+    this._clearAndroidUpdateReturnListener();
 
     const platform =
       typeof this.updaterService.detectPlatform === 'function'
         ? this.updaterService.detectPlatform()
         : 'web';
     const manifest = us.manifest || this.updaterService.lastManifest || null;
+
+    const attachAndroidInstallerReturnListener = () => {
+      this._clearAndroidUpdateReturnListener();
+      let handled = false;
+      const onReturn = (evt) => {
+        if (handled) return;
+        if (
+          evt?.type === 'visibilitychange' &&
+          typeof document !== 'undefined' &&
+          (document.hidden || document.visibilityState === 'hidden')
+        ) {
+          return;
+        }
+        handled = true;
+        this._clearAndroidUpdateReturnListener();
+        if (this._destroyed || !this.state.updateState.installing) return;
+        this.state.updateState = {
+          ...this.state.updateState,
+          installing: false,
+          progress: 0,
+          statusText: ''
+        };
+        this.render();
+      };
+
+      if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+        window.addEventListener('focus', onReturn);
+        window.addEventListener('visibilitychange', onReturn);
+      }
+      if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+        document.addEventListener('visibilitychange', onReturn);
+      }
+
+      this._androidUpdateReturnCleanup = () => {
+        if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+          window.removeEventListener('focus', onReturn);
+          window.removeEventListener('visibilitychange', onReturn);
+        }
+        if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+          document.removeEventListener('visibilitychange', onReturn);
+        }
+      };
+    };
 
     this.state.updateState = {
       ...us,
@@ -2711,11 +2765,13 @@ class AudiobookApp {
               evt.message ||
               (platform === 'windows-tauri' ? 'Installing & restarting...' : 'Opening installer...');
           } else if (status === 'permission_required') {
+            this._clearAndroidUpdateReturnListener();
             installing = false;
             statusText =
               evt.message ||
               'Allow Install unknown apps for Audiobook Player, then tap Update Now again.';
           } else if (status === 'error') {
+            this._clearAndroidUpdateReturnListener();
             installing = false;
             statusText = evt.message || 'Update failed.';
           }
@@ -2727,10 +2783,15 @@ class AudiobookApp {
             statusText
           };
           this.render();
+
+          if (platform === 'android-apk' && status === 'installing') {
+            attachAndroidInstallerReturnListener();
+          }
         }
       });
 
       if (res && res.ok === false && res.reason === 'permission_required') {
+        this._clearAndroidUpdateReturnListener();
         this.state.updateState = {
           ...this.state.updateState,
           installing: false,
@@ -2777,6 +2838,7 @@ class AudiobookApp {
       }
 
       if (res?.ok === false && res?.error) {
+        this._clearAndroidUpdateReturnListener();
         this.state.updateState = {
           ...this.state.updateState,
           installing: false,
@@ -2786,6 +2848,7 @@ class AudiobookApp {
         return;
       }
     } catch (err) {
+      this._clearAndroidUpdateReturnListener();
       this.state.updateState = {
         ...this.state.updateState,
         installing: false,

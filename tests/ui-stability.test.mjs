@@ -230,21 +230,42 @@ function createDomEnv({ innerWidth = 1280 } = {}) {
   const docEl = new MockElement('html');
   docEl.appendChild(bodyEl);
 
+  const docListeners = new Map();
+  const winListeners = new Map();
+  const addTo = (map, type, fn) => {
+    if (!map.has(type)) map.set(type, new Set());
+    map.get(type).add(fn);
+  };
+  const removeFrom = (map, type, fn) => {
+    map.get(type)?.delete(fn);
+  };
+  const dispatchFrom = (map, type, extra = {}) => {
+    for (const fn of [...(map.get(type) || [])]) {
+      fn({ type, ...extra });
+    }
+  };
+
   const mockDocument = {
     body: bodyEl,
     documentElement: docEl,
     activeElement: null,
     readyState: 'complete',
+    hidden: false,
+    visibilityState: 'visible',
     getElementById: (id) => (id === 'appRoot' ? rootEl : rootEl.querySelector(`#${id}`)),
     querySelector: (sel) => rootEl.querySelector(sel),
     querySelectorAll: (sel) => rootEl.querySelectorAll(sel),
-    addEventListener: () => {}
+    addEventListener: (type, fn) => addTo(docListeners, type, fn),
+    removeEventListener: (type, fn) => removeFrom(docListeners, type, fn),
+    dispatchEvent: (type, extra) => dispatchFrom(docListeners, type, extra)
   };
 
   const mockWindow = {
     innerWidth,
     location: { search: '', pathname: '/', hash: '' },
-    addEventListener: () => {},
+    addEventListener: (type, fn) => addTo(winListeners, type, fn),
+    removeEventListener: (type, fn) => removeFrom(winListeners, type, fn),
+    dispatchEvent: (type, extra) => dispatchFrom(winListeners, type, extra),
     matchMedia: () => ({ matches: false, addEventListener: () => {} })
   };
 
@@ -261,6 +282,7 @@ function createDomEnv({ innerWidth = 1280 } = {}) {
   return {
     rootEl,
     mockWindow,
+    mockDocument,
     restore() {
       globalThis.window = prevWindow;
       globalThis.document = prevDocument;
@@ -905,6 +927,85 @@ test('cross-device library merge, Drive folder auto-link, remote-local badge/not
     const devicesSlot = env.rootEl.querySelector('#appOverlayDevices');
     assert.match(devicesSlot.innerHTML, /Signed-In Devices/);
     assert.match(devicesSlot.innerHTML, /Windows PC/);
+  } finally {
+    app?.destroy?.();
+    env.restore();
+  }
+});
+
+test('returning via focus or visibilitychange after Android installing resets installing=false so Update Now is clickable again', async () => {
+  const env = createDomEnv({ innerWidth: 390 });
+  let app = null;
+  try {
+    app = new AudiobookApp(env.rootEl);
+    app._enrichSingleBookInBackground = async () => {};
+    app._runBackgroundMetadataEnrichment = async () => {};
+    app.guestLocalMode = true;
+    app.books = [makeBook(1)];
+    app.state.activeBookKey = app.books[0].bookKey;
+
+    app.state.updateState = {
+      ...app.state.updateState,
+      checked: true,
+      updateAvailable: true,
+      latestVersion: '1.0.12',
+      manifest: {
+        version: '1.0.12',
+        apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk'
+      }
+    };
+    app.render();
+
+    let progressHandler = null;
+    let installCalls = 0;
+    app.updaterService.detectPlatform = () => 'android-apk';
+    app.updaterService.installNativeUpdate = async (platform, manifest, { onProgress }) => {
+      installCalls += 1;
+      progressHandler = onProgress;
+      return { ok: true, started: true, platform, url: manifest.apkDownloadUrl };
+    };
+
+    // 1. Trigger install and advance to Android PackageInstaller launch (`installing` at 100%)
+    env.rootEl.querySelector('[data-action="install-update"]').click();
+    await new Promise((r) => setTimeout(r, 10));
+    progressHandler({ status: 'downloading', progress: 60 });
+    progressHandler({ status: 'installing', progress: 100, message: 'Opening Android installer...' });
+
+    const disabledBtn = env.rootEl.querySelector('[data-action="install-update"]');
+    assert.equal(app.state.updateState.installing, true);
+    assert.equal(disabledBtn?.disabled, true);
+    assert.match(disabledBtn?.textContent || '', /Updating 100%/);
+
+    // Hidden visibilitychange when PackageInstaller opens must NOT reset prematurely
+    env.mockDocument.hidden = true;
+    env.mockDocument.visibilityState = 'hidden';
+    env.mockDocument.dispatchEvent('visibilitychange');
+    assert.equal(app.state.updateState.installing, true);
+
+    // Returning via focus resets installing=false and makes Update Now clickable again
+    env.mockDocument.hidden = false;
+    env.mockDocument.visibilityState = 'visible';
+    env.mockWindow.dispatchEvent('focus');
+
+    assert.equal(app.state.updateState.installing, false);
+    assert.equal(app.state.updateState.statusText, '');
+    const reenabledBtn = env.rootEl.querySelector('[data-action="install-update"]');
+    assert.equal(reenabledBtn?.disabled, false);
+    assert.match(reenabledBtn?.textContent || '', /Update Now/);
+
+    // 2. Retry install and verify visibilitychange -> visible also resets cleanly
+    reenabledBtn.click();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(installCalls, 2);
+    progressHandler({ status: 'installing', progress: 100, message: 'Opening Android installer...' });
+    assert.equal(app.state.updateState.installing, true);
+
+    env.mockDocument.hidden = false;
+    env.mockDocument.visibilityState = 'visible';
+    env.mockDocument.dispatchEvent('visibilitychange');
+
+    assert.equal(app.state.updateState.installing, false);
+    assert.equal(env.rootEl.querySelector('[data-action="install-update"]')?.disabled, false);
   } finally {
     app?.destroy?.();
     env.restore();

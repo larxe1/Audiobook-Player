@@ -1,4 +1,4 @@
-export const LOCAL_VERSION = '1.0.11';
+export const LOCAL_VERSION = '1.0.12';
 
 /**
  * Detect the runtime platform for update delivery.

@@ -22,12 +22,14 @@ class AudiobookOAuthBridge(private val activity: BridgeActivity) {
     companion object {
         private const val DEFAULT_SCOPE =
             "https://www.googleapis.com/auth/drive.readonly " +
+                "https://www.googleapis.com/auth/drive.appdata " +
                 "https://www.googleapis.com/auth/userinfo.email " +
                 "https://www.googleapis.com/auth/userinfo.profile"
         private const val DEFAULT_REDIRECT_URI =
             "https://larxe1.github.io/Audiobook-Player/oauth-callback.html"
         private const val DEEP_LINK_SCHEME = "com.audiobook.player"
         private const val DEEP_LINK_HOST = "oauth"
+        private const val DEFAULT_PROMPT = "select_account"
     }
 
     @JavascriptInterface
@@ -38,6 +40,18 @@ class AudiobookOAuthBridge(private val activity: BridgeActivity) {
         state: String?,
         redirectUri: String?
     ) {
+        startGoogleOAuth(clientId, scope, loginHint, state, redirectUri, DEFAULT_PROMPT)
+    }
+
+    @JavascriptInterface
+    fun startGoogleOAuth(
+        clientId: String?,
+        scope: String?,
+        loginHint: String?,
+        state: String?,
+        redirectUri: String?,
+        prompt: String?
+    ) {
         synchronized(this) {
             pendingResultJson = null
         }
@@ -47,6 +61,7 @@ class AudiobookOAuthBridge(private val activity: BridgeActivity) {
         val safeRedirectUri = redirectUri?.trim()?.takeIf { it.isNotEmpty() } ?: DEFAULT_REDIRECT_URI
         val safeState = state?.trim().orEmpty()
         val safeHint = loginHint?.trim().orEmpty()
+        val safePrompt = normalizePrompt(prompt)
 
         val authUri = Uri.parse("https://accounts.google.com/o/oauth2/v2/auth")
             .buildUpon()
@@ -55,7 +70,7 @@ class AudiobookOAuthBridge(private val activity: BridgeActivity) {
             .appendQueryParameter("response_type", "token")
             .appendQueryParameter("scope", safeScope)
             .appendQueryParameter("include_granted_scopes", "true")
-            .appendQueryParameter("prompt", "select_account")
+            .appendQueryParameter("prompt", safePrompt)
             .apply {
                 if (safeState.isNotEmpty()) appendQueryParameter("state", safeState)
                 if (safeHint.isNotEmpty()) appendQueryParameter("login_hint", safeHint)
@@ -162,6 +177,14 @@ class AudiobookOAuthBridge(private val activity: BridgeActivity) {
             if (key.isNotEmpty()) {
                 out[key] = value
             }
+        }
+    }
+
+    private fun normalizePrompt(prompt: String?): String {
+        val normalized = prompt?.trim()?.replace(Regex("\\s+"), " ").orEmpty()
+        return when (normalized) {
+            "select_account", "select_account consent", "consent" -> normalized
+            else -> DEFAULT_PROMPT
         }
     }
 
