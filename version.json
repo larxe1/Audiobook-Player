@@ -1,11 +1,11 @@
 {
-  "version": "1.0.0",
-  "build": 1,
+  "version": "1.0.1",
+  "build": 2,
   "channel": "stable",
   "publishedAt": "2026-11-18T00:00:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Initial release of Audiobook Player"
+  "releaseNotes": "Real Google OAuth & Local Mode login, empty library import for local files/folders and Google Drive"
 }

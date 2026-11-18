@@ -17,7 +17,7 @@ import {
   scanGoogleDriveFolder,
   normalizeBookKey
 } from '../services/library-scanner.js';
-import { enrichBookMetadata } from '../services/metadata-enrichment.js';
+import { enrichBookMetadata, parseFilenameMetadata } from '../services/metadata-enrichment.js';
 import { searchCoverImages, buildCuratedSvgCover } from '../services/cover-search.js';
 import { SelfUpdaterService, LOCAL_VERSION } from '../services/self-updater.js';
 import { AudioEngine } from '../player/audio-engine.js';
@@ -48,9 +48,8 @@ import {
 } from './icons.js';
 
 const STORAGE_THEME_KEY = 'audiobook_player_theme_v1';
-const STORAGE_LIBRARY_KEY = 'audiobook_player_library_v1';
+const STORAGE_LIBRARY_KEY = 'audiobook_user_library_v1';
 const STORAGE_ACTIVE_BOOK_KEY = 'audiobook_player_active_book_v1';
-const STORAGE_DEMO_USER_KEY = 'audiobook_player_demo_user_v1';
 
 const PLAYBACK_RATES = [1.0, 1.25, 1.5, 1.75, 2.0];
 
@@ -91,190 +90,6 @@ function formatRemaining(totalSec = 0, positionSec = 0) {
   const mins = Math.floor((left % 3600) / 60);
   if (hrs > 0) return `${hrs}h ${mins}m left`;
   return `${Math.max(1, mins)}m left`;
-}
-
-function createInitialCatalog() {
-  const makeCover = (title, bg1, bg2, accent, label) =>
-    buildCuratedSvgCover(title, {
-      id: title.toLowerCase(),
-      label,
-      bg1,
-      bg2,
-      accent,
-      ring: `${accent}44`
-    });
-
-  return deduplicateLibraryItems([
-    {
-      bookKey: normalizeBookKey('Project Hail Mary', 'Andy Weir'),
-      title: 'Project Hail Mary',
-      author: 'Andy Weir',
-      narrator: 'Ray Porter',
-      series: 'Standalone',
-      year: '2021',
-      description:
-        'Ryland Grace is the sole survivor on a desperate, last-chance mission—and if he fails, humanity and the earth itself will perish.',
-      totalDurationSec: 58200,
-      positionSec: 18420,
-      chapterIndex: 2,
-      sources: ['drive', 'local'],
-      preferredPlaybackSource: 'local',
-      isOffline: true,
-      offline: true,
-      accentHex: '#f59e0b',
-      accentSecondaryHex: '#131b2e',
-      coverUrl: makeCover('Project Hail Mary', '#1b1106', '#2c1f0b', '#f59e0b', 'Andy Weir'),
-      chapters: [
-        { index: 0, title: 'Chapter 1: Awakening', startSec: 0 },
-        { index: 1, title: 'Chapter 2: Petrova Line', startSec: 7200 },
-        { index: 2, title: 'Chapter 3: Hail Mary', startSec: 16200 },
-        { index: 3, title: 'Chapter 4: Eridani', startSec: 28800 },
-        { index: 4, title: 'Chapter 5: Astrophage', startSec: 42000 }
-      ],
-      bookmarks: [
-        {
-          id: 'bm-phm-1',
-          bookKey: 'project-hail-mary::andy-weir',
-          chapterIndex: 2,
-          positionSec: 17120,
-          label: 'First contact signal',
-          clientUpdatedAt: '2026-11-17T08:12:00.000Z'
-        }
-      ]
-    },
-    {
-      bookKey: normalizeBookKey('The Fellowship of the Ring', 'J.R.R. Tolkien'),
-      title: 'The Fellowship of the Ring',
-      author: 'J.R.R. Tolkien',
-      narrator: 'Andy Serkis',
-      series: 'The Lord of the Rings',
-      year: '1954',
-      description:
-        'In a sleepy village in the Shire, young Frodo Baggins finds himself faced with an immense task as the One Ring passes into his care.',
-      totalDurationSec: 81600,
-      positionSec: 12900,
-      chapterIndex: 1,
-      sources: ['drive'],
-      preferredPlaybackSource: 'drive',
-      isOffline: false,
-      offline: false,
-      accentHex: '#1ed760',
-      accentSecondaryHex: '#0b1812',
-      coverUrl: makeCover('The Fellowship of the Ring', '#071612', '#123328', '#1ed760', 'J.R.R. Tolkien'),
-      chapters: [
-        { index: 0, title: 'Book I: A Long-Expected Party', startSec: 0 },
-        { index: 1, title: 'Book I: The Shadow of the Past', startSec: 9400 },
-        { index: 2, title: 'Book I: At the Sign of The Prancing Pony', startSec: 24200 },
-        { index: 3, title: 'Book II: The Council of Elrond', startSec: 46800 }
-      ],
-      bookmarks: []
-    },
-    {
-      bookKey: normalizeBookKey('Dune', 'Frank Herbert'),
-      title: 'Dune',
-      author: 'Frank Herbert',
-      narrator: 'Scott Brick',
-      series: 'Dune Chronicles',
-      year: '1965',
-      description:
-        'Set on the desert planet Arrakis, Dune tells the story of young Paul Atreides as his family accepts stewardship of the universe’s most coveted resource.',
-      totalDurationSec: 75600,
-      positionSec: 34200,
-      chapterIndex: 2,
-      sources: ['drive'],
-      preferredPlaybackSource: 'drive',
-      isOffline: true,
-      offline: true,
-      accentHex: '#fb923c',
-      accentSecondaryHex: '#1d1007',
-      coverUrl: makeCover('Dune', '#1a0c05', '#3c1e0c', '#fb923c', 'Frank Herbert'),
-      chapters: [
-        { index: 0, title: 'Book 1: Dune', startSec: 0 },
-        { index: 1, title: 'Book 2: Muad’Dib', startSec: 26000 },
-        { index: 2, title: 'Book 3: The Prophet', startSec: 52000 }
-      ],
-      bookmarks: []
-    },
-    {
-      bookKey: normalizeBookKey('Atomic Habits', 'James Clear'),
-      title: 'Atomic Habits',
-      author: 'James Clear',
-      narrator: 'James Clear',
-      series: '',
-      year: '2018',
-      description:
-        'An easy and proven way to build good habits and break bad ones through tiny daily systems.',
-      totalDurationSec: 19800,
-      positionSec: 6300,
-      chapterIndex: 1,
-      sources: ['local'],
-      preferredPlaybackSource: 'local',
-      isOffline: true,
-      offline: true,
-      accentHex: '#60a5fa',
-      accentSecondaryHex: '#0b1426',
-      coverUrl: makeCover('Atomic Habits', '#070e1d', '#14264b', '#60a5fa', 'James Clear'),
-      chapters: [
-        { index: 0, title: 'Fundamentals: The Surprising Power', startSec: 0 },
-        { index: 1, title: '1st Law: Make It Obvious', startSec: 4800 },
-        { index: 2, title: '2nd Law: Make It Attractive', startSec: 10200 },
-        { index: 3, title: '3rd Law: Make It Easy', startSec: 15000 }
-      ],
-      bookmarks: []
-    },
-    {
-      bookKey: normalizeBookKey('The Three-Body Problem', 'Cixin Liu'),
-      title: 'The Three-Body Problem',
-      author: 'Cixin Liu',
-      narrator: 'Luke Daniels',
-      series: 'Remembrance of Earth’s Past',
-      year: '2008',
-      description:
-        'A secret military project sends signals into space to establish contact with aliens, sparking a centuries-spanning cosmic confrontation.',
-      totalDurationSec: 48600,
-      positionSec: 9420,
-      chapterIndex: 1,
-      sources: ['drive', 'local'],
-      preferredPlaybackSource: 'local',
-      isOffline: true,
-      offline: true,
-      accentHex: '#38bdf8',
-      accentSecondaryHex: '#0a1628',
-      coverUrl: makeCover('The Three-Body Problem', '#07111e', '#102b46', '#38bdf8', 'Cixin Liu'),
-      chapters: [
-        { index: 0, title: 'Part I: Silent Spring', startSec: 0 },
-        { index: 1, title: 'Part II: Three Body', startSec: 8400 },
-        { index: 2, title: 'Part III: Sunset for Humanity', startSec: 27400 }
-      ],
-      bookmarks: []
-    },
-    {
-      bookKey: normalizeBookKey('The Pragmatic Programmer', 'David Thomas & Andrew Hunt'),
-      title: 'The Pragmatic Programmer',
-      author: 'David Thomas & Andrew Hunt',
-      narrator: 'Anna Katarina',
-      series: '20th Anniversary Edition',
-      year: '2019',
-      description:
-        'Your journey to mastery through timeless software craftsmanship principles and practical engineering habits.',
-      totalDurationSec: 34800,
-      positionSec: 2100,
-      chapterIndex: 0,
-      sources: ['local'],
-      preferredPlaybackSource: 'local',
-      isOffline: true,
-      offline: true,
-      accentHex: '#a78bfa',
-      accentSecondaryHex: '#150e28',
-      coverUrl: makeCover('The Pragmatic Programmer', '#120a24', '#26174a', '#a78bfa', 'Thomas & Hunt'),
-      chapters: [
-        { index: 0, title: 'Chapter 1: A Pragmatic Philosophy', startSec: 0 },
-        { index: 1, title: 'Chapter 2: A Pragmatic Approach', startSec: 6900 },
-        { index: 2, title: 'Chapter 3: The Basic Tools', startSec: 15800 }
-      ],
-      bookmarks: []
-    }
-  ]);
 }
 
 class AudiobookApp {
@@ -319,6 +134,9 @@ class AudiobookApp {
     const initialAudioOutput = this.mediaBridge.getAudioOutputState();
     const initialAndroidAuto = this.mediaBridge.isAndroidAutoConnected();
 
+    this.user = null;
+    this.guestLocalMode = false;
+
     this.state = {
       theme: this._loadTheme(),
       androidAutoConnected: initialAndroidAuto,
@@ -335,9 +153,18 @@ class AudiobookApp {
       activeOutputDevice: initialAudioOutput.activeLabel || 'System Audio',
       activeOutputDeviceId: initialAudioOutput.activeDeviceId || 'default',
       audioOutputs: initialAudioOutput.devices || [],
-      books: this._loadBooks(),
+      books: [],
       activeBookKey: null,
       detailBookKey: null,
+      loginTokenOpen: false,
+      authError: '',
+      driveModal: {
+        open: false,
+        folderId: '',
+        token: '',
+        loading: false,
+        error: ''
+      },
       coverModal: {
         open: false,
         bookKey: null,
@@ -361,11 +188,18 @@ class AudiobookApp {
         chapterIndex: 0,
         sleepTimerMode: 0,
         sleepRemainingSec: 0
-      },
-      demoUser: this._loadDemoUser()
+      }
     };
 
     this._lastCheckpointAt = 0;
+  }
+
+  get books() {
+    return this.state.books;
+  }
+
+  set books(nextBooks) {
+    this.state.books = Array.isArray(nextBooks) ? nextBooks : [];
   }
 
   _detectViewportLayout(androidAutoOverride = null) {
@@ -413,62 +247,88 @@ class AudiobookApp {
     document.body.classList.add(theme === 'pitch' ? 'theme-pitch' : 'theme-midnight');
   }
 
-  _loadDemoUser() {
-    try {
-      const raw = localStorage.getItem(STORAGE_DEMO_USER_KEY);
-      if (raw) return JSON.parse(raw);
-    } catch {
-      // ignore
-    }
-    return {
-      name: 'Alex Morgan',
-      email: 'alex.morgan@gmail.com',
-      avatarUrl: ''
-    };
-  }
-
   _loadBooks() {
-    const defaults = createInitialCatalog();
     try {
       const raw = localStorage.getItem(STORAGE_LIBRARY_KEY);
       if (raw) {
         const saved = JSON.parse(raw);
         if (Array.isArray(saved) && saved.length > 0) {
-          // Merge saved customizations (covers, progress, new books) with defaults
-          const merged = deduplicateLibraryItems([...defaults, ...saved]);
-          return merged.map((b) => {
-            const override = saved.find((s) => s.bookKey === b.bookKey);
-            if (!override) return b;
-            return {
-              ...b,
-              coverUrl: override.coverUrl || b.coverUrl,
-              author: override.author || b.author,
-              narrator: override.narrator || b.narrator,
-              description: override.description || b.description,
-              totalDurationSec: override.totalDurationSec || b.totalDurationSec,
-              positionSec: override.positionSec ?? b.positionSec,
-              chapterIndex: override.chapterIndex ?? b.chapterIndex,
-              isOffline: Boolean(override.isOffline ?? b.isOffline),
-              offline: Boolean(override.offline ?? b.offline)
-            };
-          });
+          return deduplicateLibraryItems(saved).map((b) => ({
+            ...b,
+            positionSec: b.positionSec ?? b.elapsedSec ?? 0
+          }));
         }
       }
     } catch {
       // ignore
     }
-    return defaults;
+    return [];
   }
 
   _persistBooks() {
     try {
-      const serializable = this.state.books.map((b) => {
+      const serializable = this.books.map((b) => {
         const { localFile, ...rest } = b;
-        return rest;
+        const total = Number(b.totalDurationSec || 0);
+        const elapsedSec = Math.round(Number(b.positionSec || 0));
+        const progressPct =
+          total > 0 ? Math.min(100, Math.round((elapsedSec / total) * 1000) / 10) : 0;
+        return {
+          ...rest,
+          elapsedSec,
+          progressPct,
+          bookmarks: this.state.bookmarksByBook[b.bookKey] || b.bookmarks || []
+        };
       });
       localStorage.setItem(STORAGE_LIBRARY_KEY, JSON.stringify(serializable));
     } catch {
       // ignore storage quota errors
+    }
+  }
+
+  async _loadUserLibraryAndSync() {
+    const localBooks = this._loadBooks();
+    let combined = localBooks;
+
+    if (this.syncService.isAuthenticated()) {
+      const remoteBooks = await this.syncService.fetchLibraryItems().catch(() => []);
+      if (Array.isArray(remoteBooks) && remoteBooks.length > 0) {
+        combined = deduplicateLibraryItems([...localBooks, ...remoteBooks]);
+      }
+    }
+
+    const progressMap = await this.syncService.fetchAllProgress().catch(() => ({}));
+    this.books = combined.map((book) => {
+      const localStored = progressMap[book.bookKey];
+      const merged = localStored ? resolveProgressConflict(book, localStored) : book;
+      return {
+        ...book,
+        positionSec: merged?.positionSec ?? book.positionSec ?? 0,
+        chapterIndex: merged?.chapterIndex ?? book.chapterIndex ?? 0
+      };
+    });
+
+    for (const book of this.books) {
+      this.state.bookmarksByBook[book.bookKey] = await this.syncService
+        .fetchBookmarks(book.bookKey)
+        .catch(() => book.bookmarks || []);
+    }
+
+    if (this.books.length > 0) {
+      let savedActiveKey = null;
+      try {
+        savedActiveKey = localStorage.getItem(STORAGE_ACTIVE_BOOK_KEY);
+      } catch {
+        // ignore
+      }
+      const initialBook =
+        this.books.find((b) => b.bookKey === savedActiveKey) || this.books[0];
+      if (initialBook) {
+        await this.selectBook(initialBook.bookKey, false);
+      }
+    } else {
+      this.state.activeBookKey = null;
+      this.state.detailBookKey = null;
     }
   }
 
@@ -478,47 +338,30 @@ class AudiobookApp {
 
     // Handle OAuth callback if returning from Google login
     if (typeof window !== 'undefined' && window.location.hash.includes('access_token=')) {
-      await this.syncService.handleAuthCallback(window.location.hash).catch(() => null);
+      const callbackSession = await this.syncService
+        .handleAuthCallback(window.location.hash)
+        .catch(() => null);
       if (window.history?.replaceState) {
         window.history.replaceState(null, '', window.location.pathname + window.location.search);
       }
+      if (!callbackSession) {
+        this.state.authError = 'Google sign-in could not be completed.';
+      }
+    } else {
+      await this.syncService.restoreSession().catch(() => null);
     }
+
+    this.user = this.syncService.getUserProfile();
 
     const token = this.syncService.getGoogleAccessToken();
     if (token) {
       this.audioEngine.setDriveAccessToken(token);
     }
 
-    // Reconcile stored progress & bookmarks
-    const progressMap = await this.syncService.fetchAllProgress().catch(() => ({}));
-    this.state.books = this.state.books.map((book) => {
-      const localStored = progressMap[book.bookKey];
-      const merged = localStored ? resolveProgressConflict(book, localStored) : book;
-      return {
-        ...book,
-        positionSec: merged?.positionSec ?? book.positionSec,
-        chapterIndex: merged?.chapterIndex ?? book.chapterIndex
-      };
-    });
-
-    for (const book of this.state.books) {
-      this.state.bookmarksByBook[book.bookKey] = await this.syncService
-        .fetchBookmarks(book.bookKey)
-        .catch(() => book.bookmarks || []);
-    }
-
-    // Restore last active book
-    let savedActiveKey = null;
-    try {
-      savedActiveKey = localStorage.getItem(STORAGE_ACTIVE_BOOK_KEY);
-    } catch {
-      // ignore
-    }
-    const initialBook =
-      this.state.books.find((b) => b.bookKey === savedActiveKey) || this.state.books[0];
-
-    if (initialBook) {
-      await this.selectBook(initialBook.bookKey, false);
+    if (this.user || this.guestLocalMode) {
+      await this._loadUserLibraryAndSync();
+    } else {
+      this.books = [];
     }
 
     // Subscribe to remote playback handoff
@@ -539,7 +382,7 @@ class AudiobookApp {
         this.audioEngine.pause();
       }
       if (decision.updatedBookKey && decision.updatedPositionSec !== undefined) {
-        const target = this.state.books.find((b) => b.bookKey === decision.updatedBookKey);
+        const target = this.books.find((b) => b.bookKey === decision.updatedBookKey);
         if (target) {
           target.positionSec = decision.updatedPositionSec;
           target.chapterIndex = decision.updatedChapterIndex;
@@ -551,9 +394,74 @@ class AudiobookApp {
       }
     });
 
-    this.syncService.connectRealtime();
+    if (this.syncService.isAuthenticated()) {
+      this.syncService.connectRealtime();
+    }
     await this.mediaBridge.refreshAudioOutputs().catch(() => null);
     this._bindGlobalInputs();
+    this.render();
+  }
+
+  async _importLocalFiles(fileList) {
+    if (!fileList || fileList.length === 0) return;
+    const filesArr = Array.from(fileList);
+    const scanned = await scanLocalFiles(filesArr);
+
+    // Fallback for .wav / generic audio/* files not matched by scanLocalFiles
+    const scannedNames = new Set(
+      scanned.flatMap((b) => (b.tracks || []).map((t) => t.name)).filter(Boolean)
+    );
+    const extraAudio = filesArr.filter(
+      (f) =>
+        f &&
+        typeof f.name === 'string' &&
+        !scannedNames.has(f.name) &&
+        (/\.(wav|aac|opus|m4b|mp3|m4a|ogg|flac)$/i.test(f.name) ||
+          (typeof f.type === 'string' && f.type.startsWith('audio/')))
+    );
+
+    const extraBooks = extraAudio.map((file) => {
+      const meta = parseFilenameMetadata(file.name);
+      const title = meta.title || file.name.replace(/\.[^/.]+$/, '');
+      const author = meta.author || '';
+      const bookKey = normalizeBookKey(title, author);
+      const localUrl =
+        typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
+          ? URL.createObjectURL(file)
+          : '';
+      return {
+        id: bookKey,
+        bookKey,
+        title,
+        author,
+        narrator: '',
+        series: '',
+        description: '',
+        totalDurationSec: 0,
+        sources: ['local'],
+        preferredPlaybackSource: 'local',
+        localUrl,
+        localFile: file,
+        tracks: [{ name: file.name, localUrl, size: file.size || 0 }],
+        chapters: [{ index: 0, title: 'Chapter 1', startSec: 0, localUrl }],
+        bookmarks: [],
+        positionSec: 0,
+        progressSec: 0,
+        chapterIndex: 0,
+        isOffline: true,
+        offline: true
+      };
+    });
+
+    const imported = deduplicateLibraryItems([...scanned, ...extraBooks]);
+    if (imported.length === 0) return;
+
+    this.books = deduplicateLibraryItems([...this.books, ...imported]);
+    this._persistBooks();
+    if (this.syncService.isAuthenticated()) {
+      void this.syncService.syncLibraryItems(imported).catch(() => null);
+    }
+    await this.selectBook(imported[0].bookKey, false);
     this.render();
   }
 
@@ -562,15 +470,21 @@ class AudiobookApp {
     if (folderInput) {
       folderInput.addEventListener('change', async (e) => {
         const files = e.target?.files;
-        if (!files || files.length === 0) return;
-        const scanned = await scanLocalFiles(files);
-        if (scanned.length > 0) {
-          this.state.books = deduplicateLibraryItems([...this.state.books, ...scanned]);
-          this._persistBooks();
-          await this.selectBook(scanned[0].bookKey, true);
-          this.render();
+        if (files && files.length > 0) {
+          await this._importLocalFiles(files);
         }
         folderInput.value = '';
+      });
+    }
+
+    const audioFilesInput = document.getElementById('localAudioFilesInput');
+    if (audioFilesInput) {
+      audioFilesInput.addEventListener('change', async (e) => {
+        const files = e.target?.files;
+        if (files && files.length > 0) {
+          await this._importLocalFiles(files);
+        }
+        audioFilesInput.value = '';
       });
     }
 
@@ -645,12 +559,19 @@ class AudiobookApp {
   getUserAccount() {
     const supaProfile = this.syncService.getUserProfile();
     if (supaProfile) {
+      this.user = supaProfile;
       return { ...supaProfile, authenticated: true };
     }
-    return {
-      ...this.state.demoUser,
-      authenticated: false
-    };
+    if (this.guestLocalMode) {
+      return {
+        id: null,
+        name: 'Local Mode',
+        email: 'Offline library',
+        avatarUrl: '',
+        authenticated: false
+      };
+    }
+    return null;
   }
 
   getFilteredBooks() {
@@ -983,21 +904,85 @@ class AudiobookApp {
   }
 
   async handleConnectGoogleDrive() {
-    const token = this.syncService.getGoogleAccessToken();
-    if (!token) {
-      await this.syncService.signInWithGoogle({ autoRedirect: true });
+    const existingToken = this.syncService.getGoogleAccessToken() || '';
+    this.state.profileOpen = false;
+    this.state.driveModal = {
+      open: true,
+      folderId: this.state.driveModal?.folderId || '',
+      token: existingToken,
+      loading: false,
+      error: ''
+    };
+    this.render();
+  }
+
+  async runGoogleDriveSync(folderIdInput = '', tokenInput = '') {
+    const cleanToken = (tokenInput || this.syncService.getGoogleAccessToken() || '').trim();
+    const cleanFolderId = (folderIdInput || '').trim();
+    if (!cleanToken) {
+      this.state.driveModal = {
+        ...this.state.driveModal,
+        error: 'Enter a Google OAuth token or sign in with Google.'
+      };
+      this.render();
       return;
     }
+
+    this.syncService.setGoogleAccessToken(cleanToken);
+    this.audioEngine.setDriveAccessToken(cleanToken);
+    this.state.driveModal = {
+      ...this.state.driveModal,
+      token: cleanToken,
+      folderId: cleanFolderId,
+      loading: true,
+      error: ''
+    };
+    this.render();
+
     try {
-      const driveBooks = await scanGoogleDriveFolder(token);
+      const driveBooks = await scanGoogleDriveFolder(cleanToken, cleanFolderId);
       if (driveBooks.length > 0) {
-        this.state.books = deduplicateLibraryItems([...this.state.books, ...driveBooks]);
+        this.books = deduplicateLibraryItems([...this.books, ...driveBooks]);
         this._persistBooks();
+        if (this.syncService.isAuthenticated()) {
+          void this.syncService.syncLibraryItems(driveBooks).catch(() => null);
+        }
+        if (!this.state.activeBookKey) {
+          await this.selectBook(driveBooks[0].bookKey, false);
+        }
+        this.state.driveModal.open = false;
+        this.state.driveModal.loading = false;
+      } else {
+        this.state.driveModal.loading = false;
+        this.state.driveModal.error = 'No audio files found in Google Drive.';
       }
-    } catch {
-      // Keep existing library if Drive API rejects
+    } catch (err) {
+      this.state.driveModal.loading = false;
+      this.state.driveModal.error = err?.message || 'Google Drive sync failed.';
     }
+    this.render();
+  }
+
+  async enterLocalMode() {
+    this.guestLocalMode = true;
+    this.state.authError = '';
+    this.state.loginTokenOpen = false;
+    await this._loadUserLibraryAndSync();
+    this.render();
+  }
+
+  async handleSignOut() {
+    this.audioEngine.pause();
+    await this.syncService.signOut();
+    this.user = null;
+    this.guestLocalMode = false;
+    this.books = [];
+    this.state.activeBookKey = null;
+    this.state.detailBookKey = null;
     this.state.profileOpen = false;
+    this.state.driveModal.open = false;
+    this.state.coverModal.open = false;
+    this.state.desktopView = 'home';
     this.render();
   }
 
@@ -1099,14 +1084,18 @@ class AudiobookApp {
   }
 
   _renderCoverImg(book, classes = 'w-full h-full object-cover', extra = '') {
-    const src = escapeHtml(book?.coverUrl || '');
+    const fallbackUrl = buildCuratedSvgCover(book?.title || 'Audiobook', {
+      id: book?.bookKey || book?.title || 'audiobook',
+      label: book?.author || 'Audiobook'
+    });
+    const src = escapeHtml(book?.coverUrl || fallbackUrl);
     const alt = escapeHtml(book?.title || 'Audiobook');
     return `<img src="${src}" alt="${alt}" class="${classes}" ${extra} />`;
   }
 
   _renderAvatarButton() {
-    const user = this.getUserAccount();
-    const initials = (user.name || 'A')
+    const user = this.getUserAccount() || { name: 'Local Mode', email: '', avatarUrl: '' };
+    const initials = (user.name || 'L')
       .split(/\s+/)
       .map((s) => s[0])
       .join('')
@@ -1129,6 +1118,7 @@ class AudiobookApp {
   _renderProfilePopover() {
     if (!this.state.profileOpen) return '';
     const user = this.getUserAccount();
+    if (!user) return '';
     const activeBook = this.getActiveBook();
     const {
       theme,
@@ -1145,7 +1135,7 @@ class AudiobookApp {
             ${
               user.avatarUrl
                 ? `<img src="${escapeHtml(user.avatarUrl)}" alt="${escapeHtml(user.name)}" class="w-full h-full object-cover" />`
-                : escapeHtml((user.name || 'A')[0].toUpperCase())
+                : escapeHtml((user.name || 'L')[0].toUpperCase())
             }
           </div>
           <div class="min-w-0 flex-1">
@@ -1178,17 +1168,24 @@ class AudiobookApp {
         </div>
 
         <div class="py-2 border-b border-[var(--border-subtle)] space-y-0.5">
-          <button data-action="open-cover-search" data-book="${escapeHtml(activeBook?.bookKey || '')}" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            <span class="truncate">Search Cover Images</span>
-          </button>
-          <button data-action="auto-match-tags" data-book="${escapeHtml(activeBook?.bookKey || '')}" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            <span class="truncate">${enrichingBookKey ? 'Matching...' : 'Auto-Match Tags'}</span>
-          </button>
+          ${
+            activeBook
+              ? `<button data-action="open-cover-search" data-book="${escapeHtml(activeBook.bookKey)}" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+                  <span class="truncate">Search Cover Images</span>
+                </button>
+                <button data-action="auto-match-tags" data-book="${escapeHtml(activeBook.bookKey)}" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+                  <span class="truncate">${enrichingBookKey ? 'Matching...' : 'Auto-Match Tags'}</span>
+                </button>`
+              : ''
+          }
           <button data-action="trigger-local-folder" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span class="truncate">Add Local Folder</span>
           </button>
+          <button data-action="trigger-local-files" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+            <span class="truncate">Add Audio Files</span>
+          </button>
           <button data-action="connect-drive" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            <span class="truncate">${user.authenticated ? 'Scan Google Drive' : 'Connect Google Drive'}</span>
+            <span class="truncate">Sync Google Drive</span>
           </button>
           <button data-action="toggle-theme" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span>Theme</span>
@@ -1210,19 +1207,179 @@ class AudiobookApp {
           </button>
         </div>
 
-        ${
-          user.authenticated
-            ? `<div class="pt-2">
-                <button data-action="sign-out" class="btn-press w-full py-1.5 rounded-xl surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Sign Out</button>
-              </div>`
-            : ''
-        }
+        <div class="pt-2 space-y-1.5">
+          ${
+            user.authenticated
+              ? `<button data-action="sign-out" class="btn-press w-full py-1.5 rounded-xl surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Sign Out</button>`
+              : `<button data-action="login-google" class="btn-press w-full py-1.5 rounded-xl bg-[#1ed760] text-xs font-bold text-[#050506]">Sign In with Google</button>
+                 <button data-action="sign-out" class="btn-press w-full py-1.5 rounded-xl surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Return to Login</button>`
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  _renderLoginView() {
+    const { loginTokenOpen, authError } = this.state;
+    return `
+      <main class="min-h-screen w-full flex items-center justify-center p-6 bg-[var(--bg-canvas)]">
+        <div class="w-full max-w-sm surface-panel rounded-3xl p-8 border border-[var(--border-subtle)] shadow-2xl space-y-7 text-center">
+          <div class="flex flex-col items-center gap-4">
+            <div class="w-16 h-16 rounded-2xl bg-[#1ed760]/15 border border-[#1ed760]/35 flex items-center justify-center text-[#1ed760] shadow-lg">
+              <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
+                <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"/>
+                <path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
+              </svg>
+            </div>
+            <h1 class="text-2xl font-bold tracking-tight text-white">Audiobook Player</h1>
+          </div>
+
+          ${
+            authError
+              ? `<div class="rounded-xl bg-red-500/10 border border-red-500/30 px-3 py-2 text-xs text-red-300">${escapeHtml(authError)}</div>`
+              : ''
+          }
+
+          <div class="space-y-3">
+            <button data-action="login-google" class="btn-press w-full py-3 px-4 rounded-full bg-[#1ed760] hover:brightness-105 text-[#050506] text-sm font-bold flex items-center justify-center gap-2.5 shadow-lg">
+              <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+                <path fill="#050506" d="M21.35 11.1h-9.17v2.73h6.51c-.33 3.81-3.5 5.44-6.5 5.44C8.36 19.27 5 16.25 5 12c0-4.1 3.2-7.27 7.2-7.27c3.09 0 4.9 1.97 4.9 1.97L19 4.72S16.56 2 12.1 2C6.42 2 2.03 6.8 2.03 12c0 5.05 4.13 10 10.22 10c5.35 0 9.25-3.67 9.25-9.09c0-1.15-.15-1.81-.15-1.81Z"/>
+              </svg>
+              <span>Continue with Google</span>
+            </button>
+
+            <button data-action="login-local" class="btn-press w-full py-3 px-4 rounded-full surface-card hover:bg-white/10 text-white text-sm font-semibold">
+              Continue with Local Files
+            </button>
+          </div>
+
+          <div class="pt-1">
+            <button data-action="toggle-login-token" class="btn-press text-xs font-medium text-[var(--text-secondary)] hover:text-white">
+              ${loginTokenOpen ? 'Hide Drive Token' : 'Enter Google Drive Token'}
+            </button>
+            ${
+              loginTokenOpen
+                ? `<form id="loginDriveTokenForm" class="mt-3 flex items-center gap-2">
+                    <input id="loginDriveTokenInput" type="password" placeholder="Paste Google OAuth token..." class="flex-1 min-w-0 px-3 py-2 rounded-xl bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
+                    <button type="submit" class="btn-press px-3.5 py-2 rounded-xl bg-[#1ed760] text-[#050506] text-xs font-bold shrink-0">Connect</button>
+                  </form>`
+                : ''
+            }
+          </div>
+        </div>
+      </main>
+    `;
+  }
+
+  _renderEmptyLibraryCard() {
+    return `
+      <div class="flex-1 min-h-[360px] flex items-center justify-center p-4">
+        <div class="w-full max-w-md surface-card rounded-3xl p-7 text-center space-y-5 border border-[var(--border-subtle)]">
+          <div class="w-14 h-14 mx-auto rounded-2xl bg-white/5 border border-[var(--border-subtle)] flex items-center justify-center text-[#1ed760]">
+            ${ICON_LIBRARY(26)}
+          </div>
+          <div class="space-y-1">
+            <h2 class="text-lg font-bold text-white">Your library is empty</h2>
+            <p class="text-xs text-[var(--text-secondary)]">Import audiobooks from your device or Google Drive.</p>
+          </div>
+          <div class="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center justify-center gap-2.5 pt-1">
+            <button data-action="trigger-local-folder" class="btn-press px-4 py-2.5 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold">
+              Add Local Folder
+            </button>
+            <button data-action="trigger-local-files" class="btn-press px-4 py-2.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white text-xs font-semibold">
+              Add Audio Files
+            </button>
+            <button data-action="connect-drive" class="btn-press px-4 py-2.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white text-xs font-semibold">
+              Sync Google Drive
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderDriveSyncModal() {
+    const { open, folderId, token, loading, error } = this.state.driveModal;
+    if (!open) return '';
+    const hasToken = Boolean(token || this.syncService.getGoogleAccessToken());
+
+    return `
+      <div class="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="sheet-modal w-full max-w-md rounded-3xl overflow-hidden">
+          <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
+            <h2 class="text-base font-bold text-white truncate">Sync Google Drive</h2>
+            <button data-action="close-drive-modal" aria-label="Close" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white">
+              ${ICON_CLOSE(18)}
+            </button>
+          </div>
+
+          <form id="driveSyncForm" class="p-5 space-y-4">
+            ${
+              !hasToken
+                ? `<div class="space-y-1.5">
+                    <label for="driveTokenInput" class="block text-xs font-medium text-[var(--text-secondary)]">Google OAuth Token</label>
+                    <input id="driveTokenInput" type="password" value="${escapeHtml(token)}" placeholder="Paste Google OAuth access token..." class="w-full px-3.5 py-2.5 rounded-xl bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
+                  </div>`
+                : ''
+            }
+            <div class="space-y-1.5">
+              <label for="driveFolderIdInput" class="block text-xs font-medium text-[var(--text-secondary)]">Drive Folder ID (optional)</label>
+              <input id="driveFolderIdInput" type="text" value="${escapeHtml(folderId)}" placeholder="Leave blank to scan all Drive audio files" class="w-full px-3.5 py-2.5 rounded-xl bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
+            </div>
+
+            ${
+              error
+                ? `<div class="rounded-xl bg-red-500/10 border border-red-500/30 px-3 py-2 text-xs text-red-300">${escapeHtml(error)}</div>`
+                : ''
+            }
+
+            <div class="flex items-center justify-end gap-2 pt-1">
+              ${
+                !hasToken
+                  ? `<button type="button" data-action="login-google" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-semibold text-white mr-auto">Sign In with Google</button>`
+                  : ''
+              }
+              <button type="button" data-action="close-drive-modal" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Cancel</button>
+              <button type="submit" ${loading ? 'disabled' : ''} class="btn-press px-5 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold disabled:opacity-50">
+                ${loading ? 'Syncing...' : 'Sync Drive'}
+              </button>
+            </div>
+          </form>
+        </div>
       </div>
     `;
   }
 
   _renderNotificationShade(book, snap) {
-    if (!book) return '';
+    if (!book) {
+      return `
+        <div class="notif-shade rounded-3xl p-4 w-full max-w-[390px] mx-auto space-y-3 overflow-hidden">
+          <div class="flex items-center justify-between gap-2 min-w-0">
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="w-4 h-4 rounded-full bg-white/15 text-[var(--text-secondary)] flex items-center justify-center shrink-0">${ICON_PLAY(9)}</span>
+              <span class="text-xs font-medium text-[var(--text-secondary)] truncate">Audiobook Player</span>
+            </div>
+            <button data-action="cycle-device" class="btn-press inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/10 text-[11px] font-medium text-white shrink-0 max-w-[165px]">
+              ${ICON_SPEAKER(12, 'text-[#1ed760] shrink-0')}
+              <span class="truncate">${escapeHtml(this.state.activeOutputDevice)}</span>
+            </button>
+          </div>
+          <div class="flex items-center gap-3 min-w-0">
+            <div class="w-14 h-14 rounded-xl bg-white/5 border border-[var(--border-subtle)] flex items-center justify-center text-[var(--text-muted)] shrink-0">
+              ${ICON_LIBRARY(20)}
+            </div>
+            <div class="min-w-0 flex-1">
+              <div class="text-sm font-semibold text-white truncate">No audiobook playing</div>
+              <div class="text-xs text-[var(--text-secondary)] truncate">Add audiobooks to listen</div>
+            </div>
+            <button disabled aria-label="Play or Pause" class="play-fab w-11 h-11 shrink-0 opacity-40 cursor-not-allowed">
+              ${ICON_PLAY(18)}
+            </button>
+          </div>
+        </div>
+      `;
+    }
     const duration = Math.max(1, snap.durationSec || book.totalDurationSec || 1);
     const pos = Math.max(0, Math.min(duration, snap.positionSec || 0));
     const pct = Math.min(100, Math.max(0, (pos / duration) * 100));
@@ -1272,7 +1429,21 @@ class AudiobookApp {
   }
 
   _renderGalaxyWatchView(book, snap) {
-    if (!book) return '';
+    if (!book) {
+      return `
+        <main class="w-full min-h-screen flex flex-col items-center justify-center p-1 sm:p-4 bg-[var(--bg-canvas)]">
+          <div class="relative w-[270px] h-[270px] rounded-full overflow-hidden surface-shell shadow-[0_24px_60px_rgba(0,0,0,0.75)] flex flex-col items-center justify-between text-center mx-auto p-6 select-none">
+            <div data-testid="watchCoverBackdrop" class="watchCoverBackdrop absolute inset-0 pointer-events-none" style="background: radial-gradient(circle at 50% 35%, rgba(30,215,96,0.12) 0%, rgba(11,16,32,0.92) 60%, rgba(6,9,17,0.98) 100%);"></div>
+            <div class="relative z-10 mt-3 px-3 py-1 rounded-full bg-black/55 border border-white/10 text-xs font-semibold text-white">Audiobook Player</div>
+            <div class="relative z-10 flex flex-col items-center gap-2 my-auto">
+              <button disabled aria-label="Play or Pause" class="play-fab w-14 h-14 opacity-40 cursor-not-allowed">${ICON_PLAY(24)}</button>
+              <span class="text-xs text-[var(--text-secondary)]">No audiobook playing</span>
+            </div>
+            <div class="relative z-10 mb-2 text-[11px] text-[var(--text-muted)]">Idle</div>
+          </div>
+        </main>
+      `;
+    }
     const duration = Math.max(1, snap.durationSec || book.totalDurationSec || 1);
     const pos = Math.max(0, Math.min(duration, snap.positionSec || 0));
     const pct = Math.min(1, Math.max(0, pos / duration));
@@ -1335,7 +1506,17 @@ class AudiobookApp {
   }
 
   _renderAndroidAutoView(book, snap) {
-    if (!this.state.androidAutoConnected || !book) return '';
+    if (!this.state.androidAutoConnected) return '';
+    if (!book) {
+      return `
+        <main class="min-h-screen flex items-center justify-center p-4 sm:p-8">
+          <div class="w-full max-w-3xl surface-panel ambient-surface rounded-3xl p-6 sm:p-8 space-y-6 overflow-hidden shadow-2xl text-center">
+            <h2 class="text-2xl font-bold text-white">No audiobook playing</h2>
+            <p class="text-sm text-[var(--text-secondary)]">Import audiobooks in the player to listen here.</p>
+          </div>
+        </main>
+      `;
+    }
     const duration = Math.max(1, snap.durationSec || book.totalDurationSec || 1);
     const pos = Math.max(0, Math.min(duration, snap.positionSec || 0));
     const pct = Math.min(100, Math.max(0, (pos / duration) * 100));
@@ -1424,7 +1605,16 @@ class AudiobookApp {
         }
 
         <!-- Mobile Scrollable Content -->
-        <div class="flex-1 overflow-y-auto px-4 pb-24 space-y-6 min-w-0">
+        <div class="flex-1 overflow-y-auto px-4 pb-24 space-y-6 min-w-0 flex flex-col">
+          ${
+            this.books.length === 0
+              ? this._renderEmptyLibraryCard()
+              : filtered.length === 0
+                ? `<div class="flex-1 flex flex-col items-center justify-center text-center py-12 space-y-3">
+                    <div class="text-sm font-semibold text-white">No matching audiobooks</div>
+                    <button data-action="clear-filters" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-[#1ed760]">Clear filters</button>
+                  </div>`
+                : `
           <!-- 2-Column Quick-Resume Grid -->
           <div class="grid grid-cols-2 gap-2.5">
             ${filtered
@@ -1499,7 +1689,8 @@ class AudiobookApp {
                 )
                 .join('')}
             </div>
-          </section>
+          </section>`
+          }
         </div>
 
         <!-- Floating Mini-Player Bar -->
@@ -1524,7 +1715,22 @@ class AudiobookApp {
             <div data-ab-progress-fill class="h-full bg-[#1ed760]" style="width:${pct.toFixed(2)}%"></div>
           </div>
         </div>`
-            : ''
+            : `
+        <div class="absolute inset-x-3 bottom-3 z-20 rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
+          <div class="p-2.5 flex items-center gap-3 min-w-0">
+            <div class="w-11 h-11 rounded-xl bg-white/5 border border-[var(--border-subtle)] flex items-center justify-center text-[var(--text-muted)] shrink-0">
+              ${ICON_LIBRARY(18)}
+            </div>
+            <div class="min-w-0 flex-1">
+              <div class="text-xs font-semibold text-white truncate">No audiobook playing</div>
+              <div class="text-[11px] text-[var(--text-secondary)] truncate">Library idle</div>
+            </div>
+            <button disabled aria-label="Play or Pause" class="play-fab w-9 h-9 shrink-0 opacity-40 cursor-not-allowed">
+              ${ICON_PLAY(16)}
+            </button>
+          </div>
+          <div class="h-0.5 w-full bg-white/10"></div>
+        </div>`
         }
 
         ${this.state.mobileSheetOpen ? this._renderMobileFullSheet(activeBook, snap) : ''}
@@ -1666,12 +1872,22 @@ class AudiobookApp {
             </div>
 
             <div class="flex-1 overflow-y-auto p-2 space-y-1">
-              ${filtered
-                .map(
-                  (book) => `
+              ${
+                this.books.length === 0
+                  ? sidebarCollapsed
+                    ? ''
+                    : `<div class="px-2 py-6 text-center space-y-2.5">
+                        <div class="text-xs text-[var(--text-muted)]">No audiobooks yet</div>
+                        <button data-action="trigger-local-files" class="btn-press w-full py-1.5 px-3 rounded-full surface-card text-[11px] font-semibold text-white hover:bg-white/10">
+                          + Add Audio Files
+                        </button>
+                      </div>`
+                  : filtered
+                      .map(
+                        (book) => `
                 <button data-action="open-detail" data-book="${escapeHtml(book.bookKey)}" class="btn-press w-full flex items-center gap-2.5 p-2 rounded-xl text-left overflow-hidden min-w-0 ${
-                    activeBook?.bookKey === book.bookKey ? 'bg-white/10' : 'hover:bg-white/5'
-                  }">
+                          activeBook?.bookKey === book.bookKey ? 'bg-white/10' : 'hover:bg-white/5'
+                        }">
                   <div class="w-11 h-11 rounded-lg overflow-hidden shrink-0">
                     ${this._renderCoverImg(book)}
                   </div>
@@ -1690,8 +1906,9 @@ class AudiobookApp {
                         <div class="flex items-center gap-1 shrink-0">${this._renderSourceBadges(book, 13)}</div>`
                   }
                 </button>`
-                )
-                .join('')}
+                      )
+                      .join('')
+              }
             </div>
           </aside>
 
@@ -1715,7 +1932,7 @@ class AudiobookApp {
               </div>
             </div>
 
-            <div class="flex-1 overflow-y-auto p-5 space-y-7 min-w-0">
+            <div class="flex-1 overflow-y-auto p-5 space-y-7 min-w-0 flex flex-col">
               ${
                 desktopView === 'detail' && detailBook
                   ? this._renderDesktopDetail(detailBook)
@@ -1726,8 +1943,9 @@ class AudiobookApp {
 
           <!-- Right Now Playing & Bookmarks Panel -->
           ${
-            rightPanelOpen && activeBook
-              ? `
+            rightPanelOpen
+              ? activeBook
+                ? `
           <aside class="hidden lg:flex w-80 shrink-0 surface-panel rounded-2xl flex-col overflow-hidden">
             <div class="px-4 py-3 border-b border-[var(--border-subtle)] flex items-center justify-between gap-2">
               <span class="text-xs font-bold uppercase tracking-wider text-[var(--text-secondary)] truncate">Now Playing</span>
@@ -1782,6 +2000,22 @@ class AudiobookApp {
               </div>
             </div>
           </aside>`
+                : `
+          <aside class="hidden lg:flex w-80 shrink-0 surface-panel rounded-2xl flex-col overflow-hidden">
+            <div class="px-4 py-3 border-b border-[var(--border-subtle)] flex items-center justify-between gap-2">
+              <span class="text-xs font-bold uppercase tracking-wider text-[var(--text-secondary)] truncate">Now Playing</span>
+              <button data-action="toggle-right-panel" aria-label="Close Panel" class="btn-press p-1 rounded-lg hover:bg-white/10 text-[var(--text-secondary)]">${ICON_CLOSE(15)}</button>
+            </div>
+            <div class="flex-1 flex flex-col items-center justify-center p-6 text-center space-y-3">
+              <div class="w-24 h-24 rounded-2xl bg-white/5 border border-[var(--border-subtle)] flex items-center justify-center text-[var(--text-muted)]">
+                ${ICON_LIBRARY(30)}
+              </div>
+              <div class="space-y-1">
+                <div class="text-sm font-semibold text-white">No audiobook playing</div>
+                <div class="text-xs text-[var(--text-secondary)]">Select or import an audiobook to listen.</div>
+              </div>
+            </div>
+          </aside>`
               : ''
           }
         </div>
@@ -1830,13 +2064,58 @@ class AudiobookApp {
             </button>
           </div>
         </footer>`
-            : ''
+            : `
+        <footer class="h-20 shrink-0 px-4 border-t border-[var(--border-subtle)] bg-[var(--bg-canvas)] flex items-center justify-between gap-4">
+          <div class="flex items-center gap-3 w-64 lg:w-72 min-w-0">
+            <div class="w-12 h-12 rounded-lg bg-white/5 border border-[var(--border-subtle)] flex items-center justify-center text-[var(--text-muted)] shrink-0">
+              ${ICON_LIBRARY(18)}
+            </div>
+            <div class="min-w-0 flex-1">
+              <div class="text-xs font-semibold text-white truncate">No audiobook playing</div>
+              <div class="text-[11px] text-[var(--text-secondary)] truncate">Library idle</div>
+            </div>
+          </div>
+
+          <div class="flex-1 max-w-xl flex flex-col items-center gap-1.5 min-w-0">
+            <div class="flex items-center gap-4 opacity-40">
+              <button disabled aria-label="Rewind 15 seconds" class="p-1.5 text-[var(--text-secondary)] cursor-not-allowed">${ICON_SKIP_BACK_15(19)}</button>
+              <button disabled aria-label="Previous chapter" class="p-1.5 text-[var(--text-secondary)] cursor-not-allowed">${ICON_PREV(17)}</button>
+              <button disabled aria-label="Play or Pause" class="play-fab w-9 h-9 cursor-not-allowed">${ICON_PLAY(16)}</button>
+              <button disabled aria-label="Next chapter" class="p-1.5 text-[var(--text-secondary)] cursor-not-allowed">${ICON_NEXT(17)}</button>
+              <button disabled aria-label="Forward 30 seconds" class="p-1.5 text-[var(--text-secondary)] cursor-not-allowed">${ICON_SKIP_FORWARD_30(19)}</button>
+            </div>
+            <div class="w-full flex items-center gap-2.5 opacity-50">
+              <span class="text-[11px] text-[var(--text-secondary)] tabular-nums shrink-0">0:00</span>
+              <input disabled type="range" min="0" max="100" value="0" style="--range-progress:0%" class="ab-range flex-1 min-w-0 cursor-not-allowed" />
+              <span class="text-[11px] text-[var(--text-secondary)] tabular-nums shrink-0">-0:00</span>
+            </div>
+          </div>
+
+          <div class="hidden md:flex items-center justify-end gap-2 w-64 shrink-0">
+            <button data-action="cycle-speed" class="btn-press px-2.5 py-1 rounded-full surface-card text-xs font-semibold text-white tabular-nums">${formatPlaybackRate(snap.playbackRate)}</button>
+            <button data-action="cycle-device" class="btn-press inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white max-w-[130px]">
+              ${ICON_SPEAKER(13, 'text-[#1ed760] shrink-0')}
+              <span class="truncate">${escapeHtml(this.state.activeOutputDevice)}</span>
+            </button>
+          </div>
+        </footer>`
         }
       </div>
     `;
   }
 
   _renderDesktopHome(filtered, activeBook) {
+    if (this.books.length === 0) {
+      return this._renderEmptyLibraryCard();
+    }
+    if (filtered.length === 0) {
+      return `
+        <div class="flex-1 min-h-[280px] flex flex-col items-center justify-center text-center space-y-3">
+          <div class="text-sm font-semibold text-white">No matching audiobooks</div>
+          <button data-action="clear-filters" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-[#1ed760]">Clear filters</button>
+        </div>
+      `;
+    }
     return `
       <!-- Quick-Resume Grid -->
       <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
@@ -2043,6 +2322,17 @@ class AudiobookApp {
 
   render() {
     if (!this.rootEl) return;
+
+    if (!this.user && !this.guestLocalMode) {
+      this.rootEl.innerHTML = `
+        <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
+          ${this._renderLoginView()}
+        </div>
+      `;
+      this._bindViewEvents();
+      return;
+    }
+
     const activeBook = this.getActiveBook();
     const snap = this.state.snapshot;
     const layoutMode = this._detectViewportLayout();
@@ -2064,6 +2354,7 @@ class AudiobookApp {
         ${bodyView}
         ${this._renderProfilePopover()}
         ${this._renderCoverSearchModal()}
+        ${this._renderDriveSyncModal()}
       </div>
     `;
 
@@ -2112,6 +2403,33 @@ class AudiobookApp {
         if (input) {
           void this.runCoverSearch(input.value);
         }
+      });
+    }
+
+    const loginTokenForm = document.getElementById('loginDriveTokenForm');
+    if (loginTokenForm) {
+      loginTokenForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const input = document.getElementById('loginDriveTokenInput');
+        const token = input?.value?.trim() || '';
+        if (!token) {
+          this.state.authError = 'Paste a valid Google OAuth token to connect.';
+          this.render();
+          return;
+        }
+        this.syncService.setGoogleAccessToken(token);
+        this.audioEngine.setDriveAccessToken(token);
+        void this.enterLocalMode();
+      });
+    }
+
+    const driveSyncForm = document.getElementById('driveSyncForm');
+    if (driveSyncForm) {
+      driveSyncForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const tokenInput = document.getElementById('driveTokenInput');
+        const folderInput = document.getElementById('driveFolderIdInput');
+        void this.runGoogleDriveSync(folderInput?.value || '', tokenInput?.value || '');
       });
     }
 
@@ -2287,6 +2605,38 @@ class AudiobookApp {
             if (folderInput) folderInput.click();
             break;
           }
+          case 'trigger-local-files': {
+            this.state.profileOpen = false;
+            const filesInput = document.getElementById('localAudioFilesInput');
+            if (filesInput) filesInput.click();
+            break;
+          }
+          case 'login-google': {
+            this.state.profileOpen = false;
+            void this.syncService.signInWithGoogle({ autoRedirect: true });
+            break;
+          }
+          case 'login-local': {
+            void this.enterLocalMode();
+            break;
+          }
+          case 'toggle-login-token': {
+            this.state.loginTokenOpen = !this.state.loginTokenOpen;
+            this.state.authError = '';
+            this.render();
+            break;
+          }
+          case 'clear-filters': {
+            this.state.filterSource = 'all';
+            this.state.searchQuery = '';
+            this.render();
+            break;
+          }
+          case 'close-drive-modal': {
+            this.state.driveModal.open = false;
+            this.render();
+            break;
+          }
           case 'connect-drive': {
             void this.handleConnectGoogleDrive();
             break;
@@ -2300,10 +2650,7 @@ class AudiobookApp {
             break;
           }
           case 'sign-out': {
-            void this.syncService.signOut().then(() => {
-              this.state.profileOpen = false;
-              this.render();
-            });
+            void this.handleSignOut();
             break;
           }
           default:

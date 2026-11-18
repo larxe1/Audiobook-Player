@@ -10,6 +10,7 @@ export const SUPABASE_CONFIG = {
 };
 
 const SESSION_STORAGE_KEY = 'audiobook_player_supabase_session_v1';
+const GOOGLE_TOKEN_STORAGE_KEY = 'audiobook_player_google_token_v1';
 const DEVICE_ID_STORAGE_KEY = 'audiobook_player_device_id_v1';
 const BROADCAST_CHANNEL_NAME = 'audiobook-player-sync-channel';
 
@@ -301,12 +302,85 @@ export class SupabaseSyncService {
     this._saveSession(session);
   }
 
+  _loadManualGoogleToken() {
+    if (!this.storage) return null;
+    try {
+      return this.storage.getItem(GOOGLE_TOKEN_STORAGE_KEY) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Persists a Google OAuth provider token for Google Drive API v3 calls.
+   * @param {string|null} token
+   */
+  setGoogleAccessToken(token) {
+    const clean = typeof token === 'string' ? token.trim() : '';
+    if (this.storage) {
+      try {
+        if (clean) {
+          this.storage.setItem(GOOGLE_TOKEN_STORAGE_KEY, clean);
+        } else {
+          this.storage.removeItem(GOOGLE_TOKEN_STORAGE_KEY);
+        }
+      } catch {
+        // Ignore storage failures
+      }
+    }
+    if (this.session) {
+      this._saveSession({
+        ...this.session,
+        provider_token: clean || null
+      });
+    }
+  }
+
   /**
    * Returns the Google OAuth provider token if available (for Google Drive API v3 calls).
    * @returns {string|null}
    */
   getGoogleAccessToken() {
-    return this.session?.provider_token || this.session?.googleAccessToken || null;
+    return (
+      this.session?.provider_token ||
+      this.session?.googleAccessToken ||
+      this._loadManualGoogleToken() ||
+      null
+    );
+  }
+
+  /**
+   * Restores and validates any persisted Supabase session via /auth/v1/user.
+   * Returns the validated session or null when signed out / expired.
+   * @returns {Promise<object|null>}
+   */
+  async restoreSession() {
+    this.session = this._loadSession();
+    if (!this.session?.access_token) {
+      return null;
+    }
+    if (this._isOnline() && this.fetchImpl) {
+      try {
+        const res = await this.fetchImpl(`${this.config.url}/auth/v1/user`, {
+          headers: {
+            apikey: this.config.publishableKey,
+            Authorization: `Bearer ${this.session.access_token}`
+          }
+        });
+        if (res.ok) {
+          const user = await res.json();
+          this._saveSession({ ...this.session, user });
+          return this.session;
+        }
+        if (res.status === 401 || res.status === 403) {
+          this._saveSession(null);
+          return null;
+        }
+      } catch {
+        // Offline fallback: keep persisted user session if user object exists
+      }
+    }
+    return this.session?.user ? this.session : null;
   }
 
   /**
@@ -391,12 +465,17 @@ export class SupabaseSyncService {
         });
         if (res.ok) {
           session.user = await res.json();
+        } else if (res.status === 401 || res.status === 403) {
+          return null;
         }
       } catch {
         // Keep token-only session if user lookup is temporarily offline
       }
     }
 
+    if (session.provider_token) {
+      this.setGoogleAccessToken(session.provider_token);
+    }
     this._saveSession(session);
     this.connectRealtime();
     return session;
@@ -421,6 +500,7 @@ export class SupabaseSyncService {
         // Proceed with local sign-out even if network call fails
       }
     }
+    this.setGoogleAccessToken(null);
     this._saveSession(null);
     this.disconnectRealtime();
   }
