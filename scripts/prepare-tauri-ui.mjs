@@ -10,7 +10,7 @@ const outDir = resolve(rootDir, 'ui-dist');
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
-for (const file of ['index.html', 'version.json']) {
+for (const file of ['index.html', 'version.json', 'oauth-callback.html', 'sw.js']) {
   const srcFile = resolve(rootDir, file);
   if (existsSync(srcFile)) {
     copyFileSync(srcFile, resolve(outDir, file));

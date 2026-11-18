@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#060911" />
+    <title>Audiobook Player — Google Sign-In</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        min-height: 100vh;
+        background-color: #060911;
+        color: #f8fafc;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Inter, sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .card {
+        width: min(92vw, 420px);
+        padding: 28px 24px;
+        border-radius: 18px;
+        background: rgba(15, 23, 42, 0.85);
+        border: 1px solid rgba(148, 163, 184, 0.16);
+        box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+        text-align: center;
+      }
+      .badge {
+        width: 48px;
+        height: 48px;
+        margin: 0 auto 16px;
+        border-radius: 9999px;
+        background: rgba(30, 215, 96, 0.14);
+        border: 1px solid rgba(30, 215, 96, 0.35);
+        color: #1ed760;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 22px;
+        font-weight: 700;
+      }
+      .badge.is-error {
+        background: rgba(239, 68, 68, 0.14);
+        border-color: rgba(239, 68, 68, 0.35);
+        color: #f87171;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 18px;
+        font-weight: 700;
+        line-height: 1.35;
+      }
+      p {
+        margin: 0;
+        font-size: 14px;
+        line-height: 1.5;
+        color: #94a3b8;
+      }
+      .btn {
+        display: inline-block;
+        margin-top: 20px;
+        padding: 12px 22px;
+        border-radius: 9999px;
+        background: #1ed760;
+        color: #060911;
+        font-size: 14px;
+        font-weight: 700;
+        text-decoration: none;
+        transition: transform 140ms ease, opacity 140ms ease;
+      }
+      .btn:active {
+        transform: scale(0.98);
+      }
+      .hidden {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <div id="statusBadge" class="badge">✓</div>
+      <h1 id="statusTitle">Completing Google Sign-In…</h1>
+      <p id="statusSubtitle">Please wait a moment.</p>
+      <a id="returnBtn" class="btn hidden" href="com.audiobook.player://oauth">Return to Audiobook Player</a>
+    </main>
+
+    <script>
+      (function () {
+        var searchParams = new URLSearchParams(window.location.search || '');
+        var hashParams = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
+        var getParam = function (key) {
+          var fromHash = hashParams.get(key);
+          if (fromHash !== null) return fromHash;
+          var fromSearch = searchParams.get(key);
+          return fromSearch !== null ? fromSearch : '';
+        };
+
+        var access_token = getParam('access_token');
+        var error = getParam('error');
+        var error_description = getParam('error_description');
+        var state = getParam('state');
+
+        var badgeEl = document.getElementById('statusBadge');
+        var titleEl = document.getElementById('statusTitle');
+        var subtitleEl = document.getElementById('statusSubtitle');
+        var returnBtn = document.getElementById('returnBtn');
+
+        if (state && state.indexOf('android_') === 0) {
+          var suffix = (window.location.search || '') + (window.location.hash || '');
+          var deepLink = 'com.audiobook.player://oauth' + suffix;
+          returnBtn.setAttribute('href', deepLink);
+          returnBtn.classList.remove('hidden');
+
+          if (error && !access_token) {
+            badgeEl.textContent = '!';
+            badgeEl.classList.add('is-error');
+            titleEl.textContent = 'Google Sign-In did not complete';
+            subtitleEl.textContent = error_description || error;
+          } else {
+            titleEl.textContent = 'Returning to Audiobook Player…';
+            subtitleEl.textContent = 'Tap the button below if the app does not reopen automatically.';
+          }
+
+          window.location.replace(deepLink);
+          return;
+        }
+
+        if (window.opener && !window.opener.closed) {
+          try {
+            window.opener.postMessage(
+              {
+                type: 'audiobook_google_oauth',
+                access_token: access_token,
+                error: error,
+                error_description: error_description,
+                state: state
+              },
+              window.location.origin
+            );
+          } catch (e) {}
+        }
+
+        if (error && !access_token) {
+          badgeEl.textContent = '!';
+          badgeEl.classList.add('is-error');
+          titleEl.textContent = 'Google Sign-In did not complete';
+          subtitleEl.textContent = (error_description || error) + ' — you can close this window.';
+        } else {
+          titleEl.textContent = 'Sign-in complete — you can close this window';
+          subtitleEl.textContent = 'Your Google account is now connected to Audiobook Player.';
+        }
+
+        if (window.opener && !window.opener.closed) {
+          setTimeout(function () {
+            try {
+              window.close();
+            } catch (e) {}
+          }, 400);
+        }
+      })();
+    </script>
+  </body>
+</html>

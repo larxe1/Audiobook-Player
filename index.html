@@ -89,7 +89,7 @@
     <script>
       if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.protocol === 'http:')) {
         window.addEventListener('load', () => {
-          navigator.serviceWorker.register('./public/sw.js').catch(() => {});
+          navigator.serviceWorker.register('./sw.js').catch(() => {});
         });
       }
     </script>

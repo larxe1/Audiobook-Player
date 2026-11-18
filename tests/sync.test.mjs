@@ -6,6 +6,7 @@ import {
   resolveProgressConflict
 } from '../src/services/offline-queue.js';
 import {
+  DEFAULT_GOOGLE_CLIENT_ID,
   SUPABASE_CONFIG,
   SupabaseSyncService,
   handleRemoteEvent
@@ -40,9 +41,9 @@ function createFakeWindow() {
     removeEventListener(type, fn) {
       listeners.get(type)?.delete(fn);
     },
-    dispatchEvent(type) {
+    dispatchEvent(type, extra = {}) {
       for (const fn of listeners.get(type) || []) {
-        fn({ type });
+        fn({ type, ...extra });
       }
     }
   };
@@ -837,5 +838,191 @@ test('SupabaseSyncService Android native OAuth bridge hydrates Gmail profile on 
   assert.equal(res.ok, true);
   assert.equal(sync.getUserProfile().email, 'driver@gmail.com');
   assert.equal(sync.getGoogleAccessToken(), 'ya29.android_native_popup_token');
+  sync.destroy();
+});
+
+test('DEFAULT_GOOGLE_CLIENT_ID matches updated OAuth client ID', () => {
+  assert.equal(
+    DEFAULT_GOOGLE_CLIENT_ID,
+    '22283534025-av56s1jjavk740hd5n4i7r10jkjajd1f.apps.googleusercontent.com'
+  );
+});
+
+test('SupabaseSyncService AudiobookOAuthNative Chrome Custom Tabs flow verifies state and completes OAuth', async () => {
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://localhost';
+  fakeWindow.Capacitor = { isNativePlatform: () => true };
+
+  let capturedArgs = null;
+  let consumeCalls = 0;
+  fakeWindow.AudiobookOAuthNative = {
+    consumePendingResult() {
+      consumeCalls += 1;
+      return null;
+    },
+    startGoogleOAuth(clientId, scope, loginHint, state, redirectUri) {
+      capturedArgs = { clientId, scope, loginHint, state, redirectUri };
+      queueMicrotask(() => {
+        fakeWindow.__onAndroidGoogleOAuthResult({
+          access_token: 'ya29.custom_tabs_android_token',
+          state
+        });
+      });
+    }
+  };
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.endsWith('/auth/v1/settings')) {
+        return { ok: true, status: 200, async json() { return { external: { google: false } }; } };
+      }
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              sub: '5544',
+              email: 'customtabs@gmail.com',
+              name: 'Custom Tabs User',
+              picture: 'https://lh3.googleusercontent.com/ct.jpg'
+            };
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const res = await sync.signInWithGoogle({
+    autoRedirect: true,
+    fallbackToDirectGoogleOAuth: true,
+    hint: 'customtabs@gmail.com'
+  });
+
+  assert.equal(res.ok, true);
+  assert.ok(consumeCalls >= 1);
+  assert.equal(capturedArgs.clientId, DEFAULT_GOOGLE_CLIENT_ID);
+  assert.equal(capturedArgs.loginHint, 'customtabs@gmail.com');
+  assert.match(capturedArgs.state, /^android_/);
+  assert.equal(
+    capturedArgs.redirectUri,
+    'https://larxe1.github.io/Audiobook-Player/oauth-callback.html'
+  );
+  assert.equal(sync.getUserProfile().email, 'customtabs@gmail.com');
+  assert.equal(sync.getGoogleAccessToken(), 'ya29.custom_tabs_android_token');
+  assert.equal(fakeWindow.__onAndroidGoogleOAuthResult, undefined);
+  sync.destroy();
+});
+
+test('SupabaseSyncService AudiobookOAuthNative rejects mismatched state and handles cancellation on focus/visibilitychange', async () => {
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://localhost';
+  fakeWindow.Capacitor = { isNativePlatform: () => true };
+
+  // 1. Mismatched state must be rejected cleanly
+  fakeWindow.AudiobookOAuthNative = {
+    consumePendingResult: () => null,
+    startGoogleOAuth() {
+      queueMicrotask(() => {
+        fakeWindow.__onAndroidGoogleOAuthResult({
+          access_token: 'ya29.forged_token',
+          state: 'android_wrong_state'
+        });
+      });
+    }
+  };
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.endsWith('/auth/v1/settings')) {
+        return { ok: true, status: 200, async json() { return { external: { google: false } }; } };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const mismatchRes = await sync.signInWithGooglePopup();
+  assert.equal(mismatchRes.ok, false);
+  assert.equal(mismatchRes.reason, 'oauth_state_mismatch');
+  assert.equal(sync.getGoogleAccessToken(), null);
+
+  // 2. Returning to app (focus/visibilitychange) without OAuth completion cancels cleanly
+  fakeWindow.AudiobookOAuthNative = {
+    consumePendingResult: () => null,
+    startGoogleOAuth() {
+      setTimeout(() => {
+        fakeWindow.dispatchEvent('focus');
+      }, 5);
+    }
+  };
+
+  const cancelRes = await sync.signInWithGooglePopup({ androidCancelDelayMs: 25 });
+  assert.equal(cancelRes.ok, false);
+  assert.equal(cancelRes.reason, 'popup_closed');
+  assert.equal(fakeWindow.__onAndroidGoogleOAuthResult, undefined);
+  sync.destroy();
+});
+
+test('SupabaseSyncService openBrowserOAuthPopup completes OAuth via postMessage from oauth-callback.html', async () => {
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://larxe1.github.io';
+  fakeWindow.location.pathname = '/Audiobook-Player/';
+  let popupClosed = false;
+  fakeWindow.open = () => ({
+    closed: false,
+    location: {},
+    close() {
+      popupClosed = true;
+      this.closed = true;
+    }
+  });
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Windows NT 10.0)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { sub: '321', email: 'pwa@gmail.com', name: 'PWA Reader' };
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const pending = sync.signInWithGooglePopup({ forcePopup: true });
+  setTimeout(() => {
+    fakeWindow.dispatchEvent('message', {
+      origin: 'https://larxe1.github.io',
+      data: {
+        type: 'audiobook_google_oauth',
+        access_token: 'ya29.postmessage_token'
+      }
+    });
+  }, 15);
+
+  const res = await pending;
+  assert.equal(res.ok, true);
+  assert.equal(popupClosed, true);
+  assert.equal(sync.getGoogleAccessToken(), 'ya29.postmessage_token');
+  assert.equal(sync.getUserProfile().email, 'pwa@gmail.com');
   sync.destroy();
 });

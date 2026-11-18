@@ -10,7 +10,7 @@ export const SUPABASE_CONFIG = {
 };
 
 export const DEFAULT_GOOGLE_CLIENT_ID =
-  '572567924584-qj0m9fkkkjsrgva6dj32or7esbgkqvql.apps.googleusercontent.com';
+  '22283534025-av56s1jjavk740hd5n4i7r10jkjajd1f.apps.googleusercontent.com';
 
 const SESSION_STORAGE_KEY = 'audiobook_player_supabase_session_v1';
 const GOOGLE_TOKEN_STORAGE_KEY = 'audiobook_player_google_token_v1';
@@ -915,6 +915,189 @@ export class SupabaseSyncService {
       }
     }
 
+    const nativeOAuthBridge = this.windowObj?.AudiobookOAuthNative;
+    if (this._isCapacitorEnvironment() && typeof nativeOAuthBridge?.startGoogleOAuth === 'function') {
+      const parseNativePayload = (raw) => {
+        if (!raw) return null;
+        if (typeof raw === 'string') {
+          try {
+            return JSON.parse(raw);
+          } catch {
+            return null;
+          }
+        }
+        return typeof raw === 'object' ? raw : null;
+      };
+
+      const initialPending = parseNativePayload(nativeOAuthBridge.consumePendingResult?.());
+      if (initialPending?.access_token || initialPending?.accessToken) {
+        return await this.completeGoogleOAuthToken(
+          initialPending.access_token || initialPending.accessToken
+        );
+      }
+
+      const randomNonce =
+        typeof globalThis.crypto?.randomUUID === 'function'
+          ? globalThis.crypto.randomUUID().replace(/-/g, '')
+          : `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+      const state = `android_${randomNonce}`;
+      const redirectUri = 'https://larxe1.github.io/Audiobook-Player/oauth-callback.html';
+      const cancelDelayMs = Math.max(0, Number(options.androidCancelDelayMs ?? 1800));
+      const doc = this.windowObj?.document || (typeof document !== 'undefined' ? document : null);
+
+      return await new Promise((resolve) => {
+        let settled = false;
+        let cancelTimer = null;
+        let overallTimer = null;
+
+        const cleanup = () => {
+          if (cancelTimer) {
+            clearTimeout(cancelTimer);
+            cancelTimer = null;
+          }
+          if (overallTimer) {
+            clearTimeout(overallTimer);
+            overallTimer = null;
+          }
+          if (doc && typeof doc.removeEventListener === 'function') {
+            doc.removeEventListener('visibilitychange', onReturnToApp);
+          }
+          if (this.windowObj && typeof this.windowObj.removeEventListener === 'function') {
+            this.windowObj.removeEventListener('visibilitychange', onReturnToApp);
+            this.windowObj.removeEventListener('focus', onReturnToApp);
+          }
+          if (this.windowObj && this.windowObj.__onAndroidGoogleOAuthResult === onAndroidResult) {
+            delete this.windowObj.__onAndroidGoogleOAuthResult;
+          }
+        };
+
+        const finish = (result) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(result);
+        };
+
+        const handlePayload = async (rawPayload) => {
+          const payload = parseNativePayload(rawPayload);
+          if (!payload || settled) return;
+
+          if (payload.state !== state) {
+            if (payload.error && !payload.state) {
+              finish({
+                ok: false,
+                reason: payload.error || 'android_oauth_cancelled',
+                error: payload.error_description || 'Google sign-in did not complete.'
+              });
+              return;
+            }
+            finish({
+              ok: false,
+              reason: 'oauth_state_mismatch',
+              error: 'Google sign-in state verification failed.'
+            });
+            return;
+          }
+
+          if (payload.error) {
+            finish({
+              ok: false,
+              reason: payload.error || 'android_oauth_cancelled',
+              error: payload.error_description || 'Google sign-in was cancelled or rejected.'
+            });
+            return;
+          }
+
+          const token = payload.access_token || payload.accessToken;
+          if (token) {
+            settled = true;
+            cleanup();
+            resolve(await this.completeGoogleOAuthToken(token));
+            return;
+          }
+
+          finish({
+            ok: false,
+            reason: 'android_oauth_cancelled',
+            error: 'Google sign-in did not return an access token.'
+          });
+        };
+
+        const onAndroidResult = (rawPayload) => {
+          void handlePayload(rawPayload);
+        };
+
+        const checkPendingResult = () => {
+          const pending = parseNativePayload(nativeOAuthBridge.consumePendingResult?.());
+          if (pending) {
+            void handlePayload(pending);
+            return true;
+          }
+          return false;
+        };
+
+        const onReturnToApp = () => {
+          if (settled) return;
+          if (doc && (doc.hidden || doc.visibilityState === 'hidden')) {
+            return;
+          }
+          if (checkPendingResult()) return;
+          if (!cancelTimer) {
+            cancelTimer = setTimeout(() => {
+              if (settled) return;
+              if (checkPendingResult()) return;
+              finish({
+                ok: false,
+                reason: 'popup_closed',
+                error: 'Google sign-in was cancelled.'
+              });
+            }, cancelDelayMs);
+          }
+        };
+
+        this.windowObj.__onAndroidGoogleOAuthResult = onAndroidResult;
+
+        if (doc && typeof doc.addEventListener === 'function') {
+          doc.addEventListener('visibilitychange', onReturnToApp);
+        }
+        if (this.windowObj && typeof this.windowObj.addEventListener === 'function') {
+          this.windowObj.addEventListener('visibilitychange', onReturnToApp);
+          this.windowObj.addEventListener('focus', onReturnToApp);
+        }
+
+        overallTimer = setTimeout(() => {
+          finish({
+            ok: false,
+            reason: 'oauth_timeout',
+            error: 'Google sign-in timed out.'
+          });
+        }, 180000);
+
+        try {
+          const started = nativeOAuthBridge.startGoogleOAuth(
+            clientId,
+            scopes,
+            options.hint || '',
+            state,
+            redirectUri
+          );
+          if (started === false) {
+            finish({
+              ok: false,
+              reason: 'android_oauth_error',
+              error: 'Unable to open Google sign-in in Chrome Custom Tabs.'
+            });
+          }
+        } catch (err) {
+          finish({
+            ok: false,
+            reason: 'android_oauth_error',
+            error: err?.message || 'Google sign-in failed on Android.'
+          });
+        }
+      });
+    }
+
     // 3. Browser / PWA: try Google Identity Services token client first, falling back to popup window
     const openBrowserOAuthPopup = () => {
       if (typeof this.windowObj?.open !== 'function') {
@@ -959,9 +1142,47 @@ export class SupabaseSyncService {
 
       return new Promise((resolve) => {
         const startedAt = Date.now();
-        const poll = setInterval(async () => {
-          if (popup.closed) {
+        let settled = false;
+        let poll = null;
+
+        const cleanup = () => {
+          if (poll) {
             clearInterval(poll);
+            poll = null;
+          }
+          if (this.windowObj && typeof this.windowObj.removeEventListener === 'function') {
+            this.windowObj.removeEventListener('message', onMessage);
+          }
+        };
+
+        const onMessage = async (event) => {
+          if (settled) return;
+          if (event?.origin && origin && event.origin !== origin) return;
+          const data = event?.data;
+          if (!data || data.type !== 'audiobook_google_oauth') return;
+          settled = true;
+          cleanup();
+          try { popup.close(); } catch {}
+          if (data.access_token) {
+            resolve(await this.completeGoogleOAuthToken(data.access_token));
+            return;
+          }
+          resolve({
+            ok: false,
+            reason: 'oauth_error',
+            error: data.error_description || data.error || 'Google sign-in was cancelled or rejected.'
+          });
+        };
+
+        if (this.windowObj && typeof this.windowObj.addEventListener === 'function') {
+          this.windowObj.addEventListener('message', onMessage);
+        }
+
+        poll = setInterval(async () => {
+          if (settled) return;
+          if (popup.closed) {
+            settled = true;
+            cleanup();
             resolve({
               ok: false,
               reason: 'popup_closed',
@@ -972,7 +1193,8 @@ export class SupabaseSyncService {
           try {
             const hash = popup.location?.hash || '';
             if (hash.includes('access_token=')) {
-              clearInterval(poll);
+              settled = true;
+              cleanup();
               const params = new URLSearchParams(hash.replace(/^#/, ''));
               const token = params.get('access_token');
               try { popup.close(); } catch {}
@@ -980,7 +1202,8 @@ export class SupabaseSyncService {
               return;
             }
             if (hash.includes('error=')) {
-              clearInterval(poll);
+              settled = true;
+              cleanup();
               try { popup.close(); } catch {}
               resolve({
                 ok: false,
@@ -993,7 +1216,8 @@ export class SupabaseSyncService {
             // Cross-origin while user is on accounts.google.com
           }
           if (Date.now() - startedAt > 120000) {
-            clearInterval(poll);
+            settled = true;
+            cleanup();
             try { popup.close(); } catch {}
             resolve({
               ok: false,

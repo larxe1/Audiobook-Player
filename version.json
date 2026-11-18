@@ -1,11 +1,11 @@
 {
-  "version": "1.0.9",
-  "build": 10,
+  "version": "1.0.10",
+  "build": 11,
   "channel": "stable",
-  "publishedAt": "2026-11-18T06:05:50Z",
+  "publishedAt": "2026-11-18T06:33:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Unify split series folders (The Expanse, The First Law, The Age of Madness, The Sandman), normalize curly apostrophes and Roman numerals, and heal cached library keys on startup"
+  "releaseNotes": "Fix Android APK Google OAuth via Chrome Custom Tabs and deep link callback, update Google OAuth client ID across platforms, and fix root PWA service worker OTA caching"
 }

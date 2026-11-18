@@ -37,7 +37,8 @@ jobs:
       - name: Stage static PWA site
         run: |
           mkdir -p _site
-          cp index.html version.json _site/
+          cp index.html version.json oauth-callback.html _site/
+          if [ -f sw.js ]; then cp sw.js _site/; fi
           cp -r public src _site/
           touch _site/.nojekyll
 
@@ -60,14 +61,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Check if version.json changed
         id: changes
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ] || [ -z "${{ github.event.before }}" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif ! git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           elif git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -qx "version.json"; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
@@ -96,13 +99,115 @@ jobs:
         if: steps.changes.outputs.should_build == 'true'
         run: |
           mkdir -p dist
-          cp index.html version.json dist/
+          cp index.html version.json oauth-callback.html dist/
+          if [ -f sw.js ]; then cp sw.js dist/; fi
           cp -r public src dist/
           node -e "const fs=require('fs');const c=JSON.parse(fs.readFileSync('capacitor.config.json','utf8'));c.webDir='dist';fs.writeFileSync('capacitor.config.json',JSON.stringify(c,null,2));"
           npm install --no-save @capacitor/core @capacitor/cli @capacitor/android
           npx cap add android
-          node -e "const fs=require('fs');const p='android/app/src/main/AndroidManifest.xml';let xml=fs.readFileSync(p,'utf8');const perms=['android.permission.WAKE_LOCK','android.permission.FOREGROUND_SERVICE','android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK','android.permission.POST_NOTIFICATIONS','android.permission.REQUEST_INSTALL_PACKAGES'];const add=perms.filter(n=>!xml.includes(n)).map(n=>'    <uses-permission android:name=\"'+n+'\" />').join('\n');if(add){xml=xml.replace('<application',add+'\n\n    <application');fs.writeFileSync(p,xml);}"
           npx cap sync android
+          mkdir -p android/app/src/main/java/com/audiobook/player
+          cp android-auto/AudiobookOAuthBridge.java android/app/src/main/java/com/audiobook/player/AudiobookOAuthBridge.java
+          node << 'EOF'
+          const fs = require('fs');
+
+          // 1. Ensure androidx.browser:browser dependency in android/app/build.gradle
+          const gradlePath = 'android/app/build.gradle';
+          let gradle = fs.readFileSync(gradlePath, 'utf8');
+          if (!gradle.includes('androidx.browser:browser')) {
+            if (!/dependencies\s*\{/.test(gradle)) {
+              throw new Error('Could not find dependencies block in android/app/build.gradle');
+            }
+            gradle = gradle.replace(
+              /dependencies\s*\{/,
+              'dependencies {\n    implementation "androidx.browser:browser:1.8.0"'
+            );
+            fs.writeFileSync(gradlePath, gradle);
+          }
+
+          // 2. Patch MainActivity.java to register AudiobookOAuthNative and forward redirect intents
+          const mainActivityPath = 'android/app/src/main/java/com/audiobook/player/MainActivity.java';
+          const mainActivitySrc = `package com.audiobook.player;
+
+          import android.content.Intent;
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              private AudiobookOAuthBridge oauthBridge;
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  oauthBridge = new AudiobookOAuthBridge(this);
+                  if (getBridge() != null && getBridge().getWebView() != null) {
+                      getBridge().getWebView().addJavascriptInterface(oauthBridge, "AudiobookOAuthNative");
+                  }
+                  oauthBridge.handleRedirectIntent(getIntent());
+              }
+
+              @Override
+              public void onNewIntent(Intent intent) {
+                  setIntent(intent);
+                  super.onNewIntent(intent);
+                  if (oauthBridge != null) {
+                      oauthBridge.handleRedirectIntent(intent);
+                  }
+              }
+          }
+          `.replace(/^          /gm, '');
+          fs.writeFileSync(mainActivityPath, mainActivitySrc);
+
+          // 3. Patch AndroidManifest.xml: preserve 5 permissions, enforce singleTask, add OAuth deep-link intent-filter
+          const manifestPath = 'android/app/src/main/AndroidManifest.xml';
+          let xml = fs.readFileSync(manifestPath, 'utf8');
+          const perms = [
+            'android.permission.WAKE_LOCK',
+            'android.permission.FOREGROUND_SERVICE',
+            'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK',
+            'android.permission.POST_NOTIFICATIONS',
+            'android.permission.REQUEST_INSTALL_PACKAGES'
+          ];
+          const addPerms = perms
+            .filter((n) => !xml.includes(n))
+            .map((n) => '    <uses-permission android:name="' + n + '" />')
+            .join('\n');
+          if (addPerms) {
+            xml = xml.replace('<application', addPerms + '\n\n    <application');
+          }
+
+          const activityOpenRe = /<activity\b[^>]*\bandroid:name="(?:\.|com\.audiobook\.player\.)MainActivity"[^>]*>/;
+          if (!activityOpenRe.test(xml)) {
+            throw new Error('Could not find MainActivity <activity> tag in AndroidManifest.xml');
+          }
+          xml = xml.replace(activityOpenRe, (tag) => {
+            if (/\bandroid:launchMode=/.test(tag)) {
+              return tag.replace(/\bandroid:launchMode="[^"]*"/, 'android:launchMode="singleTask"');
+            }
+            return tag.replace(/>$/, ' android:launchMode="singleTask">');
+          });
+
+          if (!xml.includes('android:scheme="com.audiobook.player"')) {
+            const oauthFilter = [
+              '            <intent-filter>',
+              '                <action android:name="android.intent.action.VIEW" />',
+              '                <category android:name="android.intent.category.DEFAULT" />',
+              '                <category android:name="android.intent.category.BROWSABLE" />',
+              '                <data android:scheme="com.audiobook.player" android:host="oauth" />',
+              '            </intent-filter>'
+            ].join('\n');
+            const activityBlockRe = /(<activity\b[^>]*\bandroid:name="(?:\.|com\.audiobook\.player\.)MainActivity"[^>]*>[\s\S]*?)(<\/activity>)/;
+            if (!activityBlockRe.test(xml)) {
+              throw new Error('Could not find closing </activity> for MainActivity in AndroidManifest.xml');
+            }
+            xml = xml.replace(activityBlockRe, `$1${oauthFilter}\n        $2`);
+          }
+
+          if (!xml.includes('android:launchMode="singleTask"') || !xml.includes('android:scheme="com.audiobook.player"')) {
+            throw new Error('AndroidManifest.xml OAuth patch verification failed');
+          }
+          fs.writeFileSync(manifestPath, xml);
+          EOF
 
       - name: Build debug-signed APK
         if: steps.changes.outputs.should_build == 'true'

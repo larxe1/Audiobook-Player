@@ -11,9 +11,9 @@ use serde::Serialize;
 use tauri::{window::Color, App, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 const GOOGLE_CLIENT_ID: &str =
-    "572567924584-qj0m9fkkkjsrgva6dj32or7esbgkqvql.apps.googleusercontent.com";
+    "22283534025-av56s1jjavk740hd5n4i7r10jkjajd1f.apps.googleusercontent.com";
 const GOOGLE_OAUTH_REDIRECT_URI: &str =
-    "storagerelay%3A%2F%2Fhttps%2Fnotetaking-app.pages.dev%3Fid%3Dauth123456";
+    "https%3A%2F%2Flarxe1.github.io%2FAudiobook-Player%2Foauth-callback.html";
 const GOOGLE_OAUTH_SCOPE: &str =
     "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly%20email%20profile";
 
@@ -272,13 +272,15 @@ async fn desktop_start_google_oauth(
         format!("&login_hint={}", url_encode_param(&hint_email))
     };
 
+    let state_param = format!("tauri_{}", now_ms());
     let auth_url_str = format!(
-        "https://accounts.google.com/o/oauth2/v2/auth?gsiwebsdk=3&client_id={}&scope={}&redirect_uri={}&prompt={}{}&response_type=token&include_granted_scopes=true",
+        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&scope={}&redirect_uri={}&prompt={}{}&response_type=token&include_granted_scopes=true&state={}",
         GOOGLE_CLIENT_ID,
         GOOGLE_OAUTH_SCOPE,
         GOOGLE_OAUTH_REDIRECT_URI,
         prompt_param,
-        hint_clause
+        hint_clause,
+        state_param
     );
     let parsed_url = tauri::Url::parse(&auth_url_str).map_err(|e| e.to_string())?;
 

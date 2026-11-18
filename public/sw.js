@@ -1,19 +1,22 @@
-const CACHE_VERSION = 'audiobook-player-v1';
+const CACHE_VERSION = 'audiobook-player-v2';
 
 const APP_SHELL_ASSETS = [
-  '/',
-  '/index.html',
-  '/src/styles/theme.css',
-  '/public/manifest.json',
-  '/src/ui/app.js',
-  '/src/ui/icons.js',
-  '/src/player/audio-engine.js',
-  '/src/player/media-session-bridge.js',
-  '/src/services/offline-queue.js',
-  '/src/services/supabase-sync.js',
-  '/src/services/library-scanner.js',
-  '/src/services/metadata-enrichment.js',
-  '/src/services/cover-search.js'
+  '../',
+  '../index.html',
+  '../oauth-callback.html',
+  '../src/styles/theme.css',
+  './manifest.json',
+  './icon.svg',
+  '../src/ui/app.js',
+  '../src/ui/icons.js',
+  '../src/player/audio-engine.js',
+  '../src/player/media-session-bridge.js',
+  '../src/services/offline-queue.js',
+  '../src/services/supabase-sync.js',
+  '../src/services/self-updater.js',
+  '../src/services/library-scanner.js',
+  '../src/services/metadata-enrichment.js',
+  '../src/services/cover-search.js'
 ];
 
 self.addEventListener('install', (event) => {
@@ -83,7 +86,7 @@ self.addEventListener('fetch', (event) => {
           const cached = await caches.match(request);
           if (cached) return cached;
           if (request.mode === 'navigate') {
-            return caches.match('/index.html');
+            return caches.match('../index.html');
           }
           return new Response('', { status: 503, statusText: 'Offline' });
         })

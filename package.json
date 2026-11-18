@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Cross-platform Spotify-inspired audiobook player with Google Drive streaming, local folder deduplication, and Supabase cross-device sync.",
   "scripts": {
-    "test": "node --test tests/sync.test.mjs tests/library.test.mjs tests/updater.test.mjs",
+    "test": "node --test tests/sync.test.mjs tests/library.test.mjs tests/updater.test.mjs tests/ui-stability.test.mjs",
     "tauri:prepare": "node scripts/prepare-tauri-ui.mjs",
     "tauri:build": "node scripts/prepare-tauri-ui.mjs && cargo build --release --manifest-path src-tauri/Cargo.toml"
   }
