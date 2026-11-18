@@ -1,9 +1,11 @@
 const DEFAULT_STORAGE_KEY = 'audiobook_player_offline_sync_v1';
+const AUTH_BACKUP_STORAGE_KEY = 'audiobook_player_auth_backup_v1';
 const IDB_NAME = 'audiobook-player-sync';
-const IDB_VERSION = 1;
+const IDB_VERSION = 2;
 const STORE_PENDING_PROGRESS = 'pending_progress';
 const STORE_LOCAL_PROGRESS = 'local_progress';
 const STORE_BOOKMARKS = 'bookmarks';
+const STORE_META = 'meta';
 
 /**
  * Converts an ISO timestamp string, Date, or epoch number into epoch milliseconds.
@@ -140,6 +142,10 @@ export class OfflineSyncQueue {
     this._bookmarksByBook = new Map();
     /** @type {Map<string, object>} */
     this._pendingBookmarks = new Map();
+    /** @type {object|null} */
+    this._authSession = null;
+    this._authSessionSavedAt = 0;
+    this._authSessionDirty = false;
 
     this._db = null;
     this._loadFromStorage();
@@ -156,6 +162,22 @@ export class OfflineSyncQueue {
 
   _loadFromStorage() {
     if (!this.storage) return;
+    try {
+      const rawAuth = this.storage.getItem(AUTH_BACKUP_STORAGE_KEY);
+      if (rawAuth) {
+        const parsedAuth = JSON.parse(rawAuth);
+        const restoredSession =
+          parsedAuth && typeof parsedAuth === 'object' && 'session' in parsedAuth
+            ? parsedAuth.session
+            : parsedAuth;
+        if (restoredSession && typeof restoredSession === 'object') {
+          this._authSession = { ...restoredSession };
+          this._authSessionSavedAt = toEpochMs(parsedAuth?.savedAt);
+        }
+      }
+    } catch {
+      // Ignore corrupt auth backup payloads
+    }
     try {
       const raw = this.storage.getItem(this.storageKey);
       if (!raw) return;
@@ -224,6 +246,9 @@ export class OfflineSyncQueue {
           if (!upgradeDb.objectStoreNames.contains(STORE_BOOKMARKS)) {
             upgradeDb.createObjectStore(STORE_BOOKMARKS, { keyPath: 'id' });
           }
+          if (!upgradeDb.objectStoreNames.contains(STORE_META)) {
+            upgradeDb.createObjectStore(STORE_META, { keyPath: 'key' });
+          }
         };
         request.onsuccess = () => resolve(request.result);
         request.onerror = () => reject(request.error);
@@ -250,10 +275,11 @@ export class OfflineSyncQueue {
         }
       });
 
-    const [pendingList, localList, bookmarkList] = await Promise.all([
+    const [pendingList, localList, bookmarkList, metaList] = await Promise.all([
       readAll(STORE_PENDING_PROGRESS),
       readAll(STORE_LOCAL_PROGRESS),
-      readAll(STORE_BOOKMARKS)
+      readAll(STORE_BOOKMARKS),
+      readAll(STORE_META)
     ]);
 
     for (const item of pendingList) {
@@ -278,6 +304,36 @@ export class OfflineSyncQueue {
       }
       if (bm._pending) {
         this._pendingBookmarks.set(bm.id, bm);
+      }
+    }
+
+    if (this._authSessionDirty) {
+      if (this._authSession) {
+        this._idbPut(STORE_META, {
+          key: 'auth_session',
+          session: { ...this._authSession },
+          savedAt: this._authSessionSavedAt
+            ? new Date(this._authSessionSavedAt).toISOString()
+            : new Date().toISOString()
+        });
+      } else {
+        this._idbDelete(STORE_META, 'auth_session');
+      }
+    } else {
+      const authRecord = metaList.find((entry) => entry?.key === 'auth_session');
+      if (authRecord?.session && typeof authRecord.session === 'object') {
+        const idbSavedAt = toEpochMs(authRecord.savedAt);
+        if (!this._authSession || idbSavedAt > (this._authSessionSavedAt || 0)) {
+          this._authSession = { ...authRecord.session };
+          this._authSessionSavedAt = idbSavedAt;
+          if (this.storage) {
+            try {
+              this.storage.setItem(AUTH_BACKUP_STORAGE_KEY, JSON.stringify(authRecord));
+            } catch {
+              // Ignore storage quota errors
+            }
+          }
+        }
       }
     }
   }
@@ -524,5 +580,57 @@ export class OfflineSyncQueue {
         this._idbPut(STORE_BOOKMARKS, bm);
       }
     }
+  }
+
+  /**
+   * Persists the active auth session durably to memory, localStorage backup, and IndexedDB.
+   * @param {object|null} session
+   * @returns {object|null}
+   */
+  saveAuthSession(session) {
+    const cleanSession = session && typeof session === 'object' ? { ...session } : null;
+    const savedAt = new Date().toISOString();
+    const record = {
+      key: 'auth_session',
+      session: cleanSession,
+      savedAt
+    };
+    this._authSession = cleanSession;
+    this._authSessionSavedAt = toEpochMs(savedAt);
+    this._authSessionDirty = true;
+    if (this.storage) {
+      try {
+        this.storage.setItem(AUTH_BACKUP_STORAGE_KEY, JSON.stringify(record));
+      } catch {
+        // Ignore storage errors
+      }
+    }
+    this._idbPut(STORE_META, record);
+    return cleanSession ? { ...cleanSession } : null;
+  }
+
+  /**
+   * Returns the durably backed-up auth session, if any.
+   * @returns {object|null}
+   */
+  getAuthSession() {
+    return this._authSession ? { ...this._authSession } : null;
+  }
+
+  /**
+   * Clears the backed-up auth session from memory, localStorage, and IndexedDB.
+   */
+  clearAuthSession() {
+    this._authSession = null;
+    this._authSessionSavedAt = 0;
+    this._authSessionDirty = true;
+    if (this.storage) {
+      try {
+        this.storage.removeItem(AUTH_BACKUP_STORAGE_KEY);
+      } catch {
+        // Ignore storage errors
+      }
+    }
+    this._idbDelete(STORE_META, 'auth_session');
   }
 }

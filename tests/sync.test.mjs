@@ -1484,3 +1484,328 @@ test('SupabaseSyncService AudiobookOAuthNative passes promptValue as 6th arg for
 
   sync.destroy();
 });
+
+function createFakeIndexedDB() {
+  const databases = new Map();
+  const makeRequest = (executor) => {
+    const req = { result: undefined, error: null, onupgradeneeded: null, onsuccess: null, onerror: null };
+    queueMicrotask(() => {
+      try {
+        executor(req);
+      } catch (err) {
+        req.error = err;
+        req.onerror?.({ target: req });
+      }
+    });
+    return req;
+  };
+
+  return {
+    open(name, version) {
+      return makeRequest((req) => {
+        let entry = databases.get(name);
+        const isUpgrade = !entry || entry.version < version;
+        if (!entry) {
+          entry = { version, stores: new Map() };
+          databases.set(name, entry);
+        }
+        const db = {
+          objectStoreNames: {
+            contains: (storeName) => entry.stores.has(storeName)
+          },
+          createObjectStore(storeName, { keyPath } = {}) {
+            if (!entry.stores.has(storeName)) {
+              entry.stores.set(storeName, { keyPath, rows: new Map() });
+            }
+          },
+          transaction(storeName) {
+            const storeData = entry.stores.get(storeName);
+            if (!storeData) throw new Error(`Missing store ${storeName}`);
+            return {
+              objectStore() {
+                return {
+                  getAll() {
+                    return makeRequest((r) => {
+                      r.result = Array.from(storeData.rows.values()).map((v) => structuredClone(v));
+                      r.onsuccess?.({ target: r });
+                    });
+                  },
+                  put(val) {
+                    const key = val[storeData.keyPath];
+                    storeData.rows.set(key, structuredClone(val));
+                  },
+                  delete(key) {
+                    storeData.rows.delete(key);
+                  }
+                };
+              }
+            };
+          }
+        };
+        req.result = db;
+        if (isUpgrade) {
+          entry.version = version;
+          req.onupgradeneeded?.({ target: req });
+        }
+        req.onsuccess?.({ target: req });
+      });
+    }
+  };
+}
+
+test('SupabaseSyncService google_oauth session survives restoreSession() on 401 userinfo without logging user out and separates needsDriveConsent', async () => {
+  const storage = createMemoryStorage();
+  const sync = new SupabaseSyncService({
+    storage,
+    windowObj: null,
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        return { ok: false, status: 401, async text() { return 'Invalid Credentials'; } };
+      }
+      if (url.includes('/auth/v1/token') || url.includes('/auth/v1/signup')) {
+        return { ok: false, status: 500, async text() { return 'Bridge unavailable'; } };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  sync.setSession({
+    access_token: null,
+    auth_mode: 'google_oauth',
+    provider_token: 'ya29.expired_after_1h',
+    user: {
+      id: 'google_1001',
+      email: 'phone.user@gmail.com',
+      user_metadata: {
+        email: 'phone.user@gmail.com',
+        name: 'Phone Listener',
+        full_name: 'Phone Listener',
+        avatar_url: 'https://lh3.googleusercontent.com/a/phone.jpg',
+        picture: 'https://lh3.googleusercontent.com/a/phone.jpg'
+      }
+    }
+  });
+
+  const restored = await sync.restoreSession();
+  assert.ok(restored, 'restoreSession must NOT return null when user profile exists');
+  assert.deepEqual(sync.getUserProfile(), {
+    id: 'google_1001',
+    email: 'phone.user@gmail.com',
+    name: 'Phone Listener',
+    avatarUrl: 'https://lh3.googleusercontent.com/a/phone.jpg'
+  });
+  assert.equal(sync.needsDriveSyncReauth, true);
+  assert.equal(sync.needsDriveConsent, false, '401 expired token must NOT force full consent screen');
+  assert.equal(sync.getGoogleAccessToken(), null);
+
+  const persisted = JSON.parse(storage.getItem('audiobook_player_supabase_session_v1'));
+  assert.equal(persisted.user.email, 'phone.user@gmail.com');
+  assert.equal(persisted.auth_mode, 'google_oauth');
+
+  // 403 insufficientPermissions sets needsDriveConsent = true, and setGoogleAccessToken clears both
+  sync.setGoogleAccessToken('ya29.lacking_scope');
+  assert.equal(sync.needsDriveSyncReauth, false);
+  assert.equal(sync.needsDriveConsent, false);
+
+  const sync403 = new SupabaseSyncService({
+    storage,
+    windowObj: null,
+    navigatorObj: { onLine: true },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        return { ok: false, status: 403, async text() { return 'insufficientPermissions'; } };
+      }
+      return { ok: false, status: 500, async text() { return 'unavailable'; } };
+    }
+  });
+  await sync403.restoreSession();
+  assert.equal(sync403.needsDriveSyncReauth, true);
+  assert.equal(sync403.needsDriveConsent, true);
+
+  sync403.setGoogleAccessToken('ya29.fresh_token');
+  assert.equal(sync403.needsDriveSyncReauth, false);
+  assert.equal(sync403.needsDriveConsent, false);
+
+  sync.destroy();
+  sync403.destroy();
+});
+
+test('SupabaseSyncService restoreSession recovers evicted localStorage session from OfflineSyncQueue IndexedDB backup and never wipes user on /auth/v1/user 401', async () => {
+  const fakeIDB = createFakeIndexedDB();
+  const storage1 = createMemoryStorage();
+  const queue1 = new OfflineSyncQueue({ storage: storage1, indexedDB: fakeIDB });
+  await queue1.ready();
+
+  const sync1 = new SupabaseSyncService({
+    storage: storage1,
+    indexedDB: fakeIDB,
+    offlineQueue: queue1,
+    windowObj: null,
+    navigatorObj: { onLine: true },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async () => ({ ok: false, status: 500, async text() { return 'offline'; } })
+  });
+
+  sync1.setSession({
+    access_token: 'expired-jwt',
+    refresh_token: 'expired-refresh',
+    provider_token: null,
+    user: {
+      id: 'supa-u-99',
+      email: 'persist@gmail.com',
+      user_metadata: {
+        email: 'persist@gmail.com',
+        full_name: 'Persist User',
+        avatar_url: 'https://example.com/avatar.png'
+      }
+    }
+  });
+
+  // Allow microtask IDB put to settle, then simulate Android WebView clearing ALL localStorage
+  await new Promise((r) => setTimeout(r, 10));
+  const emptyStorage = createMemoryStorage();
+  assert.equal(emptyStorage.getItem('audiobook_player_supabase_session_v1'), null);
+
+  const queue2 = new OfflineSyncQueue({ storage: emptyStorage, indexedDB: fakeIDB });
+  const sync2 = new SupabaseSyncService({
+    storage: emptyStorage,
+    indexedDB: fakeIDB,
+    offlineQueue: queue2,
+    windowObj: null,
+    navigatorObj: { onLine: true },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.includes('/auth/v1/user')) {
+        return { ok: false, status: 401, async text() { return 'JWT expired'; } };
+      }
+      if (url.includes('/auth/v1/token')) {
+        return { ok: false, status: 400, async text() { return 'invalid_grant'; } };
+      }
+      if (url.includes('/auth/v1/signup')) {
+        return { ok: false, status: 500, async text() { return 'error'; } };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const recovered = await sync2.restoreSession();
+  assert.ok(recovered, 'restoreSession must recover session from IndexedDB even after localStorage eviction and 401');
+  assert.equal(recovered.auth_mode, 'google_oauth');
+  assert.equal(sync2.getUserProfile().email, 'persist@gmail.com');
+  assert.equal(sync2.getUserProfile().name, 'Persist User');
+
+  const rePersisted = JSON.parse(emptyStorage.getItem('audiobook_player_supabase_session_v1'));
+  assert.equal(rePersisted.user.email, 'persist@gmail.com');
+  assert.equal(rePersisted.access_token, null);
+
+  // Explicit signOut clears both localStorage and IndexedDB backup
+  await sync2.signOut();
+  assert.equal(emptyStorage.getItem('audiobook_player_supabase_session_v1'), null);
+  assert.equal(queue2.getAuthSession(), null);
+
+  sync1.destroy();
+  sync2.destroy();
+});
+
+test('Windows Tauri restoreSession runs _trySilentGoogleRefresh when bridged Supabase session is valid and googleAccessToken expired (401 userinfo)', async () => {
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://tauri.localhost';
+  let oauthMode = 'success';
+  const invokeCalls = [];
+  fakeWindow.__TAURI_INTERNALS__ = {
+    invoke: async (cmd, args) => {
+      invokeCalls.push({ cmd, args });
+      if (cmd === 'desktop_start_google_oauth') {
+        if (oauthMode === 'success') {
+          return { status: 'success', accessToken: 'ya29.tauri_silent_fresh' };
+        }
+        return { status: 'needs_interactive', accessToken: null };
+      }
+      return null;
+    }
+  };
+
+  const storage = createMemoryStorage();
+  const sync = new SupabaseSyncService({
+    storage,
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true, userAgent: 'Windows NT 10.0' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url, init = {}) => {
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        const auth = init.headers?.Authorization || '';
+        if (auth === 'Bearer ya29.tauri_silent_fresh') {
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return { sub: 'win-1', email: 'win.user@gmail.com', name: 'Win User' };
+            }
+          };
+        }
+        return { ok: false, status: 401, async text() { return 'Invalid Credentials'; } };
+      }
+      if (url.endsWith('/auth/v1/user')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              id: 'supa-win-1',
+              email: 'win.user@gmail.com',
+              user_metadata: { full_name: 'Win User' }
+            };
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  // Case 1: Bridged Supabase session (/auth/v1/user 200) + expired ya29 -> silently refreshes on Tauri
+  sync.setSession({
+    access_token: 'valid-supa-jwt',
+    refresh_token: 'valid-supa-refresh',
+    auth_mode: 'google_oauth',
+    provider_token: 'ya29.expired_1h',
+    user: {
+      id: 'supa-win-1',
+      email: 'win.user@gmail.com',
+      user_metadata: { full_name: 'Win User' }
+    }
+  });
+
+  const restored = await sync.restoreSession();
+  assert.ok(restored);
+  assert.equal(sync.isAuthenticated(), true);
+  assert.equal(sync.getGoogleAccessToken(), 'ya29.tauri_silent_fresh');
+  assert.equal(sync.needsDriveSyncReauth, false);
+  assert.equal(sync.needsDriveConsent, false);
+  assert.equal(invokeCalls.filter((c) => c.cmd === 'desktop_start_google_oauth').length, 1);
+  assert.equal(invokeCalls[0].args.silent, true);
+
+  // Case 2: When silent refresh returns needs_interactive, keep user signed in and set needsDriveSyncReauth = true, needsDriveConsent = false
+  oauthMode = 'needs_interactive';
+  sync.setSession({
+    ...sync.session,
+    provider_token: 'ya29.expired_again',
+    googleAccessToken: 'ya29.expired_again'
+  });
+
+  const restoredNeedsInteractive = await sync.restoreSession();
+  assert.ok(restoredNeedsInteractive);
+  assert.equal(sync.isAuthenticated(), true);
+  assert.equal(sync.getGoogleAccessToken(), null);
+  assert.equal(sync.needsDriveSyncReauth, true);
+  assert.equal(sync.needsDriveConsent, false);
+
+  sync.destroy();
+});

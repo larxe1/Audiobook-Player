@@ -618,6 +618,7 @@ export class SupabaseSyncService {
     this.driveSyncFileId = null;
     this.lastDriveSyncModifiedTime = null;
     this.needsDriveSyncReauth = false;
+    this.needsDriveConsent = false;
     this._lastDrivePayload = null;
     this._lastLocalDeviceState = null;
     this._driveWriteQueue = Promise.resolve();
@@ -658,26 +659,40 @@ export class SupabaseSyncService {
   }
 
   _loadSession() {
-    if (!this.storage) return null;
-    try {
-      const raw = this.storage.getItem(SESSION_STORAGE_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch {
-      return null;
+    if (this.storage) {
+      try {
+        const raw = this.storage.getItem(SESSION_STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') {
+            return parsed;
+          }
+        }
+      } catch {
+        // Fall back to durable OfflineSyncQueue backup
+      }
     }
+    const backup = this.offlineQueue?.getAuthSession?.();
+    return backup && typeof backup === 'object' ? backup : null;
   }
 
   _saveSession(session) {
     this.session = session || null;
-    if (!this.storage) return;
-    try {
-      if (this.session) {
-        this.storage.setItem(SESSION_STORAGE_KEY, JSON.stringify(this.session));
-      } else {
-        this.storage.removeItem(SESSION_STORAGE_KEY);
+    if (this.storage) {
+      try {
+        if (this.session) {
+          this.storage.setItem(SESSION_STORAGE_KEY, JSON.stringify(this.session));
+        } else {
+          this.storage.removeItem(SESSION_STORAGE_KEY);
+        }
+      } catch {
+        // Ignore storage failures
       }
-    } catch {
-      // Ignore storage failures
+    }
+    if (this.session) {
+      this.offlineQueue?.saveAuthSession?.(this.session);
+    } else {
+      this.offlineQueue?.clearAuthSession?.();
     }
   }
 
@@ -867,6 +882,7 @@ export class SupabaseSyncService {
     this.googleAccessToken = clean || null;
     if (clean) {
       this.needsDriveSyncReauth = false;
+      this.needsDriveConsent = false;
       this._lastSilentGoogleRefreshFailAt = 0;
     } else {
       this.driveSyncFileId = null;
@@ -995,9 +1011,23 @@ export class SupabaseSyncService {
    * @returns {Promise<object|null>}
    */
   async restoreSession() {
+    await this.offlineQueue?.ready?.();
+    let parsedLocal = null;
+    if (this.storage) {
+      try {
+        const raw = this.storage.getItem(SESSION_STORAGE_KEY);
+        parsedLocal = raw ? JSON.parse(raw) : null;
+      } catch {
+        parsedLocal = null;
+      }
+    }
     this.session = this._loadSession();
     if (!this.session) {
       return null;
+    }
+    if (!parsedLocal || typeof parsedLocal !== 'object') {
+      // Re-persist session recovered from IndexedDB backup into localStorage
+      this._saveSession(this.session);
     }
     this.googleAccessToken =
       this.session?.provider_token ||
@@ -1030,9 +1060,13 @@ export class SupabaseSyncService {
               }
             };
             this._saveSession({ ...this.session, user: updatedUser });
-          } else if (res.status === 401 || res.status === 403) {
+          } else if (res.status === 401) {
             this.setGoogleAccessToken(null);
             this.needsDriveSyncReauth = true;
+          } else if (res.status === 403) {
+            this.setGoogleAccessToken(null);
+            this.needsDriveSyncReauth = true;
+            this.needsDriveConsent = true;
           }
         } catch {
           // Offline fallback: keep persisted Google user profile
@@ -1067,26 +1101,27 @@ export class SupabaseSyncService {
             }
           };
           this._saveSession({ ...this.session, user: mergedUser });
-          this.connectRealtime();
-          void this.flushOfflineQueue();
-          return this.session;
-        }
-        if (res.status === 401 || res.status === 403) {
+        } else if (res.status === 401 || res.status === 403) {
           const refreshed = await this._refreshAccessToken().catch(() => false);
-          if (refreshed && this.isAuthenticated()) {
-            this.connectRealtime();
-            void this.flushOfflineQueue();
-            return this.session;
-          }
-          if (this.session?.user?.email && this.session.auth_mode === 'google_oauth') {
-            this._saveSession({
-              ...this.session,
-              access_token: null,
-              refresh_token: null
-            });
-          } else {
-            this._saveSession(null);
-            return null;
+          if (!refreshed || !this.isAuthenticated()) {
+            const hasUser = Boolean(
+              this.session?.user &&
+                (this.session.user.id ||
+                  this.session.user.email ||
+                  (this.session.user.user_metadata &&
+                    Object.keys(this.session.user.user_metadata).length > 0))
+            );
+            if (hasUser) {
+              this._saveSession({
+                ...this.session,
+                auth_mode: this.session.auth_mode || 'google_oauth',
+                access_token: null,
+                refresh_token: null
+              });
+            } else {
+              this._saveSession(null);
+              return null;
+            }
           }
         }
       } catch {
@@ -1107,13 +1142,12 @@ export class SupabaseSyncService {
       this._isTauriEnvironment()
     ) {
       const refreshed = await this._trySilentGoogleRefresh().catch(() => false);
-      if (!refreshed && !this.isAuthenticated()) {
+      if (!refreshed) {
         this.needsDriveSyncReauth = true;
       }
     } else if (
       this.session?.auth_mode === 'google_oauth' &&
-      !this.getGoogleAccessToken() &&
-      !this.isAuthenticated()
+      !this.getGoogleAccessToken()
     ) {
       this.needsDriveSyncReauth = true;
     }
@@ -1535,6 +1569,7 @@ export class SupabaseSyncService {
     if (this.isAuthenticated()) {
       const updated = {
         ...this.session,
+        auth_mode: 'google_oauth',
         provider_token: cleanToken,
         googleAccessToken: cleanToken,
         user: {
@@ -2247,6 +2282,9 @@ export class SupabaseSyncService {
       }
     }
 
+    if (session.provider_token || session.user?.app_metadata?.provider === 'google') {
+      session.auth_mode = 'google_oauth';
+    }
     if (session.provider_token) {
       this.setGoogleAccessToken(session.provider_token);
     }
@@ -2278,6 +2316,7 @@ export class SupabaseSyncService {
     this.lastDriveSyncModifiedTime = null;
     this._lastDrivePayload = null;
     this.needsDriveSyncReauth = false;
+    this.needsDriveConsent = false;
     this._lastLocalDeviceState = null;
     this.googleAccessToken = null;
     this._bridgeFailedEmails?.clear();
@@ -2348,7 +2387,13 @@ export class SupabaseSyncService {
   }
 
   async _driveFetch(url, init = {}) {
-    const token = this.getGoogleAccessToken();
+    let token = this.getGoogleAccessToken();
+    if (!token && this.session?.auth_mode === 'google_oauth' && this._isTauriEnvironment()) {
+      const refreshed = await this._trySilentGoogleRefresh().catch(() => false);
+      if (refreshed) {
+        token = this.getGoogleAccessToken();
+      }
+    }
     if (!token || !this.fetchImpl || !this._isOnline()) {
       return { res: null, forbidden: false, unauthorized: false, text: '' };
     }
@@ -2376,6 +2421,7 @@ export class SupabaseSyncService {
         const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
         if (!text || /insufficientPermissions|insufficient|PERMISSION_DENIED|scope/i.test(text)) {
           this.needsDriveSyncReauth = true;
+          this.needsDriveConsent = true;
         }
         return { res, forbidden: true, unauthorized: false, text };
       }

@@ -882,7 +882,7 @@ test('cross-device library merge, Drive folder auto-link, remote-local badge/not
     assert.equal(globalThis.localStorage.getItem('audiobook_drive_folder_v1'), 'drive-folder-from-pc');
     assert.equal(app.state.driveModal.folderId, 'drive-folder-from-pc');
 
-    // Reauth banner renders when needsDriveSyncReauth is true
+    // Reauth banner renders when needsDriveSyncReauth is true (401 skips consent; 403 forces consent)
     const reauthBtn = env.rootEl.querySelector('[data-action="reauth-drive-sync"]');
     assert.ok(reauthBtn, 'Enable Cloud Library Sync button should render');
     let consentOpts = null;
@@ -892,7 +892,15 @@ test('cross-device library merge, Drive folder auto-link, remote-local badge/not
     };
     reauthBtn.click();
     await new Promise((r) => setTimeout(r, 10));
+    assert.equal(consentOpts?.forceConsent, false);
+    assert.equal(consentOpts?.hint, 'reader@gmail.com');
+
+    app.syncService.needsDriveConsent = true;
+    reauthBtn.click();
+    await new Promise((r) => setTimeout(r, 10));
     assert.equal(consentOpts?.forceConsent, true);
+    assert.equal(consentOpts?.hint, 'reader@gmail.com');
+    app.syncService.needsDriveConsent = false;
 
     // Remote-local-only book shows "On Windows PC" badge and shows friendly message on play click
     assert.match(env.rootEl.querySelector('#appMainLayer').innerHTML, /On Windows PC/);

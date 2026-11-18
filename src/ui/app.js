@@ -2892,7 +2892,7 @@ class AudiobookApp {
         fallbackToDirectGoogleOAuth: true,
         forceConsent: Boolean(options?.forceConsent),
         forceRefresh: Boolean(options?.forceConsent),
-        hint: this.state.authEmail || undefined
+        hint: options?.hint || this.state.authEmail || this.user?.email || undefined
       });
 
       this.state.authLoading = false;
@@ -2901,6 +2901,7 @@ class AudiobookApp {
         this.user = this.syncService.getUserProfile();
         this.guestLocalMode = false;
         this.syncService.needsDriveSyncReauth = false;
+        this.syncService.needsDriveConsent = false;
         this.state.needsDriveSyncReauth = false;
         const token = this.syncService.getGoogleAccessToken();
         if (token) {
@@ -3513,12 +3514,19 @@ class AudiobookApp {
       </div>`
       : '';
 
+    const needsConsent = Boolean(this.syncService?.needsDriveConsent);
+    const reauthTitle = needsConsent
+      ? 'Google Drive permission needed — reconnect to sync your library &amp; playback across devices'
+      : 'Google Drive token expired — tap to refresh Drive streaming &amp; sync';
+    const reauthSub = needsConsent
+      ? 'Grant Drive permission once to sync your audiobooks, Drive folder, and playback across devices.'
+      : 'You remain signed in — tap to refresh Drive streaming and library sync.';
     const reauthBanner = showReauth
       ? `
       <div class="sync-reauth-banner px-4 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 min-w-0">
         <div class="min-w-0 flex-1">
-          <div class="text-xs font-semibold text-white truncate">Google session expired — reconnect to sync your library &amp; playback across devices</div>
-          <div class="text-[11px] text-[var(--text-secondary)] truncate">Reconnect once to sync your audiobooks, Drive folder, and playback across devices.</div>
+          <div class="text-xs font-semibold text-white truncate">${reauthTitle}</div>
+          <div class="text-[11px] text-[var(--text-secondary)] truncate">${reauthSub}</div>
         </div>
         <div class="flex items-center gap-2 shrink-0">
           <button type="button" data-action="reauth-drive-sync" class="btn-press px-3.5 py-1.5 rounded-full bg-[#60a5fa] text-[#050506] text-xs font-bold">
@@ -3726,8 +3734,11 @@ class AudiobookApp {
 
   _renderEmptyLibraryCard() {
     const needsReauth = Boolean(
-      this.user && (this.state.needsDriveSyncReauth || this.syncService?.needsDriveSyncReauth)
+      this.books.length === 0 &&
+        this.user &&
+        (this.state.needsDriveSyncReauth || this.syncService?.needsDriveSyncReauth)
     );
+    const needsConsent = Boolean(this.syncService?.needsDriveConsent);
     return `
       <div class="flex-1 min-h-[360px] flex items-center justify-center p-4">
         <div class="w-full max-w-md surface-card rounded-3xl p-7 text-center space-y-5 border border-[var(--border-subtle)]">
@@ -3735,10 +3746,18 @@ class AudiobookApp {
             ${ICON_LIBRARY(26)}
           </div>
           <div class="space-y-1">
-            <h2 class="text-lg font-bold text-white">${needsReauth ? 'Google Sync needs reconnection' : 'Your library is empty'}</h2>
+            <h2 class="text-lg font-bold text-white">${
+              needsReauth
+                ? needsConsent
+                  ? 'Google Drive permission needed'
+                  : 'Refresh Google Drive Sync'
+                : 'Your library is empty'
+            }</h2>
             <p class="text-xs text-[var(--text-secondary)]">${
               needsReauth
-                ? 'Google session expired — reconnect to sync your library & playback across devices.'
+                ? needsConsent
+                  ? 'Grant Google Drive access to sync your library & playback across devices.'
+                  : 'You are still signed in — tap below to refresh Google Drive streaming & sync.'
                 : 'Import audiobooks from your device or Google Drive.'
             }</p>
           </div>
@@ -6018,7 +6037,10 @@ class AudiobookApp {
             break;
           }
           case 'reauth-drive-sync': {
-            void this.handleGoogleOAuth({ forceConsent: true });
+            void this.handleGoogleOAuth({
+              forceConsent: Boolean(this.syncService?.needsDriveConsent),
+              hint: this.user?.email || ''
+            });
             break;
           }
           case 'continue-remote-device': {

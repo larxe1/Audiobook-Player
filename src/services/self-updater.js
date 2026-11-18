@@ -1,6 +1,6 @@
-export const LOCAL_VERSION = '1.0.14';
-export const LOCAL_BUILD = 15;
-const LOCAL_BUILD_VERSION = '1.0.14';
+export const LOCAL_VERSION = '1.0.15';
+export const LOCAL_BUILD = 16;
+const LOCAL_BUILD_VERSION = '1.0.15';
 
 /**
  * Detect the runtime platform for update delivery.

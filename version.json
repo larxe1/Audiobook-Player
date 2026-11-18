@@ -1,13 +1,13 @@
 {
-  "version": "1.0.14",
-  "build": 15,
+  "version": "1.0.15",
+  "build": 16,
   "minNativeBuild": 15,
   "channel": "stable",
-  "publishedAt": "2026-11-18T09:35:00Z",
+  "publishedAt": "2026-11-18T15:06:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "webBundleUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Fix Android Capacitor 8 edge-to-edge safe-area insets, add fast Android Web Bundle OTA delivery, silent cross-device Google OAuth refresh and reconnect banners, and immediate startup update checks"
+  "releaseNotes": "Persist Google Sign-In reliably across restarts and storage eviction with IndexedDB backup, silent token refresh, and non-blocking Drive reconnect banner"
 }
