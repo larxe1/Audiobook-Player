@@ -9,10 +9,57 @@ export const SUPABASE_CONFIG = {
   publishableKey: 'sb_publishable_YzLKM2MCjKhqrc91vgmsFA_8RZlzyOZ'
 };
 
+export const DEFAULT_GOOGLE_CLIENT_ID =
+  '572567924584-qj0m9fkkkjsrgva6dj32or7esbgkqvql.apps.googleusercontent.com';
+
 const SESSION_STORAGE_KEY = 'audiobook_player_supabase_session_v1';
 const GOOGLE_TOKEN_STORAGE_KEY = 'audiobook_player_google_token_v1';
+const GOOGLE_CLIENT_ID_STORAGE_KEY = 'audiobook_player_google_client_id_v1';
 const DEVICE_ID_STORAGE_KEY = 'audiobook_player_device_id_v1';
 const BROADCAST_CHANNEL_NAME = 'audiobook-player-sync-channel';
+
+function deriveDisplayNameFromEmail(email = '') {
+  const local = String(email || '').split('@')[0] || '';
+  const cleaned = local.replace(/[._-]+/g, ' ').trim();
+  if (!cleaned) return 'Listener';
+  return cleaned.replace(/\b\w/g, (ch) => ch.toUpperCase());
+}
+
+async function computeGravatarUrl(email = '') {
+  const clean = String(email || '').trim().toLowerCase();
+  if (!clean || !globalThis.crypto?.subtle || typeof TextEncoder === 'undefined') {
+    return '';
+  }
+  try {
+    const bytes = new TextEncoder().encode(clean);
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+    const hex = Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+    return `https://www.gravatar.com/avatar/${hex}?s=128&d=404`;
+  } catch {
+    return '';
+  }
+}
+
+function parseAuthErrorMessage(payload, fallback = 'Authentication failed.') {
+  if (!payload) return fallback;
+  if (typeof payload === 'string') {
+    try {
+      const parsed = JSON.parse(payload);
+      return parsed.msg || parsed.error_description || parsed.message || parsed.error || fallback;
+    } catch {
+      return payload || fallback;
+    }
+  }
+  return (
+    payload.msg ||
+    payload.error_description ||
+    payload.message ||
+    payload.error ||
+    fallback
+  );
+}
 
 function generateId(prefix = 'dev') {
   if (typeof globalThis.crypto?.randomUUID === 'function') {
@@ -350,12 +397,119 @@ export class SupabaseSyncService {
   }
 
   /**
-   * Restores and validates any persisted Supabase session via /auth/v1/user.
+   * Returns the configured Google OAuth Client ID (falling back to the local default).
+   * @returns {string}
+   */
+  getGoogleClientId() {
+    if (this.storage) {
+      try {
+        const stored = this.storage.getItem(GOOGLE_CLIENT_ID_STORAGE_KEY);
+        if (stored !== null) return stored.trim();
+      } catch {
+        // Ignore storage errors
+      }
+    }
+    return this.config.googleClientId || DEFAULT_GOOGLE_CLIENT_ID;
+  }
+
+  /**
+   * Persists a custom Google OAuth Client ID (or clears to revert to default).
+   * @param {string|null} clientId
+   */
+  setGoogleClientId(clientId) {
+    if (!this.storage) return;
+    const clean = typeof clientId === 'string' ? clientId.trim() : '';
+    try {
+      if (clean) {
+        this.storage.setItem(GOOGLE_CLIENT_ID_STORAGE_KEY, clean);
+      } else {
+        this.storage.removeItem(GOOGLE_CLIENT_ID_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }
+
+  _isTauriEnvironment() {
+    const origin = this.windowObj?.location?.origin || '';
+    return Boolean(
+      this.windowObj?.__TAURI__ ||
+        this.windowObj?.__TAURI_INTERNALS__ ||
+        /tauri\.localhost/i.test(origin)
+    );
+  }
+
+  /**
+   * Queries Supabase /auth/v1/settings to inspect enabled auth providers before navigating.
+   * @param {{ forceRefresh?: boolean }} [options]
+   * @returns {Promise<object|null>}
+   */
+  async getAuthSettings({ forceRefresh = false } = {}) {
+    if (!forceRefresh && this._authSettings) {
+      return this._authSettings;
+    }
+    if (!this.fetchImpl || !this._isOnline()) {
+      return null;
+    }
+    try {
+      const res = await this.fetchImpl(`${this.config.url}/auth/v1/settings`, {
+        headers: {
+          apikey: this.config.publishableKey
+        }
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      this._authSettings = data;
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Restores and validates any persisted Supabase or Google OAuth session.
    * Returns the validated session or null when signed out / expired.
    * @returns {Promise<object|null>}
    */
   async restoreSession() {
     this.session = this._loadSession();
+    if (!this.session) {
+      return null;
+    }
+
+    if (this.session.auth_mode === 'google_oauth' && !this.session.access_token) {
+      const googleToken = this.getGoogleAccessToken();
+      if (googleToken && this._isOnline() && this.fetchImpl) {
+        try {
+          const res = await this.fetchImpl('https://www.googleapis.com/oauth2/v3/userinfo', {
+            headers: { Authorization: `Bearer ${googleToken}` }
+          });
+          if (res.ok) {
+            const info = await res.json();
+            const updatedUser = {
+              ...(this.session.user || {}),
+              id: info.sub ? `google_${info.sub}` : (this.session.user?.id || 'google_user'),
+              email: info.email || this.session.user?.email || '',
+              user_metadata: {
+                ...(this.session.user?.user_metadata || {}),
+                email: info.email || this.session.user?.email || '',
+                name: info.name || this.session.user?.user_metadata?.name || '',
+                full_name: info.name || this.session.user?.user_metadata?.full_name || '',
+                avatar_url: info.picture || this.session.user?.user_metadata?.avatar_url || '',
+                picture: info.picture || this.session.user?.user_metadata?.picture || ''
+              }
+            };
+            this._saveSession({ ...this.session, user: updatedUser });
+          } else if (res.status === 401 || res.status === 403) {
+            this.setGoogleAccessToken(null);
+          }
+        } catch {
+          // Offline fallback: keep persisted Google user profile
+        }
+      }
+      return this.session?.user ? this.session : null;
+    }
+
     if (!this.session?.access_token) {
       return null;
     }
@@ -401,10 +555,439 @@ export class SupabaseSyncService {
   }
 
   /**
-   * Initiates Google OAuth via Supabase Auth, requesting Drive readonly scope for library streaming.
-   * If running in a browser, redirects to the OAuth URL unless autoRedirect is false.
+   * Signs in with Gmail + password via Supabase /auth/v1/token?grant_type=password,
+   * automatically creating the account via /auth/v1/signup if it does not exist yet.
+   * @param {string} emailInput
+   * @param {string} passwordInput
+   * @returns {Promise<{ ok: boolean, session: object|null, created?: boolean, confirmationRequired?: boolean, error?: string }>}
+   */
+  async signInWithEmail(emailInput, passwordInput) {
+    const email = String(emailInput || '').trim().toLowerCase();
+    const password = String(passwordInput || '');
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return { ok: false, session: null, error: 'Enter a valid Gmail address.' };
+    }
+    if (password.length < 6) {
+      return { ok: false, session: null, error: 'Password must be at least 6 characters.' };
+    }
+    if (!this.fetchImpl) {
+      return { ok: false, session: null, error: 'Network fetch is unavailable.' };
+    }
+    if (!this._isOnline()) {
+      return { ok: false, session: null, error: 'You appear to be offline.' };
+    }
+
+    const avatarUrl = await computeGravatarUrl(email);
+    const displayName = deriveDisplayNameFromEmail(email);
+
+    const finalizeSession = (data, created = false) => {
+      const existingMeta = data.user?.user_metadata || {};
+      const enrichedUser = {
+        ...data.user,
+        email: data.user?.email || email,
+        user_metadata: {
+          ...existingMeta,
+          email: existingMeta.email || email,
+          full_name: existingMeta.full_name || existingMeta.name || displayName,
+          name: existingMeta.name || existingMeta.full_name || displayName,
+          avatar_url: existingMeta.avatar_url || existingMeta.picture || avatarUrl,
+          picture: existingMeta.picture || existingMeta.avatar_url || avatarUrl
+        }
+      };
+      const session = {
+        access_token: data.access_token,
+        refresh_token: data.refresh_token || null,
+        provider_token: this.getGoogleAccessToken() || null,
+        expires_in: Number(data.expires_in || 3600),
+        token_type: data.token_type || 'bearer',
+        user: enrichedUser
+      };
+      this._saveSession(session);
+      this.connectRealtime();
+      void this.flushOfflineQueue();
+      return { ok: true, session, created, confirmationRequired: false };
+    };
+
+    try {
+      const signInRes = await this.fetchImpl(
+        `${this.config.url}/auth/v1/token?grant_type=password`,
+        {
+          method: 'POST',
+          headers: {
+            apikey: this.config.publishableKey,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ email, password })
+        }
+      );
+
+      const signInText = typeof signInRes.text === 'function' ? await signInRes.text() : '';
+      const signInData = signInText ? JSON.parse(signInText) : {};
+
+      if (signInRes.ok && signInData?.access_token) {
+        return finalizeSession(signInData, false);
+      }
+
+      const signInMsg = parseAuthErrorMessage(signInData, 'Invalid login credentials');
+      if (/email not confirmed/i.test(signInMsg)) {
+        return {
+          ok: false,
+          session: null,
+          confirmationRequired: true,
+          error: 'Confirm your Gmail verification link first, then click Sign In with Gmail.'
+        };
+      }
+
+      const looksLikeMissingOrInvalid =
+        signInRes.status === 400 &&
+        /invalid login credentials|invalid_credentials|invalid_grant/i.test(signInMsg);
+      if (!looksLikeMissingOrInvalid) {
+        return { ok: false, session: null, error: signInMsg };
+      }
+
+      // Account may not exist yet — try automatic sign-up
+      const signupRes = await this.fetchImpl(`${this.config.url}/auth/v1/signup`, {
+        method: 'POST',
+        headers: {
+          apikey: this.config.publishableKey,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          email,
+          password,
+          data: {
+            full_name: displayName,
+            name: displayName,
+            avatar_url: avatarUrl,
+            picture: avatarUrl
+          }
+        })
+      });
+
+      const signupText = typeof signupRes.text === 'function' ? await signupRes.text() : '';
+      const signupData = signupText ? JSON.parse(signupText) : {};
+
+      if (signupRes.ok && signupData?.access_token) {
+        return finalizeSession(signupData, true);
+      }
+
+      if (signupRes.ok && (signupData?.id || signupData?.user?.id)) {
+        return {
+          ok: false,
+          session: null,
+          created: true,
+          confirmationRequired: true,
+          error: `Account created for ${email}! Open the confirmation email in Gmail, then click Sign In.`
+        };
+      }
+
+      const signupMsg = parseAuthErrorMessage(signupData, signInMsg);
+      if (/already registered|already exists|user_already_exists/i.test(signupMsg)) {
+        return {
+          ok: false,
+          session: null,
+          error: 'Incorrect password for this Gmail account.'
+        };
+      }
+      return { ok: false, session: null, error: signupMsg };
+    } catch (err) {
+      return {
+        ok: false,
+        session: null,
+        error: err?.message || 'Unable to reach authentication server.'
+      };
+    }
+  }
+
+  /**
+   * Fetches Google userinfo using a Google OAuth access token, persists Drive access,
+   * and links/updates the active session with real Gmail email, name, and photo.
+   * @param {string} accessToken
+   * @returns {Promise<{ ok: boolean, session: object|null, profile?: object, error?: string }>}
+   */
+  async completeGoogleOAuthToken(accessToken) {
+    const cleanToken = String(accessToken || '').trim();
+    if (!cleanToken) {
+      return { ok: false, session: null, error: 'Missing Google access token.' };
+    }
+
+    let info = {};
+    if (this.fetchImpl) {
+      try {
+        const res = await this.fetchImpl('https://www.googleapis.com/oauth2/v3/userinfo', {
+          headers: { Authorization: `Bearer ${cleanToken}` }
+        });
+        if (res.ok) {
+          info = await res.json();
+        }
+      } catch {
+        // Proceed with token even if userinfo lookup fails
+      }
+    }
+
+    this.setGoogleAccessToken(cleanToken);
+    const email = info.email || this.session?.user?.email || '';
+    const displayName =
+      info.name ||
+      this.session?.user?.user_metadata?.full_name ||
+      deriveDisplayNameFromEmail(email);
+    const avatarUrl =
+      info.picture ||
+      this.session?.user?.user_metadata?.avatar_url ||
+      (email ? await computeGravatarUrl(email) : '');
+
+    if (this.isAuthenticated()) {
+      const updated = {
+        ...this.session,
+        provider_token: cleanToken,
+        user: {
+          ...this.session.user,
+          email: this.session.user.email || email,
+          user_metadata: {
+            ...(this.session.user.user_metadata || {}),
+            email,
+            name: displayName,
+            full_name: displayName,
+            avatar_url: avatarUrl,
+            picture: avatarUrl
+          }
+        }
+      };
+      this._saveSession(updated);
+      return { ok: true, session: updated, profile: this.getUserProfile() };
+    }
+
+    const googleSession = {
+      access_token: null,
+      provider_token: cleanToken,
+      auth_mode: 'google_oauth',
+      user: {
+        id: info.sub ? `google_${info.sub}` : 'google_user',
+        email,
+        user_metadata: {
+          email,
+          name: displayName,
+          full_name: displayName,
+          avatar_url: avatarUrl,
+          picture: avatarUrl
+        }
+      }
+    };
+    this._saveSession(googleSession);
+    return { ok: true, session: googleSession, profile: this.getUserProfile() };
+  }
+
+  /**
+   * Loads Google Identity Services (accounts.google.com/gsi/client) on demand.
+   * @returns {Promise<boolean>}
+   */
+  async _ensureGoogleIdentityScript() {
+    if (this.windowObj?.google?.accounts?.oauth2) return true;
+    if (typeof document === 'undefined' || typeof globalThis.window === 'undefined') return false;
+
+    return new Promise((resolve) => {
+      const existing = document.querySelector('script[src*="accounts.google.com/gsi/client"]');
+      if (existing) {
+        const timer = setTimeout(() => resolve(Boolean(globalThis.window?.google?.accounts?.oauth2)), 4000);
+        existing.addEventListener('load', () => {
+          clearTimeout(timer);
+          resolve(Boolean(globalThis.window?.google?.accounts?.oauth2));
+        }, { once: true });
+        existing.addEventListener('error', () => {
+          clearTimeout(timer);
+          resolve(false);
+        }, { once: true });
+        return;
+      }
+
+      const script = document.createElement('script');
+      script.src = 'https://accounts.google.com/gsi/client';
+      script.async = true;
+      script.defer = true;
+      const timer = setTimeout(() => resolve(Boolean(globalThis.window?.google?.accounts?.oauth2)), 5000);
+      script.onload = () => {
+        clearTimeout(timer);
+        resolve(Boolean(globalThis.window?.google?.accounts?.oauth2));
+      };
+      script.onerror = () => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+      document.head.appendChild(script);
+    });
+  }
+
+  /**
+   * Runs direct Google OAuth via GIS Token Client or a popup window (never replacing the main window).
    * @param {object} [options]
-   * @returns {Promise<{ url: string }>}
+   * @returns {Promise<{ ok: boolean, session?: object|null, reason?: string, error?: string }>}
+   */
+  async signInWithGooglePopup(options = {}) {
+    const clientId = (options.clientId || this.getGoogleClientId() || '').trim();
+    if (!clientId) {
+      return {
+        ok: false,
+        reason: 'no_google_client_id',
+        error: 'No Google OAuth Client ID configured. Sign in with Gmail & password below.'
+      };
+    }
+
+    const scopes =
+      options.scopes ||
+      'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile';
+
+    // Prefer Google Identity Services token client when available
+    if (!options.forcePopup && (await this._ensureGoogleIdentityScript())) {
+      const oauth2 = this.windowObj?.google?.accounts?.oauth2;
+      if (oauth2?.initTokenClient) {
+        return new Promise((resolve) => {
+          let settled = false;
+          const timeout = setTimeout(() => {
+            if (!settled) {
+              settled = true;
+              resolve({
+                ok: false,
+                reason: 'oauth_timeout',
+                error: 'Google OAuth window timed out. Sign in with Gmail & password below.'
+              });
+            }
+          }, 60000);
+
+          try {
+            const client = oauth2.initTokenClient({
+              client_id: clientId,
+              scope: scopes,
+              hint: options.hint || undefined,
+              callback: async (resp) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                if (resp?.error || !resp?.access_token) {
+                  resolve({
+                    ok: false,
+                    reason: resp?.error || 'oauth_cancelled',
+                    error: resp?.error_description || 'Google OAuth did not complete. Use Gmail & password below.'
+                  });
+                  return;
+                }
+                resolve(await this.completeGoogleOAuthToken(resp.access_token));
+              },
+              error_callback: (err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                resolve({
+                  ok: false,
+                  reason: err?.type || 'oauth_popup_error',
+                  error: 'Google OAuth popup could not complete in this window. Use Gmail & password below.'
+                });
+              }
+            });
+            client.requestAccessToken({ prompt: 'select_account' });
+          } catch (err) {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timeout);
+              resolve({
+                ok: false,
+                reason: 'oauth_init_failed',
+                error: err?.message || 'Google OAuth popup unavailable. Use Gmail & password below.'
+              });
+            }
+          }
+        });
+      }
+    }
+
+    // Fallback: explicit OAuth popup window (never replacing window.location.href)
+    if (typeof this.windowObj?.open !== 'function') {
+      return {
+        ok: false,
+        reason: 'popup_unavailable',
+        error: 'Google OAuth popup is unavailable. Sign in with Gmail & password below.'
+      };
+    }
+
+    const origin = this.windowObj?.location?.origin || 'http://localhost';
+    const pathname = this.windowObj?.location?.pathname || '/';
+    const redirectUri = options.redirectTo || `${origin}${pathname}`;
+    const authParams = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: 'token',
+      scope: scopes,
+      include_granted_scopes: 'true',
+      prompt: 'select_account'
+    });
+    const oauthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${authParams.toString()}`;
+    const popup = this.windowObj.open(
+      oauthUrl,
+      'audiobook_google_oauth',
+      'width=520,height=680,menubar=no,toolbar=no'
+    );
+
+    if (!popup) {
+      return {
+        ok: false,
+        reason: 'popup_blocked',
+        error: 'Popup was blocked. Sign in with Gmail & password below.'
+      };
+    }
+
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      const poll = setInterval(async () => {
+        if (popup.closed) {
+          clearInterval(poll);
+          resolve({
+            ok: false,
+            reason: 'popup_closed',
+            error: 'Google OAuth window was closed. Sign in with Gmail & password below.'
+          });
+          return;
+        }
+        try {
+          const hash = popup.location?.hash || '';
+          if (hash.includes('access_token=')) {
+            clearInterval(poll);
+            const params = new URLSearchParams(hash.replace(/^#/, ''));
+            const token = params.get('access_token');
+            try { popup.close(); } catch {}
+            resolve(await this.completeGoogleOAuthToken(token));
+            return;
+          }
+          if (hash.includes('error=')) {
+            clearInterval(poll);
+            try { popup.close(); } catch {}
+            resolve({
+              ok: false,
+              reason: 'oauth_error',
+              error: 'Google OAuth was rejected. Sign in with Gmail & password below.'
+            });
+            return;
+          }
+        } catch {
+          // Cross-origin while user is on accounts.google.com
+        }
+        if (Date.now() - startedAt > 120000) {
+          clearInterval(poll);
+          try { popup.close(); } catch {}
+          resolve({
+            ok: false,
+            reason: 'oauth_timeout',
+            error: 'Google OAuth timed out. Sign in with Gmail & password below.'
+          });
+        }
+      }, 300);
+    });
+  }
+
+  /**
+   * Initiates Google OAuth via Supabase Auth only after verifying /auth/v1/settings (`external.google === true`).
+   * Never replaces the main window with a raw JSON error page when the provider is disabled.
+   * @param {object} [options]
+   * @returns {Promise<{ url: string, supported?: boolean|null, reason?: string, ok?: boolean, session?: object|null, error?: string }>}
    */
   async signInWithGoogle(options = {}) {
     const redirectTo =
@@ -424,10 +1007,45 @@ export class SupabaseSyncService {
     });
 
     const authUrl = `${this.config.url}/auth/v1/authorize?${params.toString()}`;
-    if (options.autoRedirect !== false && this.windowObj?.location?.assign) {
+    if (options.autoRedirect === false) {
+      return { url: authUrl };
+    }
+
+    const settings = options.skipSettingsCheck ? { external: { google: true } } : await this.getAuthSettings();
+    const googleEnabledOnSupabase = Boolean(settings?.external?.google);
+
+    if (!googleEnabledOnSupabase) {
+      if (options.fallbackToDirectGoogleOAuth && this.getGoogleClientId()) {
+        const directResult = await this.signInWithGooglePopup(options);
+        return { url: authUrl, supported: false, ...directResult };
+      }
+      return {
+        url: authUrl,
+        supported: false,
+        ok: false,
+        reason: 'provider_not_enabled',
+        error: 'Google OAuth provider is not enabled on Supabase. Sign in with your Gmail address & password.'
+      };
+    }
+
+    if (this._isTauriEnvironment() || options.preferPopup) {
+      if (typeof this.windowObj?.open === 'function') {
+        this.windowObj.open(authUrl, 'audiobook_supabase_google', 'width=520,height=680');
+        return { url: authUrl, supported: true, mode: 'popup' };
+      }
+      return {
+        url: authUrl,
+        supported: true,
+        ok: false,
+        reason: 'popup_unavailable',
+        error: 'Popup unavailable in desktop window.'
+      };
+    }
+
+    if (this.windowObj?.location?.assign) {
       this.windowObj.location.assign(authUrl);
     }
-    return { url: authUrl };
+    return { url: authUrl, supported: true, mode: 'redirect' };
   }
 
   /**
@@ -445,6 +1063,12 @@ export class SupabaseSyncService {
     const params = new URLSearchParams(fragment);
     const accessToken = params.get('access_token');
     if (!accessToken) return null;
+
+    const scopeParam = params.get('scope') || '';
+    if (accessToken.startsWith('ya29.') || scopeParam.includes('googleapis.com')) {
+      const result = await this.completeGoogleOAuthToken(accessToken);
+      return result.ok ? result.session : null;
+    }
 
     const session = {
       access_token: accessToken,

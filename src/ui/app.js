@@ -50,6 +50,7 @@ import {
 const STORAGE_THEME_KEY = 'audiobook_player_theme_v1';
 const STORAGE_LIBRARY_KEY = 'audiobook_user_library_v1';
 const STORAGE_ACTIVE_BOOK_KEY = 'audiobook_player_active_book_v1';
+const STORAGE_LAST_EMAIL_KEY = 'audiobook_player_last_email_v1';
 
 const PLAYBACK_RATES = [1.0, 1.25, 1.5, 1.75, 2.0];
 
@@ -156,8 +157,10 @@ class AudiobookApp {
       books: [],
       activeBookKey: null,
       detailBookKey: null,
-      loginTokenOpen: false,
+      authLoading: false,
       authError: '',
+      authNotice: '',
+      authEmail: this._loadLastEmail(),
       driveModal: {
         open: false,
         folderId: '',
@@ -963,12 +966,139 @@ class AudiobookApp {
     this.render();
   }
 
+  _loadLastEmail() {
+    try {
+      return localStorage.getItem(STORAGE_LAST_EMAIL_KEY) || '';
+    } catch {
+      return '';
+    }
+  }
+
+  _saveLastEmail(email) {
+    const clean = String(email || '').trim().toLowerCase();
+    this.state.authEmail = clean;
+    try {
+      if (clean) {
+        localStorage.setItem(STORAGE_LAST_EMAIL_KEY, clean);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   async enterLocalMode() {
     this.guestLocalMode = true;
     this.state.authError = '';
-    this.state.loginTokenOpen = false;
+    this.state.authNotice = '';
     await this._loadUserLibraryAndSync();
     this.render();
+  }
+
+  async handleGmailSignIn(emailInput = '', passwordInput = '') {
+    const email = String(emailInput || '').trim().toLowerCase();
+    const password = String(passwordInput || '');
+    this._saveLastEmail(email);
+
+    this.state.authLoading = true;
+    this.state.authError = '';
+    this.state.authNotice = '';
+    this.render();
+
+    try {
+      const result = await this.syncService.signInWithEmail(email, password);
+      this.state.authLoading = false;
+
+      if (result?.ok) {
+        this.user = this.syncService.getUserProfile();
+        this.guestLocalMode = false;
+        const token = this.syncService.getGoogleAccessToken();
+        if (token) {
+          this.audioEngine.setDriveAccessToken(token);
+        }
+        await this._loadUserLibraryAndSync();
+        this.render();
+        return;
+      }
+
+      if (result?.confirmationRequired) {
+        this.state.authNotice =
+          result.error ||
+          `Confirmation link sent to ${email}. Check Gmail, then click Sign In with Gmail.`;
+        this.render();
+        return;
+      }
+
+      this.state.authError = result?.error || 'Unable to sign in with Gmail.';
+      this.render();
+    } catch (err) {
+      this.state.authLoading = false;
+      this.state.authError = err?.message || 'Unable to sign in with Gmail.';
+      this.render();
+    }
+  }
+
+  async handleGoogleOAuth() {
+    this.state.profileOpen = false;
+    this.state.authError = '';
+    this.state.authNotice = '';
+    this.state.authLoading = true;
+    this.render();
+
+    try {
+      const result = await this.syncService.signInWithGoogle({
+        autoRedirect: true,
+        fallbackToDirectGoogleOAuth: true,
+        hint: this.state.authEmail || undefined
+      });
+
+      this.state.authLoading = false;
+
+      if (result?.ok && (result.session || this.syncService.getUserProfile())) {
+        this.user = this.syncService.getUserProfile();
+        this.guestLocalMode = false;
+        const token = this.syncService.getGoogleAccessToken();
+        if (token) {
+          this.audioEngine.setDriveAccessToken(token);
+        }
+        if (this.state.driveModal.open) {
+          this.state.driveModal.token = token || '';
+          this.state.driveModal.error = '';
+        }
+        await this._loadUserLibraryAndSync();
+        this.render();
+        return;
+      }
+
+      if (result?.mode === 'popup' || result?.mode === 'redirect') {
+        this.render();
+        return;
+      }
+
+      const fallbackMsg =
+        result?.error || 'Google OAuth unavailable in this window. Sign in with Gmail & password above.';
+      if (this.state.driveModal.open) {
+        this.state.driveModal.error = fallbackMsg;
+      } else {
+        this.state.authError = fallbackMsg;
+      }
+      this.render();
+
+      if (typeof document !== 'undefined') {
+        const emailEl = document.getElementById('gmailEmailInput');
+        if (emailEl && typeof emailEl.focus === 'function') {
+          emailEl.focus();
+        }
+      }
+    } catch (err) {
+      this.state.authLoading = false;
+      const msg = err?.message || 'Google OAuth could not start. Sign in with Gmail & password above.';
+      if (this.state.driveModal.open) {
+        this.state.driveModal.error = msg;
+      } else {
+        this.state.authError = msg;
+      }
+      this.render();
+    }
   }
 
   async handleSignOut() {
@@ -983,6 +1113,8 @@ class AudiobookApp {
     this.state.driveModal.open = false;
     this.state.coverModal.open = false;
     this.state.desktopView = 'home';
+    this.state.authError = '';
+    this.state.authNotice = '';
     this.render();
   }
 
@@ -1107,7 +1239,7 @@ class AudiobookApp {
         <button id="profileAvatarBtn" data-action="toggle-profile" aria-label="Account" class="btn-press w-8 h-8 rounded-full overflow-hidden border border-white/15 bg-gradient-to-br from-[#1ed760] to-[#0f766e] flex items-center justify-center text-xs font-bold text-[#050506] shrink-0">
           ${
             user.avatarUrl
-              ? `<img src="${escapeHtml(user.avatarUrl)}" alt="${escapeHtml(user.name)}" class="w-full h-full object-cover" />`
+              ? `<img src="${escapeHtml(user.avatarUrl)}" alt="${escapeHtml(user.name)}" class="w-full h-full object-cover" onerror="this.style.display='none';if(this.nextElementSibling)this.nextElementSibling.style.display='flex';" /><span style="display:none" class="w-full h-full items-center justify-center">${escapeHtml(initials)}</span>`
               : `<span>${escapeHtml(initials)}</span>`
           }
         </button>
@@ -1134,7 +1266,7 @@ class AudiobookApp {
           <div class="w-10 h-10 rounded-full overflow-hidden bg-gradient-to-br from-[#1ed760] to-[#0f766e] flex items-center justify-center text-sm font-bold text-[#050506] shrink-0">
             ${
               user.avatarUrl
-                ? `<img src="${escapeHtml(user.avatarUrl)}" alt="${escapeHtml(user.name)}" class="w-full h-full object-cover" />`
+                ? `<img src="${escapeHtml(user.avatarUrl)}" alt="${escapeHtml(user.name)}" class="w-full h-full object-cover" onerror="this.style.display='none';if(this.nextElementSibling)this.nextElementSibling.style.display='flex';" /><span style="display:none" class="w-full h-full items-center justify-center">${escapeHtml((user.name || 'L')[0].toUpperCase())}</span>`
                 : escapeHtml((user.name || 'L')[0].toUpperCase())
             }
           </div>
@@ -1220,10 +1352,10 @@ class AudiobookApp {
   }
 
   _renderLoginView() {
-    const { loginTokenOpen, authError } = this.state;
+    const { authError, authNotice, authLoading, authEmail } = this.state;
     return `
       <main class="min-h-screen w-full flex items-center justify-center p-6 bg-[var(--bg-canvas)]">
-        <div class="w-full max-w-sm surface-panel rounded-3xl p-8 border border-[var(--border-subtle)] shadow-2xl space-y-7 text-center">
+        <div class="w-full max-w-sm surface-panel rounded-3xl p-8 border border-[var(--border-subtle)] shadow-2xl space-y-6 text-center">
           <div class="flex flex-col items-center gap-4">
             <div class="w-16 h-16 rounded-2xl bg-[#1ed760]/15 border border-[#1ed760]/35 flex items-center justify-center text-[#1ed760] shadow-lg">
               <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1232,40 +1364,46 @@ class AudiobookApp {
                 <path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
               </svg>
             </div>
-            <h1 class="text-2xl font-bold tracking-tight text-white">Audiobook Player</h1>
+            <div class="space-y-1">
+              <h1 class="text-2xl font-bold tracking-tight text-white">Audiobook Player</h1>
+              <p class="text-xs text-[var(--text-secondary)]">Sign in with Gmail to sync your library</p>
+            </div>
           </div>
 
           ${
             authError
-              ? `<div class="rounded-xl bg-red-500/10 border border-red-500/30 px-3 py-2 text-xs text-red-300">${escapeHtml(authError)}</div>`
+              ? `<div class="rounded-xl bg-red-500/10 border border-red-500/30 px-3 py-2 text-xs text-red-300 text-left">${escapeHtml(authError)}</div>`
+              : ''
+          }
+          ${
+            authNotice
+              ? `<div class="rounded-xl bg-[#1ed760]/10 border border-[#1ed760]/30 px-3 py-2 text-xs text-[#86efac] text-left">${escapeHtml(authNotice)}</div>`
               : ''
           }
 
-          <div class="space-y-3">
-            <button data-action="login-google" class="btn-press w-full py-3 px-4 rounded-full bg-[#1ed760] hover:brightness-105 text-[#050506] text-sm font-bold flex items-center justify-center gap-2.5 shadow-lg">
-              <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
-                <path fill="#050506" d="M21.35 11.1h-9.17v2.73h6.51c-.33 3.81-3.5 5.44-6.5 5.44C8.36 19.27 5 16.25 5 12c0-4.1 3.2-7.27 7.2-7.27c3.09 0 4.9 1.97 4.9 1.97L19 4.72S16.56 2 12.1 2C6.42 2 2.03 6.8 2.03 12c0 5.05 4.13 10 10.22 10c5.35 0 9.25-3.67 9.25-9.09c0-1.15-.15-1.81-.15-1.81Z"/>
+          <form id="gmailLoginForm" class="space-y-3 text-left">
+            <div>
+              <input id="gmailEmailInput" type="email" required autocomplete="email" value="${escapeHtml(authEmail || '')}" placeholder="you@gmail.com" class="w-full px-4 py-3 rounded-2xl bg-white/5 border border-[var(--border-subtle)] text-sm text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
+            </div>
+            <div>
+              <input id="gmailPasswordInput" type="password" required minlength="6" autocomplete="current-password" placeholder="Password (6+ characters)" class="w-full px-4 py-3 rounded-2xl bg-white/5 border border-[var(--border-subtle)] text-sm text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
+            </div>
+            <button type="submit" ${authLoading ? 'disabled' : ''} class="btn-press w-full py-3 px-4 rounded-full bg-[#1ed760] hover:brightness-105 text-[#050506] text-sm font-bold flex items-center justify-center gap-2 shadow-lg disabled:opacity-60">
+              <span>${authLoading ? 'Signing in...' : 'Sign In with Gmail'}</span>
+            </button>
+          </form>
+
+          <div class="space-y-2.5 pt-1">
+            <button type="button" data-action="login-google" ${authLoading ? 'disabled' : ''} class="btn-press w-full py-2.5 px-4 rounded-full surface-card hover:bg-white/10 text-white text-xs font-semibold flex items-center justify-center gap-2 disabled:opacity-60">
+              <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true">
+                <path fill="currentColor" d="M21.35 11.1h-9.17v2.73h6.51c-.33 3.81-3.5 5.44-6.5 5.44C8.36 19.27 5 16.25 5 12c0-4.1 3.2-7.27 7.2-7.27c3.09 0 4.9 1.97 4.9 1.97L19 4.72S16.56 2 12.1 2C6.42 2 2.03 6.8 2.03 12c0 5.05 4.13 10 10.22 10c5.35 0 9.25-3.67 9.25-9.09c0-1.15-.15-1.81-.15-1.81Z"/>
               </svg>
-              <span>Continue with Google</span>
+              <span>Continue with Google OAuth</span>
             </button>
 
-            <button data-action="login-local" class="btn-press w-full py-3 px-4 rounded-full surface-card hover:bg-white/10 text-white text-sm font-semibold">
+            <button type="button" data-action="login-local" class="btn-press w-full py-2.5 px-4 rounded-full bg-white/5 hover:bg-white/10 text-[var(--text-secondary)] hover:text-white text-xs font-semibold">
               Continue with Local Files
             </button>
-          </div>
-
-          <div class="pt-1">
-            <button data-action="toggle-login-token" class="btn-press text-xs font-medium text-[var(--text-secondary)] hover:text-white">
-              ${loginTokenOpen ? 'Hide Drive Token' : 'Enter Google Drive Token'}
-            </button>
-            ${
-              loginTokenOpen
-                ? `<form id="loginDriveTokenForm" class="mt-3 flex items-center gap-2">
-                    <input id="loginDriveTokenInput" type="password" placeholder="Paste Google OAuth token..." class="flex-1 min-w-0 px-3 py-2 rounded-xl bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
-                    <button type="submit" class="btn-press px-3.5 py-2 rounded-xl bg-[#1ed760] text-[#050506] text-xs font-bold shrink-0">Connect</button>
-                  </form>`
-                : ''
-            }
           </div>
         </div>
       </main>
@@ -2406,20 +2544,19 @@ class AudiobookApp {
       });
     }
 
-    const loginTokenForm = document.getElementById('loginDriveTokenForm');
-    if (loginTokenForm) {
-      loginTokenForm.addEventListener('submit', (e) => {
+    const gmailForm = document.getElementById('gmailLoginForm');
+    if (gmailForm) {
+      const emailEl = document.getElementById('gmailEmailInput');
+      if (emailEl) {
+        emailEl.addEventListener('input', (e) => {
+          this.state.authEmail = e.target.value;
+        });
+      }
+      gmailForm.addEventListener('submit', (e) => {
         e.preventDefault();
-        const input = document.getElementById('loginDriveTokenInput');
-        const token = input?.value?.trim() || '';
-        if (!token) {
-          this.state.authError = 'Paste a valid Google OAuth token to connect.';
-          this.render();
-          return;
-        }
-        this.syncService.setGoogleAccessToken(token);
-        this.audioEngine.setDriveAccessToken(token);
-        void this.enterLocalMode();
+        const emailVal = document.getElementById('gmailEmailInput')?.value || '';
+        const passVal = document.getElementById('gmailPasswordInput')?.value || '';
+        void this.handleGmailSignIn(emailVal, passVal);
       });
     }
 
@@ -2612,18 +2749,11 @@ class AudiobookApp {
             break;
           }
           case 'login-google': {
-            this.state.profileOpen = false;
-            void this.syncService.signInWithGoogle({ autoRedirect: true });
+            void this.handleGoogleOAuth();
             break;
           }
           case 'login-local': {
             void this.enterLocalMode();
-            break;
-          }
-          case 'toggle-login-token': {
-            this.state.loginTokenOpen = !this.state.loginTokenOpen;
-            this.state.authError = '';
-            this.render();
             break;
           }
           case 'clear-filters': {

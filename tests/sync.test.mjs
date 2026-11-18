@@ -469,3 +469,190 @@ test('SupabaseSyncService builds Google OAuth URL and handles signOut', async ()
   assert.match(fetchCalls[0].url, /\/auth\/v1\/logout$/);
   sync.destroy();
 });
+
+test('SupabaseSyncService signInWithGoogle checks /auth/v1/settings and never navigates when google provider is disabled', async () => {
+  const fakeWindow = createFakeWindow();
+  const openedUrls = [];
+  fakeWindow.open = (url) => {
+    openedUrls.push(url);
+    return null;
+  };
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.endsWith('/auth/v1/settings')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { external: { google: false, email: true } };
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const result = await sync.signInWithGoogle({ autoRedirect: true });
+  assert.equal(result.supported, false);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'provider_not_enabled');
+  assert.equal(fakeWindow.location.assignedUrl, null);
+  assert.equal(openedUrls.length, 0);
+  sync.destroy();
+});
+
+test('SupabaseSyncService signInWithGoogle uses popup instead of replacing Tauri window when google provider is enabled', async () => {
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://tauri.localhost';
+  const openedUrls = [];
+  fakeWindow.open = (url) => {
+    openedUrls.push(url);
+    return { closed: false, close() {} };
+  };
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.endsWith('/auth/v1/settings')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { external: { google: true, email: true } };
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const result = await sync.signInWithGoogle({ autoRedirect: true });
+  assert.equal(result.supported, true);
+  assert.equal(result.mode, 'popup');
+  assert.equal(fakeWindow.location.assignedUrl, null);
+  assert.equal(openedUrls.length, 1);
+  assert.match(openedUrls[0], /provider=google/);
+  sync.destroy();
+});
+
+test('SupabaseSyncService signInWithEmail signs in existing user and auto-creates new account on invalid_credentials', async () => {
+  const storage = createMemoryStorage();
+  const requests = [];
+
+  const sync = new SupabaseSyncService({
+    storage,
+    windowObj: null,
+    navigatorObj: { onLine: true },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url, init) => {
+      const body = init.body ? JSON.parse(init.body) : null;
+      requests.push({ url, body });
+
+      if (url.includes('/auth/v1/token?grant_type=password') && body.email === 'existing@gmail.com') {
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({
+              access_token: 'jwt-existing',
+              refresh_token: 'ref-1',
+              user: { id: 'u-existing', email: 'existing@gmail.com', user_metadata: {} }
+            });
+          }
+        };
+      }
+
+      if (url.includes('/auth/v1/token?grant_type=password') && body.email === 'newuser@gmail.com') {
+        return {
+          ok: false,
+          status: 400,
+          async text() {
+            return JSON.stringify({ error: 'invalid_grant', error_description: 'Invalid login credentials' });
+          }
+        };
+      }
+
+      if (url.includes('/auth/v1/signup')) {
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({
+              access_token: 'jwt-new',
+              user: {
+                id: 'u-new',
+                email: 'newuser@gmail.com',
+                user_metadata: body.data
+              }
+            });
+          }
+        };
+      }
+
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const res1 = await sync.signInWithEmail('existing@gmail.com', 'secret123');
+  assert.equal(res1.ok, true);
+  assert.equal(res1.created, false);
+  assert.equal(sync.isAuthenticated(), true);
+  assert.equal(sync.getUserProfile().email, 'existing@gmail.com');
+  assert.match(sync.getUserProfile().avatarUrl, /^https:\/\/www\.gravatar\.com\/avatar\/[a-f0-9]{64}/);
+
+  const res2 = await sync.signInWithEmail('newuser@gmail.com', 'secret123');
+  assert.equal(res2.ok, true);
+  assert.equal(res2.created, true);
+  assert.equal(sync.getUserProfile().email, 'newuser@gmail.com');
+  assert.equal(sync.getUserProfile().name, 'Newuser');
+  sync.destroy();
+});
+
+test('SupabaseSyncService completeGoogleOAuthToken hydrates Google userinfo and Drive token', async () => {
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: null,
+    navigatorObj: { onLine: true },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              sub: '123456',
+              email: 'reader@gmail.com',
+              name: 'Reader One',
+              picture: 'https://lh3.googleusercontent.com/a/photo.jpg'
+            };
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const res = await sync.completeGoogleOAuthToken('ya29.test-google-token');
+  assert.equal(res.ok, true);
+  assert.equal(sync.getGoogleAccessToken(), 'ya29.test-google-token');
+  assert.deepEqual(sync.getUserProfile(), {
+    id: 'google_123456',
+    email: 'reader@gmail.com',
+    name: 'Reader One',
+    avatarUrl: 'https://lh3.googleusercontent.com/a/photo.jpg'
+  });
+  sync.destroy();
+});
