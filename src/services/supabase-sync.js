@@ -1452,7 +1452,12 @@ export class SupabaseSyncService {
       drive_file_id: item.driveFileId || null,
       metadata_json: {
         description: item.description || '',
-        chapters: Array.isArray(item.chapters) ? item.chapters : []
+        chapters: Array.isArray(item.chapters) ? item.chapters : [],
+        seriesOrder:
+          item.seriesOrder != null && Number.isFinite(Number(item.seriesOrder))
+            ? Number(item.seriesOrder)
+            : null,
+        ...(item.enrichmentCheckedAt ? { enrichmentCheckedAt: item.enrichmentCheckedAt } : {})
       },
       updated_at: new Date().toISOString()
     }));
@@ -1464,6 +1469,49 @@ export class SupabaseSyncService {
       },
       body: rows
     });
+  }
+
+  /**
+   * Deletes matching library items from /rest/v1/audiobook_library_items
+   * for the authenticated user (e.g. when wiping synced Google Drive books).
+   * @param {string[]} [bookKeys=[]]
+   * @param {{ all?: boolean }} [options={}]
+   * @returns {Promise<{ ok: boolean, deleted: number }>}
+   */
+  async deleteLibraryItems(bookKeys = [], options = {}) {
+    if (!this._isOnline() || !this.isAuthenticated()) {
+      return { ok: false, deleted: 0 };
+    }
+    const userId = encodeURIComponent(this.session.user.id);
+    if (options?.all) {
+      await this._rest(`audiobook_library_items?user_id=eq.${userId}`, {
+        method: 'DELETE'
+      });
+      return { ok: true, deleted: -1 };
+    }
+
+    const keys = Array.isArray(bookKeys)
+      ? Array.from(new Set(bookKeys.map((k) => String(k || '').trim()).filter(Boolean)))
+      : [];
+    if (keys.length === 0) {
+      return { ok: true, deleted: 0 };
+    }
+
+    const chunkSize = 50;
+    let deleted = 0;
+    for (let i = 0; i < keys.length; i += chunkSize) {
+      const chunk = keys.slice(i, i + chunkSize);
+      const filter =
+        chunk.length === 1
+          ? `book_key=eq.${encodeURIComponent(chunk[0])}`
+          : `book_key=in.(${chunk.map((k) => `"${encodeURIComponent(k)}"`).join(',')})`;
+      await this._rest(`audiobook_library_items?user_id=eq.${userId}&${filter}`, {
+        method: 'DELETE'
+      });
+      deleted += chunk.length;
+    }
+
+    return { ok: true, deleted };
   }
 
   /**
@@ -1482,12 +1530,19 @@ export class SupabaseSyncService {
         author: row.author,
         narrator: row.narrator,
         series: row.series,
+        seriesOrder:
+          row.metadata_json?.seriesOrder != null && Number.isFinite(Number(row.metadata_json.seriesOrder))
+            ? Number(row.metadata_json.seriesOrder)
+            : null,
         coverUrl: row.cover_url,
         totalDurationSec: Number(row.total_duration_sec ?? 0),
         sources: Array.isArray(row.sources) ? row.sources : [],
         driveFileId: row.drive_file_id,
         description: row.metadata_json?.description || '',
-        chapters: row.metadata_json?.chapters || []
+        chapters: row.metadata_json?.chapters || [],
+        ...(row.metadata_json?.enrichmentCheckedAt
+          ? { enrichmentCheckedAt: row.metadata_json.enrichmentCheckedAt }
+          : {})
       }));
     } catch {
       return [];

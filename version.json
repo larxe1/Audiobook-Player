@@ -1,11 +1,11 @@
 {
-  "version": "1.0.6",
-  "build": 7,
+  "version": "1.0.7",
+  "build": 8,
   "channel": "stable",
   "publishedAt": "2026-11-18T00:00:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Sync progress bar, global error popup modal, and recursive local subfolder scanning"
+  "releaseNotes": "Wipe synced Drive files, automatic franchise/series folder nesting, automated cover & metadata enrichment, and hierarchical chapters"
 }

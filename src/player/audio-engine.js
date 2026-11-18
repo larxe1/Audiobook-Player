@@ -88,6 +88,17 @@ export class AudioEngine {
       if (this.usingSynth) return;
       if (Number.isFinite(this.audio.duration) && this.audio.duration > 0) {
         this.durationSec = this.audio.duration;
+        const chapters = this.currentBook?.chapters;
+        if (this._isMultiFileChapters(chapters)) {
+          const activeChapter = chapters[this.chapterIndex];
+          if (activeChapter) {
+            activeChapter.durationSec = Math.round(this.audio.duration);
+          }
+          const knownTotal = chapters.reduce((sum, ch) => sum + (Number(ch?.durationSec) > 0 ? Number(ch.durationSec) : 0), 0);
+          if (knownTotal > 0 && chapters.every((ch) => Number(ch?.durationSec) > 0)) {
+            this.currentBook.totalDurationSec = knownTotal;
+          }
+        }
       }
       if (this.positionSec > 0 && this.positionSec < this.durationSec) {
         try {
@@ -543,7 +554,10 @@ export class AudioEngine {
       const chapters = this.currentBook?.chapters || [];
       const current = chapters[this.chapterIndex];
       const next = chapters[this.chapterIndex + 1];
-      if (next) {
+      if (this._isMultiFileChapters(chapters)) {
+        const trackDur = Number(current?.durationSec) || this.durationSec || 0;
+        this.sleepRemainingSec = trackDur > 0 ? Math.max(1, trackDur - this.positionSec) : 0;
+      } else if (next) {
         this.sleepRemainingSec = Math.max(1, next.startSec - this.positionSec);
       } else if (current) {
         this.sleepRemainingSec = Math.max(1, this.durationSec - this.positionSec);
@@ -557,8 +571,26 @@ export class AudioEngine {
     return this.sleepTimerMode;
   }
 
+  _isMultiFileChapters(chapters = []) {
+    if (!Array.isArray(chapters) || chapters.length <= 1) return false;
+    let trackCount = 0;
+    const distinct = new Set();
+    for (const ch of chapters) {
+      const key = ch?.driveFileId || ch?.driveStreamUrl || ch?.localUrl || ch?.localFile?.name || '';
+      if (key) {
+        trackCount += 1;
+        distinct.add(key);
+      }
+    }
+    return trackCount > 1 && distinct.size > 1;
+  }
+
   computeChapterIndex(positionSec, chapters = []) {
     if (!Array.isArray(chapters) || chapters.length === 0) return 0;
+    if (this._isMultiFileChapters(chapters)) {
+      const idx = Number.isInteger(this.chapterIndex) ? this.chapterIndex : 0;
+      return Math.max(0, Math.min(chapters.length - 1, idx));
+    }
     let idx = 0;
     for (let i = 0; i < chapters.length; i += 1) {
       if (positionSec >= Number(chapters[i].startSec || 0)) {
@@ -572,6 +604,9 @@ export class AudioEngine {
 
   _syncChapterFromPosition() {
     const chapters = this.currentBook?.chapters || [];
+    if (this._isMultiFileChapters(chapters)) {
+      return;
+    }
     const nextIdx = this.computeChapterIndex(this.positionSec, chapters);
     if (nextIdx !== this.chapterIndex) {
       const prevMode = this.sleepTimerMode;

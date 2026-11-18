@@ -13,6 +13,70 @@
       onerror="var s=document.createElement('script');s.src='https://cdn.tailwindcss.com';document.head.appendChild(s);"
     ></script>
     <link rel="stylesheet" href="./src/styles/theme.css" />
+    <style>
+      /* Franchise / Series Folder Nesting & Hierarchical Chapters */
+      .franchise-folder-header {
+        transition: background-color 180ms var(--ease-spring), border-color 180ms var(--ease-spring);
+      }
+      .franchise-cover-stack {
+        position: relative;
+      }
+      .franchise-cover-stack::before {
+        content: "";
+        position: absolute;
+        inset: -2px 3px 3px -2px;
+        border-radius: 0.55rem;
+        background: rgba(255, 255, 255, 0.14);
+        border: 1px solid var(--border-subtle);
+        z-index: 0;
+        pointer-events: none;
+      }
+      .franchise-cover-stack > img {
+        position: relative;
+        z-index: 1;
+      }
+      .franchise-book-list {
+        position: relative;
+        margin-left: 0.95rem;
+        padding-left: 0.65rem;
+        border-left: 1.5px solid rgba(148, 163, 184, 0.22);
+      }
+      .franchise-book-item {
+        position: relative;
+      }
+      .franchise-book-item::before {
+        content: "";
+        position: absolute;
+        left: -0.65rem;
+        top: 50%;
+        width: 0.45rem;
+        height: 1.5px;
+        background: rgba(148, 163, 184, 0.22);
+      }
+      .series-order-pill {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0.08rem 0.38rem;
+        border-radius: 9999px;
+        font-size: 10px;
+        font-weight: 700;
+        line-height: 1.25;
+        font-variant-numeric: tabular-nums;
+        background: rgba(30, 215, 96, 0.14);
+        color: #1ed760;
+        border: 1px solid rgba(30, 215, 96, 0.28);
+        flex-shrink: 0;
+      }
+      .chapter-section-group {
+        border-left: 1.5px solid rgba(148, 163, 184, 0.2);
+        margin-left: 0.65rem;
+        padding-left: 0.65rem;
+      }
+      .franchise-chevron {
+        transition: transform 200ms var(--ease-spring);
+      }
+    </style>
   </head>
   <body class="theme-midnight min-h-screen antialiased selection:bg-[#1ed760]/30 selection:text-white">
     <div id="appRoot"></div>

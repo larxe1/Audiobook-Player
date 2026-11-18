@@ -3,7 +3,12 @@
  * book key normalization and Local + Drive deduplication.
  */
 
-import { parseAudioTags, parseFilenameMetadata } from './metadata-enrichment.js';
+import {
+  parseAudioTags,
+  parseFilenameMetadata,
+  parseSeriesAndOrder,
+  normalizeBookSeriesAndChapters,
+} from './metadata-enrichment.js';
 
 const SUPPORTED_AUDIO_RE = /\.(m4b|mp3|m4a|ogg|flac)$/i;
 const ANY_AUDIO_EXT_RE = /\.(m4b|mp3|m4a|ogg|flac|aac|wav|opus)$/i;
@@ -179,6 +184,10 @@ export function deduplicateLibraryItems(items = []) {
         offline: rawOffline,
         chapters: Array.isArray(raw.chapters) ? [...raw.chapters] : [],
         bookmarks: mergeBookmarks(raw.bookmarks),
+        seriesOrder:
+          raw.seriesOrder != null && Number.isFinite(Number(raw.seriesOrder))
+            ? Number(raw.seriesOrder)
+            : null,
         positionSec: rawPos,
         progressSec: rawPos,
         progress: rawProgress,
@@ -208,6 +217,15 @@ export function deduplicateLibraryItems(items = []) {
       : (existing.clientUpdatedAt || existing.lastPlayedAt);
 
     const offlineStatus = Boolean(existing.isOffline || existing.offline || rawOffline);
+    const existingOrder =
+      existing.seriesOrder != null && Number.isFinite(Number(existing.seriesOrder))
+        ? Number(existing.seriesOrder)
+        : null;
+    const rawOrder =
+      raw.seriesOrder != null && Number.isFinite(Number(raw.seriesOrder))
+        ? Number(raw.seriesOrder)
+        : null;
+    const mergedSeriesOrder = existingOrder !== null ? existingOrder : rawOrder;
 
     byKey.set(key, {
       ...existing,
@@ -217,6 +235,7 @@ export function deduplicateLibraryItems(items = []) {
       author: existing.author || raw.author || '',
       narrator: existing.narrator || raw.narrator || '',
       series: existing.series || raw.series || '',
+      seriesOrder: mergedSeriesOrder,
       description: existing.description || raw.description || '',
       coverUrl: existing.coverUrl || raw.coverUrl || '',
       year: existing.year || raw.year || '',
@@ -241,11 +260,14 @@ export function deduplicateLibraryItems(items = []) {
       progress: bestProgress,
       chapterIndex: bestChapterIndex,
       totalDurationSec: bestDuration,
+      ...(existing.enrichmentCheckedAt || raw.enrichmentCheckedAt
+        ? { enrichmentCheckedAt: existing.enrichmentCheckedAt || raw.enrichmentCheckedAt }
+        : {}),
       ...(latestTs ? { lastPlayedAt: latestTs } : {}),
     });
   }
 
-  return Array.from(byKey.values());
+  return Array.from(byKey.values()).map((item) => normalizeBookSeriesAndChapters(item));
 }
 
 /**
@@ -416,7 +438,12 @@ export async function scanLocalFiles(fileList, options = {}) {
       const folderMeta = parseFilenameMetadata(folderName || '');
       const firstTags = parsedEntries[0].tags;
       const title = firstTags.series || effectiveFolderTitle || folderMeta.title || folderName;
-      const author = firstTags.author || folderMeta.author || parentMeta.author || '';
+      const rawAuthor = firstTags.author || folderMeta.author || parentMeta.author || '';
+      const rawSeries = info.depth >= 2 ? info.parentFolderName : (firstTags.series || folderMeta.series || '');
+      const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, info.depth >= 2 ? info.parentFolderName : '');
+      const author = seriesParsed.authorPolluted
+        ? (seriesParsed.inferredAuthor || '')
+        : (rawAuthor || seriesParsed.inferredAuthor || '');
       const bookKey = normalizeBookKey(title, author);
 
       const tracks = parsedEntries.map(({ file, localUrl }) => ({
@@ -427,36 +454,42 @@ export async function scanLocalFiles(fileList, options = {}) {
       const chapters = parsedEntries.map(({ file, tags, localUrl }, idx) => ({
         index: idx,
         title: tags.title || file.name.replace(ANY_AUDIO_EXT_RE, '') || `Chapter ${idx + 1}`,
+        fileName: file.name,
         startSec: 0,
+        ...(Number(tags.totalDurationSec) > 0 ? { durationSec: Math.round(Number(tags.totalDurationSec)) } : {}),
         localUrl,
         localFile: file,
       }));
 
-      collectedBooks.push({
-        id: bookKey,
-        bookKey,
-        title,
-        author,
-        narrator: parsedEntries.find((e) => e.tags.narrator)?.tags.narrator || '',
-        series: info.depth >= 2 ? info.parentFolderName : (firstTags.series || ''),
-        description: parsedEntries.find((e) => e.tags.description)?.tags.description || '',
-        year: parsedEntries.find((e) => e.tags.year)?.tags.year || '',
-        totalDurationSec: parsedEntries.reduce((s, e) => s + Number(e.tags.totalDurationSec || 0), 0),
-        coverUrl: folderCoverUrl || '',
-        sources: ['local'],
-        preferredPlaybackSource: 'local',
-        localUrl: parsedEntries[0].localUrl,
-        localFile: parsedEntries[0].file,
-        tracks,
-        chapters,
-        bookmarks: [],
-        positionSec: 0,
-        progressSec: 0,
-        chapterIndex: 0,
-        isOffline: true,
-        offline: true,
-        fileSizeBytes: parsedEntries.reduce((s, e) => s + Number(e.file.size || 0), 0),
-      });
+      collectedBooks.push(
+        normalizeBookSeriesAndChapters({
+          id: bookKey,
+          bookKey,
+          title,
+          author,
+          narrator: parsedEntries.find((e) => e.tags.narrator)?.tags.narrator || '',
+          series: seriesParsed.series || rawSeries,
+          seriesOrder: seriesParsed.seriesOrder ?? folderMeta.seriesOrder ?? firstTags.seriesOrder ?? null,
+          parentFolderName: info.depth >= 2 ? info.parentFolderName : '',
+          description: parsedEntries.find((e) => e.tags.description)?.tags.description || '',
+          year: parsedEntries.find((e) => e.tags.year)?.tags.year || '',
+          totalDurationSec: parsedEntries.reduce((s, e) => s + Number(e.tags.totalDurationSec || 0), 0),
+          coverUrl: folderCoverUrl || '',
+          sources: ['local'],
+          preferredPlaybackSource: 'local',
+          localUrl: parsedEntries[0].localUrl,
+          localFile: parsedEntries[0].file,
+          tracks,
+          chapters,
+          bookmarks: [],
+          positionSec: 0,
+          progressSec: 0,
+          chapterIndex: 0,
+          isOffline: true,
+          offline: true,
+          fileSizeBytes: parsedEntries.reduce((s, e) => s + Number(e.file.size || 0), 0),
+        }),
+      );
       continue;
     }
 
@@ -473,13 +506,19 @@ export async function scanLocalFiles(fileList, options = {}) {
       const title = useFolderTitle
         ? effectiveFolderTitle || folderMeta.title || folderName
         : tags.title || file.name.replace(ANY_AUDIO_EXT_RE, '');
-      const author = tags.author || folderMeta.author || parentMeta.author || '';
-      const series =
+      const rawAuthor = tags.author || folderMeta.author || parentMeta.author || '';
+      const rawSeries =
         !isRootLevel && parsedEntries.length > 1 && folderName
           ? folderName
           : info.depth >= 2 && info.parentFolderName
             ? info.parentFolderName
-            : tags.series || '';
+            : tags.series || folderMeta.series || '';
+      const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, info.depth >= 2 ? info.parentFolderName : '');
+      const author = seriesParsed.authorPolluted
+        ? (seriesParsed.inferredAuthor || '')
+        : (rawAuthor || seriesParsed.inferredAuthor || '');
+      const series = seriesParsed.series || rawSeries;
+      const seriesOrder = seriesParsed.seriesOrder ?? tags.seriesOrder ?? folderMeta.seriesOrder ?? null;
       const bookKey = normalizeBookKey(title, author);
 
       if (!perFileGroups.has(bookKey)) {
@@ -490,7 +529,9 @@ export async function scanLocalFiles(fileList, options = {}) {
                 {
                   index: 0,
                   title: 'Chapter 1',
+                  fileName: file.name,
                   startSec: 0,
+                  ...(Number(tags.totalDurationSec) > 0 ? { durationSec: Math.round(Number(tags.totalDurationSec)) } : {}),
                   localUrl,
                   localFile: file,
                 },
@@ -503,6 +544,8 @@ export async function scanLocalFiles(fileList, options = {}) {
           author,
           narrator: tags.narrator || '',
           series,
+          seriesOrder,
+          parentFolderName: info.depth >= 2 ? info.parentFolderName : '',
           description: tags.description || '',
           year: tags.year || '',
           totalDurationSec: tags.totalDurationSec || 0,
@@ -528,7 +571,9 @@ export async function scanLocalFiles(fileList, options = {}) {
         book.chapters.push({
           index: nextIndex,
           title: tags.title || file.name.replace(ANY_AUDIO_EXT_RE, '') || `Chapter ${nextIndex + 1}`,
+          fileName: file.name,
           startSec: 0,
+          ...(Number(tags.totalDurationSec) > 0 ? { durationSec: Math.round(Number(tags.totalDurationSec)) } : {}),
           localUrl,
           localFile: file,
         });
@@ -538,7 +583,7 @@ export async function scanLocalFiles(fileList, options = {}) {
       }
     }
 
-    collectedBooks.push(...perFileGroups.values());
+    collectedBooks.push(...Array.from(perFileGroups.values()).map((b) => normalizeBookSeriesAndChapters(b)));
   }
 
   const deduped = deduplicateLibraryItems(collectedBooks);
@@ -687,7 +732,7 @@ async function listDriveQueryPages(accessToken, q, fetchImpl, options = {}) {
     const params = new URLSearchParams({
       q,
       fields:
-        'nextPageToken,files(id,name,mimeType,size,modifiedTime,webContentLink,thumbnailLink,shortcutDetails(targetId,targetMimeType))',
+        'nextPageToken,files(id,name,mimeType,size,modifiedTime,webContentLink,thumbnailLink,videoMediaMetadata,shortcutDetails(targetId,targetMimeType))',
       pageSize: '1000',
       supportsAllDrives: 'true',
       includeItemsFromAllDrives: 'true',
@@ -749,6 +794,11 @@ async function listDriveQueryPages(accessToken, q, fetchImpl, options = {}) {
   return allFiles;
 }
 
+function extractDriveDurationSec(file) {
+  const millis = Number(file?.videoMediaMetadata?.durationMillis || 0);
+  return Number.isFinite(millis) && millis > 0 ? Math.round(millis / 1000) : 0;
+}
+
 function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFiles, coverFile, isRootFolder) {
   if (!audioFiles.length) return [];
 
@@ -764,12 +814,18 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
     sorted.length > 1 &&
     !allSingleBookContainers;
 
+  // Only use thumbnailLink from an actual image file in the folder, NEVER from audio files
   const preferredCoverUrl = coverFile?.thumbnailLink || '';
 
   if (shouldGroupAsOneBook) {
     const folderMeta = parseFilenameMetadata(folderName || '');
     const title = folderMeta.title || folderName || sorted[0].name.replace(ANY_AUDIO_EXT_RE, '');
-    const author = folderMeta.author || '';
+    const rawAuthor = folderMeta.author || '';
+    const rawSeries = parentFolderName || folderMeta.series || '';
+    const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, parentFolderName);
+    const author = seriesParsed.authorPolluted
+      ? (seriesParsed.inferredAuthor || '')
+      : (rawAuthor || seriesParsed.inferredAuthor || '');
     const bookKey = normalizeBookKey(title, author);
     const primaryFileId = resolveDriveFileId(sorted[0]);
     const primaryStreamUrl = buildDriveStreamUrl(primaryFileId);
@@ -777,10 +833,13 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
     const chapters = sorted.map((file, idx) => {
       const fId = resolveDriveFileId(file);
       const fileMeta = parseAudioTags(null, file.name);
+      const durationSec = extractDriveDurationSec(file);
       return {
         index: idx,
         title: fileMeta.title || file.name.replace(ANY_AUDIO_EXT_RE, '') || `Chapter ${idx + 1}`,
+        fileName: file.name,
         startSec: 0,
+        ...(durationSec > 0 ? { durationSec } : {}),
         driveFileId: fId,
         driveStreamUrl: buildDriveStreamUrl(fId),
         sizeBytes: Number(file.size || 0),
@@ -788,17 +847,20 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
     });
 
     const totalSize = sorted.reduce((sum, f) => sum + Number(f.size || 0), 0);
-    const fallbackThumb = sorted.find((f) => f.thumbnailLink)?.thumbnailLink || '';
+    const totalDurationSec = chapters.reduce((sum, ch) => sum + Number(ch.durationSec || 0), 0);
 
     return [
-      {
+      normalizeBookSeriesAndChapters({
         id: bookKey,
         bookKey,
         title,
         author,
-        series: parentFolderName || folderMeta.series || '',
+        series: seriesParsed.series || rawSeries,
+        seriesOrder: seriesParsed.seriesOrder ?? folderMeta.seriesOrder ?? null,
+        parentFolderName: parentFolderName || '',
         narrator: '',
         description: '',
+        totalDurationSec,
         sources: ['drive'],
         preferredPlaybackSource: 'drive',
         driveFileId: primaryFileId,
@@ -807,7 +869,7 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
         mimeType: resolveDriveMimeType(sorted[0]) || 'audio/mpeg',
         fileSizeBytes: totalSize,
         modifiedTime: sorted[0].modifiedTime || '',
-        coverUrl: preferredCoverUrl || fallbackThumb,
+        coverUrl: preferredCoverUrl,
         coverDriveFileId: coverFile ? resolveDriveFileId(coverFile) : '',
         chapters,
         bookmarks: [],
@@ -816,7 +878,7 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
         chapterIndex: 0,
         isOffline: false,
         offline: false,
-      },
+      }),
     ];
   }
 
@@ -834,22 +896,32 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
     const title = useFolderAsTitle
       ? folderMeta.title || folderName
       : fileMeta.title || file.name.replace(ANY_AUDIO_EXT_RE, '');
-    const author = fileMeta.author || folderMeta.author || '';
-    const series =
+    const rawAuthor = fileMeta.author || folderMeta.author || '';
+    const rawSeries =
       !isRootFolder && sorted.length > 1 && folderName
         ? folderName
-        : fileMeta.series || '';
+        : fileMeta.series || folderMeta.series || parentFolderName || '';
+    const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, parentFolderName);
+    const author = seriesParsed.authorPolluted
+      ? (seriesParsed.inferredAuthor || '')
+      : (rawAuthor || seriesParsed.inferredAuthor || '');
+    const series = seriesParsed.series || rawSeries;
+    const seriesOrder = seriesParsed.seriesOrder ?? fileMeta.seriesOrder ?? folderMeta.seriesOrder ?? null;
     const bookKey = normalizeBookKey(title, author);
     const driveStreamUrl = buildDriveStreamUrl(fileId);
+    const durationSec = extractDriveDurationSec(file);
 
-    return {
+    return normalizeBookSeriesAndChapters({
       id: bookKey,
       bookKey,
       title,
       author,
       series,
+      seriesOrder,
+      parentFolderName: parentFolderName || '',
       narrator: '',
       description: '',
+      totalDurationSec: durationSec,
       sources: ['drive'],
       preferredPlaybackSource: 'drive',
       driveFileId: fileId,
@@ -858,13 +930,15 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
       mimeType: resolveDriveMimeType(file) || 'audio/mp4',
       fileSizeBytes: Number(file.size || 0),
       modifiedTime: file.modifiedTime || '',
-      coverUrl: file.thumbnailLink || preferredCoverUrl || '',
+      coverUrl: preferredCoverUrl,
       coverDriveFileId: coverFile ? resolveDriveFileId(coverFile) : '',
       chapters: [
         {
           index: 0,
           title: 'Chapter 1',
+          fileName: file.name,
           startSec: 0,
+          ...(durationSec > 0 ? { durationSec } : {}),
           driveFileId: fileId,
           driveStreamUrl,
         },
@@ -875,7 +949,7 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
       chapterIndex: 0,
       isOffline: false,
       offline: false,
-    };
+    });
   });
 }
 

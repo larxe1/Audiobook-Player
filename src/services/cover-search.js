@@ -117,6 +117,14 @@ async function safeFetchJson(url, fetchImpl) {
   }
 }
 
+function cleanCoverQuery(query = '') {
+  return String(query || '')
+    .replace(/\bUnknown Author\b/gi, '')
+    .replace(/\s*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /**
  * Search online audiobook & book cover artwork from iTunes (600x600),
  * Google Books, and Open Library, always appending curated high-contrast
@@ -127,12 +135,13 @@ async function safeFetchJson(url, fetchImpl) {
  */
 export async function searchCoverImages(query, fetchImpl = globalThis.fetch) {
   const trimmed = typeof query === 'string' ? query.trim() : '';
+  const searchTerm = cleanCoverQuery(trimmed) || trimmed;
   const candidates = [];
 
-  if (trimmed && typeof fetchImpl === 'function') {
-    const itunesUrl = `https://itunes.apple.com/search?media=audiobook&limit=6&term=${encodeURIComponent(trimmed)}`;
-    const googleBooksUrl = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(trimmed)}&maxResults=6`;
-    const openLibUrl = `https://openlibrary.org/search.json?q=${encodeURIComponent(trimmed)}&limit=6`;
+  if (searchTerm && typeof fetchImpl === 'function') {
+    const itunesUrl = `https://itunes.apple.com/search?media=audiobook&limit=6&term=${encodeURIComponent(searchTerm)}`;
+    const googleBooksUrl = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(searchTerm)}&maxResults=6`;
+    const openLibUrl = `https://openlibrary.org/search.json?q=${encodeURIComponent(searchTerm)}&limit=6`;
 
     const [itunesRes, googleRes, openLibRes] = await Promise.allSettled([
       safeFetchJson(itunesUrl, fetchImpl),

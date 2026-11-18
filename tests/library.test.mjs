@@ -10,9 +10,17 @@ import {
 } from '../src/services/library-scanner.js';
 import {
   parseAudioTags,
+  parseFilenameMetadata,
+  parseSeriesAndOrder,
+  normalizeBookChapters,
+  normalizeBookSeriesAndChapters,
+  isDriveThumbnailOrMissingCover,
+  needsAutomatedEnrichment,
   enrichBookMetadata,
 } from '../src/services/metadata-enrichment.js';
 import { searchCoverImages } from '../src/services/cover-search.js';
+import { AudioEngine } from '../src/player/audio-engine.js';
+import { SupabaseSyncService } from '../src/services/supabase-sync.js';
 
 function writeSynchsafe(value) {
   return [
@@ -602,4 +610,340 @@ test('scanGoogleDriveFolder emits progress, supports AbortSignal cancellation, a
     () => scanGoogleDriveFolder('token', 'rootFolder', errFetch403),
     (err) => err?.status === 403 && /access denied|403/i.test(err.message),
   );
+});
+
+test('parseSeriesAndOrder, parseFilenameMetadata, and normalizeBookSeriesAndChapters normalize franchises and polluted authors', () => {
+  const fnExpanse = parseFilenameMetadata('The Expanse 0.1 - Drive (2013).m4b');
+  assert.equal(fnExpanse.series, 'The Expanse');
+  assert.equal(fnExpanse.seriesOrder, 0.1);
+  assert.equal(fnExpanse.title, 'Drive (2013)');
+  assert.equal(fnExpanse.author, 'James S. A. Corey');
+
+  const pollutedExpanse = normalizeBookSeriesAndChapters({
+    title: 'The Churn (2014)',
+    author: 'The Expanse 0.2',
+    chapters: [{ index: 0, title: 'Chapter 1', startSec: 0 }],
+  });
+  assert.equal(pollutedExpanse.series, 'The Expanse');
+  assert.equal(pollutedExpanse.seriesOrder, 0.2);
+  assert.equal(pollutedExpanse.author, 'James S. A. Corey');
+
+  const pollutedGeneric = normalizeBookSeriesAndChapters({
+    title: 'Starfall',
+    author: 'Galactic Saga 1.5',
+    chapters: [],
+  });
+  assert.equal(pollutedGeneric.series, 'Galactic Saga');
+  assert.equal(pollutedGeneric.seriesOrder, 1.5);
+  assert.equal(pollutedGeneric.author, 'Unknown Author');
+
+  const sandman1 = parseSeriesAndOrder('The Sandman', 'Neil Gaiman');
+  const sandman2 = parseSeriesAndOrder('The Sandman: Act II', 'Neil Gaiman');
+  const sandman3 = parseSeriesAndOrder('The Sandman Act III', '');
+  assert.equal(sandman1.series, 'The Sandman');
+  assert.equal(sandman1.seriesOrder, 1);
+  assert.equal(sandman2.series, 'The Sandman');
+  assert.equal(sandman2.seriesOrder, 2);
+  assert.equal(sandman3.series, 'The Sandman');
+  assert.equal(sandman3.seriesOrder, 3);
+  assert.equal(sandman3.inferredAuthor, 'Neil Gaiman');
+
+  const hp1 = parseSeriesAndOrder("Harry Potter and the Philosopher's Stone");
+  const hp4 = parseSeriesAndOrder('Harry Potter Book 4');
+  assert.equal(hp1.series, 'Harry Potter');
+  assert.equal(hp1.seriesOrder, 1);
+  assert.equal(hp4.series, 'Harry Potter');
+  assert.equal(hp4.seriesOrder, 4);
+});
+
+test('normalizeBookChapters fixes repeated Lincoln in the Bardo titles, builds cumulative timestamps, and extracts hierarchy', () => {
+  const lincolnChapters = normalizeBookChapters(
+    [
+      { index: 0, title: 'Lincoln in the Bardo', fileName: '01 - Lincoln in the Bardo.mp3', startSec: 0, durationSec: 1200 },
+      { index: 1, title: 'Lincoln in the Bardo', fileName: '02 - Lincoln in the Bardo.mp3', startSec: 0, durationSec: 1500 },
+      { index: 2, title: 'Lincoln in the Bardo', fileName: '03 - Lincoln in the Bardo.mp3', startSec: 0, durationSec: 900 },
+    ],
+    'Lincoln in the Bardo',
+  );
+  assert.deepEqual(
+    lincolnChapters.map((c) => c.title),
+    ['Part 1', 'Part 2', 'Part 3'],
+  );
+  assert.deepEqual(
+    lincolnChapters.map((c) => c.startSec),
+    [0, 1200, 2700],
+  );
+
+  const hierarchical = normalizeBookChapters(
+    [
+      { index: 0, title: 'Act I - Chapter 1: Arrival', startSec: 0 },
+      { index: 1, title: 'Act I - Chapter 2: Departure', startSec: 600 },
+      { index: 2, title: '1.1 Epilogue', startSec: 1200 },
+    ],
+    'Some Book',
+  );
+  assert.equal(hierarchical[0].sectionTitle, 'Act I');
+  assert.equal(hierarchical[0].title, 'Chapter 1: Arrival');
+  assert.equal(hierarchical[0].level, 1);
+  assert.equal(hierarchical[0].durationSec, 600);
+  assert.equal(hierarchical[2].level, 1);
+});
+
+test('isDriveThumbnailOrMissingCover, needsAutomatedEnrichment, and Drive single-file series + videoMediaMetadata', async () => {
+  assert.equal(isDriveThumbnailOrMissingCover(''), true);
+  assert.equal(isDriveThumbnailOrMissingCover('https://lh3.googleusercontent.com/abc'), true);
+  assert.equal(isDriveThumbnailOrMissingCover('https://drive.google.com/thumbnail?id=123'), true);
+  assert.equal(isDriveThumbnailOrMissingCover('https://docs.google.com/uc?id=123'), true);
+  assert.equal(isDriveThumbnailOrMissingCover('https://is1-ssl.mzstatic.com/image/600x600bb.jpg'), false);
+
+  assert.equal(needsAutomatedEnrichment({ title: 'Test', author: 'Unknown Author', coverUrl: 'https://x.com/a.jpg' }), true);
+  assert.equal(
+    needsAutomatedEnrichment({
+      title: 'Test',
+      author: 'Author',
+      coverUrl: 'https://x.com/a.jpg',
+      seriesOrder: 1,
+      chapters: [{ index: 0, title: 'Opening', startSec: 0 }],
+      enrichmentCheckedAt: '2026-01-01T00:00:00Z',
+    }),
+    false,
+  );
+
+  const driveTree = {
+    root: [
+      { id: 'series-fl', name: 'First Law World', mimeType: 'application/vnd.google-apps.folder' },
+    ],
+    'series-fl': [
+      { id: 'book-blade', name: 'The Blade Itself', mimeType: 'application/vnd.google-apps.folder' },
+    ],
+    'book-blade': [
+      {
+        id: 'file-blade',
+        name: 'Joe Abercrombie - The Blade Itself.m4b',
+        mimeType: 'audio/mp4',
+        size: '450000000',
+        thumbnailLink: 'https://lh3.googleusercontent.com/black-audio-box',
+        videoMediaMetadata: { durationMillis: '3600000' },
+      },
+    ],
+  };
+
+  const mockFetch = async (url) => {
+    const u = new URL(url);
+    assert.match(u.searchParams.get('fields') || '', /videoMediaMetadata/);
+    const q = u.searchParams.get('q') || '';
+    const match = q.match(/'([^']+)'\s+in\s+parents/);
+    const parentId = match ? match[1] : '';
+    return {
+      ok: true,
+      json: async () => ({ files: driveTree[parentId] || [] }),
+    };
+  };
+
+  const books = await scanGoogleDriveFolder('token', 'root', mockFetch);
+  assert.equal(books.length, 1);
+  assert.equal(books[0].series, 'First Law World');
+  assert.equal(books[0].coverUrl, ''); // Must NOT use audio file's thumbnailLink
+  assert.equal(books[0].totalDurationSec, 3600);
+});
+
+test('enrichBookMetadata cleans queries, pulls Audnexus seriesOrder + chapters, Google Books fallback, and replaces Drive thumbnails', async () => {
+  const seenUrls = [];
+  const mockFetch = async (url) => {
+    seenUrls.push(url);
+    if (url.includes('itunes.apple.com')) {
+      return { ok: true, json: async () => ({ results: [] }) };
+    }
+    if (url.includes('api.audnex.us/books/B00DRIVE123/chapters')) {
+      return {
+        ok: true,
+        json: async () => ({
+          runtimeLengthSec: 1800,
+          chapters: [
+            { title: 'Part I - Launch', startOffsetSec: 0, lengthMs: 900000 },
+            { title: 'Part I - Burn', startOffsetSec: 900, lengthMs: 900000 },
+          ],
+        }),
+      };
+    }
+    if (url.includes('api.audnex.us/books')) {
+      return {
+        ok: true,
+        json: async () => [
+          {
+            asin: 'B00DRIVE123',
+            title: 'Drive',
+            authors: [{ name: 'James S. A. Corey' }],
+            narrators: [{ name: 'Jefferson Mays' }],
+            seriesPrimary: { name: 'The Expanse', position: '0.1' },
+            runtimeLengthMin: 30,
+          },
+        ],
+      };
+    }
+    if (url.includes('googleapis.com/books')) {
+      return {
+        ok: true,
+        json: async () => ({
+          items: [
+            {
+              volumeInfo: {
+                title: 'Drive',
+                authors: ['James S. A. Corey'],
+                imageLinks: { thumbnail: 'http://books.google.com/books/content?id=expanse1&edge=curl' },
+              },
+            },
+          ],
+        }),
+      };
+    }
+    return { ok: false };
+  };
+
+  const enriched = await enrichBookMetadata(
+    {
+      title: 'Drive (2013)',
+      author: 'The Expanse 0.1',
+      coverUrl: 'https://lh3.googleusercontent.com/broken-thumb',
+      chapters: [{ index: 0, title: 'Chapter 1', startSec: 0 }],
+    },
+    mockFetch,
+  );
+
+  assert.equal(enriched.author, 'James S. A. Corey');
+  assert.equal(enriched.series, 'The Expanse');
+  assert.equal(enriched.seriesOrder, 0.1);
+  assert.equal(enriched.narrator, 'Jefferson Mays');
+  assert.equal(enriched.coverUrl, 'https://books.google.com/books/content?id=expanse1');
+  assert.equal(enriched.chapters.length, 2);
+  assert.equal(enriched.chapters[0].sectionTitle, 'Part I');
+  assert.equal(enriched.chapters[0].title, 'Launch');
+  assert.equal(enriched.chapters[0].level, 1);
+  assert.ok(enriched.enrichmentCheckedAt);
+  assert.ok(!seenUrls.some((u) => u.includes('2013') && u.includes('api.audnex.us/books?')));
+});
+
+test('parseAudioTags parses ID3v2 CHAP frames and MP4 chpl chapter durationSec', () => {
+  // Build synthetic ID3v2.3 with CHAP frame containing embedded TIT2
+  const tit2Text = Buffer.concat([Buffer.from([3]), Buffer.from('Opening Scene', 'utf8')]);
+  const tit2Frame = Buffer.concat([
+    Buffer.from('TIT2', 'ascii'),
+    Buffer.from(writeUint32BE(tit2Text.length)),
+    Buffer.from([0, 0]),
+    tit2Text,
+  ]);
+  const chapPayload = Buffer.concat([
+    Buffer.from('chp1\0', 'latin1'),
+    Buffer.from(writeUint32BE(0)),
+    Buffer.from(writeUint32BE(45000)),
+    Buffer.from([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+    tit2Frame,
+  ]);
+  const chapFrame = Buffer.concat([
+    Buffer.from('CHAP', 'ascii'),
+    Buffer.from(writeUint32BE(chapPayload.length)),
+    Buffer.from([0, 0]),
+    chapPayload,
+  ]);
+  const id3Header = Buffer.from([0x49, 0x44, 0x33, 0x03, 0x00, 0x00, ...writeSynchsafe(chapFrame.length)]);
+  const tags = parseAudioTags(new Uint8Array(Buffer.concat([id3Header, chapFrame])), 'book.mp3');
+  assert.equal(tags.chapters.length, 1);
+  assert.equal(tags.chapters[0].title, 'Opening Scene');
+  assert.equal(tags.chapters[0].startSec, 0);
+  assert.equal(tags.chapters[0].durationSec, 45);
+
+  // MP4 chpl durationSec
+  const m4b = buildSyntheticMp4({
+    title: 'Test',
+    chapters: [
+      { title: 'Ch 1', startSec: 0 },
+      { title: 'Ch 2', startSec: 100 },
+    ],
+  });
+  const mp4Tags = parseAudioTags(m4b, 'test.m4b');
+  assert.equal(mp4Tags.chapters[0].durationSec, 100);
+});
+
+test('AudioEngine computeChapterIndex and chapter sleep timer work reliably for multi-file books', () => {
+  const engine = new AudioEngine();
+  const multiBook = {
+    bookKey: 'lincoln::saunders',
+    totalDurationSec: 3600,
+    chapters: [
+      { index: 0, title: 'Part 1', startSec: 0, durationSec: 600, driveFileId: 'f1', driveStreamUrl: 'https://d/1' },
+      { index: 1, title: 'Part 2', startSec: 0, durationSec: 900, driveFileId: 'f2', driveStreamUrl: 'https://d/2' },
+    ],
+  };
+  engine.currentBook = multiBook;
+  engine.chapterIndex = 1;
+  engine.positionSec = 120;
+  assert.equal(engine.computeChapterIndex(120, multiBook.chapters), 1);
+
+  // Cycle sleep presets: [0, 15, 30, 45, 'chapter']
+  for (let i = 0; i < 4; i += 1) engine.cycleSleepTimer();
+  assert.equal(engine.sleepTimerMode, 'chapter');
+  assert.equal(engine.sleepRemainingSec, 780);
+  engine.destroy();
+});
+
+test('SupabaseSyncService deleteLibraryItems deletes keys and syncLibraryItems/fetchLibraryItems preserve seriesOrder', async () => {
+  const requests = [];
+  const mockFetch = async (url, init = {}) => {
+    requests.push({ url, method: init.method || 'GET', body: init.body });
+    if ((init.method || 'GET') === 'GET') {
+      return {
+        ok: true,
+        text: async () =>
+          JSON.stringify([
+            {
+              book_key: 'drive-2013::james-s-a-corey',
+              title: 'Drive (2013)',
+              author: 'James S. A. Corey',
+              narrator: 'Jefferson Mays',
+              series: 'The Expanse',
+              cover_url: 'https://example.com/drive.jpg',
+              total_duration_sec: 1800,
+              sources: ['drive'],
+              drive_file_id: 'drv-1',
+              metadata_json: {
+                description: 'Epstein drive',
+                chapters: [],
+                seriesOrder: 0.1,
+              },
+            },
+          ]),
+      };
+    }
+    return { ok: true, text: async () => '' };
+  };
+
+  const client = new SupabaseSyncService({ fetchImpl: mockFetch });
+  client.setSession({ access_token: 'tok', user: { id: 'user-123' } });
+
+  await client.syncLibraryItems([
+    {
+      bookKey: 'drive-2013::james-s-a-corey',
+      title: 'Drive (2013)',
+      author: 'James S. A. Corey',
+      series: 'The Expanse',
+      seriesOrder: 0.1,
+      sources: ['drive'],
+    },
+  ]);
+
+  const postReq = requests.find((r) => r.method === 'POST');
+  assert.ok(postReq);
+  const postedRows = JSON.parse(postReq.body);
+  assert.equal(postedRows[0].metadata_json.seriesOrder, 0.1);
+
+  const fetched = await client.fetchLibraryItems();
+  assert.equal(fetched[0].seriesOrder, 0.1);
+
+  const delRes = await client.deleteLibraryItems(['drive-2013::james-s-a-corey', 'book-2::author']);
+  assert.equal(delRes.ok, true);
+  assert.equal(delRes.deleted, 2);
+  const delReq = requests.find((r) => r.method === 'DELETE');
+  assert.ok(delReq);
+  assert.match(delReq.url, /audiobook_library_items\?user_id=eq\.user-123&book_key=in\./);
+  client.destroy();
 });
