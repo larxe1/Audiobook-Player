@@ -1,11 +1,11 @@
 {
-  "version": "1.0.4",
-  "build": 5,
+  "version": "1.0.5",
+  "build": 6,
   "channel": "stable",
   "publishedAt": "2026-11-18T00:00:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Single-click Continue with Google popup login across Windows desktop and Android"
+  "releaseNotes": "Recursive Google Drive subfolder scanning, full Drive URL parsing, and multi-chapter Drive playback"
 }

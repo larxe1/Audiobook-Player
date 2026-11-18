@@ -7,7 +7,37 @@ import { parseAudioTags, parseFilenameMetadata } from './metadata-enrichment.js'
 
 const SUPPORTED_AUDIO_RE = /\.(m4b|mp3|m4a|ogg|flac)$/i;
 const ANY_AUDIO_EXT_RE = /\.(m4b|mp3|m4a|ogg|flac|aac|wav|opus)$/i;
+const IMAGE_FILE_RE = /\.(jpg|jpeg|png|webp)$/i;
 const TRACK_LIKE_FILE_RE = /^(?:\d{1,4}[\s._-]|(?:chapter|chap|ch|part|pt|disc|cd|track|tr)[\s._-]*\d+)/i;
+
+/**
+ * Extract a Google Drive Folder ID from a pasted Drive URL or raw ID string.
+ * Supports links like:
+ * - https://drive.google.com/drive/u/0/folders/1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD
+ * - https://drive.google.com/drive/folders/1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD?usp=sharing
+ * - https://drive.google.com/open?id=1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD
+ * - 1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD
+ * @param {string} [input='']
+ * @returns {string}
+ */
+export function extractGoogleDriveFolderId(input = '') {
+  const raw = String(input || '').trim();
+  if (!raw) return '';
+  const folderMatch = raw.match(/\/folders\/([a-zA-Z0-9_-]+)/i);
+  if (folderMatch && folderMatch[1]) {
+    return folderMatch[1];
+  }
+  const idParamMatch = raw.match(/[?&]id=([a-zA-Z0-9_-]+)/i);
+  if (idParamMatch && idParamMatch[1]) {
+    return idParamMatch[1];
+  }
+  // If someone pasted another Drive URL without /folders/ or ?id=, strip query/slash safely
+  if (/^https?:\/\//i.test(raw)) {
+    const seg = raw.split('?')[0].split('#')[0].split('/').filter(Boolean).pop() || '';
+    return seg.replace(/[^a-zA-Z0-9_-]/g, '');
+  }
+  return raw.replace(/^['"]+|['"]+$/g, '');
+}
 
 /**
  * Strip accents, file extensions, punctuation, and casing into a canonical slug segment.
@@ -384,86 +414,297 @@ export async function scanLocalFiles(fileList) {
   return deduplicateLibraryItems(Array.from(grouped.values()));
 }
 
-/**
- * Scan a Google Drive folder using Drive API v3 and return audiobook entries
- * configured for HTTP Range streaming (`?alt=media`).
- * @param {string} accessToken
- * @param {string} [folderId='']
- * @param {typeof fetch} [fetchImpl=globalThis.fetch]
- * @returns {Promise<Array<object>>}
- */
-export async function scanGoogleDriveFolder(
-  accessToken,
-  folderId = '',
-  fetchImpl = globalThis.fetch,
-) {
-  if (!accessToken || typeof fetchImpl !== 'function') return [];
+function isDriveFolder(file) {
+  return (
+    file?.mimeType === 'application/vnd.google-apps.folder' ||
+    (file?.mimeType === 'application/vnd.google-apps.shortcut' &&
+      file?.shortcutDetails?.targetMimeType === 'application/vnd.google-apps.folder')
+  );
+}
 
-  const q = folderId
-    ? `'${folderId}' in parents and trashed = false`
-    : "trashed = false and (mimeType contains 'audio/' or name contains '.m4b' or name contains '.mp3' or name contains '.m4a' or name contains '.ogg' or name contains '.flac')";
+function resolveDriveFileId(file) {
+  if (
+    file?.mimeType === 'application/vnd.google-apps.shortcut' &&
+    file?.shortcutDetails?.targetId
+  ) {
+    return file.shortcutDetails.targetId;
+  }
+  return file?.id || '';
+}
 
-  const params = new URLSearchParams({
-    q,
-    fields: 'files(id,name,mimeType,size,modifiedTime,webContentLink,thumbnailLink)',
-    pageSize: '100',
-  });
+function resolveDriveMimeType(file) {
+  if (
+    file?.mimeType === 'application/vnd.google-apps.shortcut' &&
+    file?.shortcutDetails?.targetMimeType
+  ) {
+    return file.shortcutDetails.targetMimeType;
+  }
+  return file?.mimeType || '';
+}
 
-  const url = `https://www.googleapis.com/drive/v3/files?${params.toString()}`;
-  const res = await fetchImpl(url, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/json',
-    },
-  });
+function isDriveAudioFile(file) {
+  if (!file || !file.name) return false;
+  const mime = resolveDriveMimeType(file);
+  return SUPPORTED_AUDIO_RE.test(file.name) || (typeof mime === 'string' && mime.startsWith('audio/'));
+}
 
-  if (!res || !res.ok) {
-    throw new Error(`Google Drive scan failed (${res ? res.status : 'no response'})`);
+function isDriveImageFile(file) {
+  if (!file || !file.name) return false;
+  const mime = resolveDriveMimeType(file);
+  return IMAGE_FILE_RE.test(file.name) || (typeof mime === 'string' && mime.startsWith('image/'));
+}
+
+async function listDriveQueryPages(accessToken, q, fetchImpl) {
+  const allFiles = [];
+  let pageToken = '';
+  let guard = 0;
+
+  do {
+    const params = new URLSearchParams({
+      q,
+      fields:
+        'nextPageToken,files(id,name,mimeType,size,modifiedTime,webContentLink,thumbnailLink,shortcutDetails(targetId,targetMimeType))',
+      pageSize: '1000',
+      supportsAllDrives: 'true',
+      includeItemsFromAllDrives: 'true',
+    });
+    if (pageToken) {
+      params.set('pageToken', pageToken);
+    }
+
+    const url = `https://www.googleapis.com/drive/v3/files?${params.toString()}`;
+    const res = await fetchImpl(url, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: 'application/json',
+      },
+    });
+
+    if (!res || !res.ok) {
+      throw new Error(`Google Drive scan failed (${res ? res.status : 'no response'})`);
+    }
+
+    const data = await res.json();
+    const files = Array.isArray(data?.files) ? data.files : [];
+    allFiles.push(...files);
+    pageToken = data?.nextPageToken || '';
+    guard += 1;
+  } while (pageToken && guard < 20);
+
+  return allFiles;
+}
+
+function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFiles, coverFile, isRootFolder) {
+  if (!audioFiles.length) return [];
+
+  const sorted = [...audioFiles].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }),
+  );
+
+  // Determine whether multiple files inside this subfolder belong to ONE book (chapters/tracks)
+  // vs multiple distinct single-file books (e.g. a series folder containing Book 1.m4b, Book 2.m4b).
+  const allSingleBookContainers = sorted.every((f) => /\.m4b$/i.test(f.name) && !TRACK_LIKE_FILE_RE.test(f.name));
+  const shouldGroupAsOneBook =
+    !isRootFolder &&
+    sorted.length > 1 &&
+    !allSingleBookContainers;
+
+  const preferredCoverUrl = coverFile?.thumbnailLink || '';
+
+  if (shouldGroupAsOneBook) {
+    const folderMeta = parseFilenameMetadata(folderName || '');
+    const title = folderMeta.title || folderName || sorted[0].name.replace(ANY_AUDIO_EXT_RE, '');
+    const author = folderMeta.author || '';
+    const bookKey = normalizeBookKey(title, author);
+    const primaryFileId = resolveDriveFileId(sorted[0]);
+    const primaryStreamUrl = buildDriveStreamUrl(primaryFileId);
+
+    const chapters = sorted.map((file, idx) => {
+      const fId = resolveDriveFileId(file);
+      const fileMeta = parseAudioTags(null, file.name);
+      return {
+        index: idx,
+        title: fileMeta.title || file.name.replace(ANY_AUDIO_EXT_RE, '') || `Chapter ${idx + 1}`,
+        startSec: 0,
+        driveFileId: fId,
+        driveStreamUrl: buildDriveStreamUrl(fId),
+        sizeBytes: Number(file.size || 0),
+      };
+    });
+
+    const totalSize = sorted.reduce((sum, f) => sum + Number(f.size || 0), 0);
+    const fallbackThumb = sorted.find((f) => f.thumbnailLink)?.thumbnailLink || '';
+
+    return [
+      {
+        id: bookKey,
+        bookKey,
+        title,
+        author,
+        series: parentFolderName || folderMeta.series || '',
+        narrator: '',
+        description: '',
+        sources: ['drive'],
+        preferredPlaybackSource: 'drive',
+        driveFileId: primaryFileId,
+        driveStreamUrl: primaryStreamUrl,
+        streamUrl: primaryStreamUrl,
+        mimeType: resolveDriveMimeType(sorted[0]) || 'audio/mpeg',
+        fileSizeBytes: totalSize,
+        modifiedTime: sorted[0].modifiedTime || '',
+        coverUrl: preferredCoverUrl || fallbackThumb,
+        coverDriveFileId: coverFile ? resolveDriveFileId(coverFile) : '',
+        chapters,
+        bookmarks: [],
+        positionSec: 0,
+        progressSec: 0,
+        chapterIndex: 0,
+        isOffline: false,
+        offline: false,
+      },
+    ];
   }
 
-  const data = await res.json();
-  const files = Array.isArray(data?.files) ? data.files : [];
+  return sorted.map((file) => {
+    const fileId = resolveDriveFileId(file);
+    const fileMeta = parseAudioTags(null, file.name);
+    const folderMeta = !isRootFolder && folderName ? parseFilenameMetadata(folderName) : { title: '', author: '' };
 
-  const items = [];
-  for (const file of files) {
-    if (!file || !file.id || !file.name) continue;
-    const isAudio =
-      SUPPORTED_AUDIO_RE.test(file.name) ||
-      (typeof file.mimeType === 'string' && file.mimeType.startsWith('audio/'));
-    if (!isAudio) continue;
+    const useFolderAsTitle =
+      sorted.length === 1 &&
+      !isRootFolder &&
+      folderName &&
+      (TRACK_LIKE_FILE_RE.test(file.name) || /^(audiobook|book|audio|part)/i.test(file.name));
 
-    const meta = parseAudioTags(null, file.name);
-    const title = meta.title || file.name.replace(ANY_AUDIO_EXT_RE, '');
-    const author = meta.author || '';
+    const title = useFolderAsTitle
+      ? folderMeta.title || folderName
+      : fileMeta.title || file.name.replace(ANY_AUDIO_EXT_RE, '');
+    const author = fileMeta.author || folderMeta.author || '';
+    const series =
+      !isRootFolder && sorted.length > 1 && folderName
+        ? folderName
+        : fileMeta.series || '';
     const bookKey = normalizeBookKey(title, author);
-    const driveStreamUrl = buildDriveStreamUrl(file.id);
+    const driveStreamUrl = buildDriveStreamUrl(fileId);
 
-    items.push({
+    return {
       id: bookKey,
       bookKey,
       title,
       author,
-      series: meta.series || '',
+      series,
       narrator: '',
       description: '',
       sources: ['drive'],
       preferredPlaybackSource: 'drive',
-      driveFileId: file.id,
+      driveFileId: fileId,
       driveStreamUrl,
       streamUrl: driveStreamUrl,
-      mimeType: file.mimeType || 'audio/mp4',
+      mimeType: resolveDriveMimeType(file) || 'audio/mp4',
       fileSizeBytes: Number(file.size || 0),
       modifiedTime: file.modifiedTime || '',
-      coverUrl: file.thumbnailLink || '',
-      chapters: [{ index: 0, title: 'Chapter 1', startSec: 0 }],
+      coverUrl: file.thumbnailLink || preferredCoverUrl || '',
+      coverDriveFileId: coverFile ? resolveDriveFileId(coverFile) : '',
+      chapters: [
+        {
+          index: 0,
+          title: 'Chapter 1',
+          startSec: 0,
+          driveFileId: fileId,
+          driveStreamUrl,
+        },
+      ],
       bookmarks: [],
       positionSec: 0,
       progressSec: 0,
       chapterIndex: 0,
       isOffline: false,
       offline: false,
-    });
+    };
+  });
+}
+
+/**
+ * Scan a Google Drive folder (by raw ID or full Drive URL) recursively across subfolders
+ * using Drive API v3 and return deduplicated audiobook entries configured for streaming.
+ * @param {string} accessToken
+ * @param {string} [folderIdOrUrl='']
+ * @param {typeof fetch} [fetchImpl=globalThis.fetch]
+ * @param {{ maxDepth?: number }} [options={}]
+ * @returns {Promise<Array<object>>}
+ */
+export async function scanGoogleDriveFolder(
+  accessToken,
+  folderIdOrUrl = '',
+  fetchImpl = globalThis.fetch,
+  options = {},
+) {
+  if (!accessToken || typeof fetchImpl !== 'function') return [];
+
+  const rootFolderId = extractGoogleDriveFolderId(folderIdOrUrl);
+  const maxDepth = Number.isFinite(options.maxDepth) ? options.maxDepth : 5;
+
+  if (!rootFolderId) {
+    const q =
+      "trashed = false and (mimeType contains 'audio/' or name contains '.m4b' or name contains '.mp3' or name contains '.m4a' or name contains '.ogg' or name contains '.flac')";
+    const files = await listDriveQueryPages(accessToken, q, fetchImpl);
+    const audioFiles = files.filter(isDriveAudioFile);
+    return deduplicateLibraryItems(
+      buildGroupedDriveBooksFromFolder('', '', audioFiles, null, true),
+    );
   }
 
-  return deduplicateLibraryItems(items);
+  const visited = new Set([rootFolderId]);
+  const queue = [{ id: rootFolderId, name: '', parentName: '', depth: 0, isRoot: true }];
+  const collectedBooks = [];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    const safeId = current.id.replace(/'/g, "\\'");
+    const q = `'${safeId}' in parents and trashed = false`;
+    const children = await listDriveQueryPages(accessToken, q, fetchImpl);
+
+    const audioFiles = [];
+    let coverFile = null;
+
+    for (const entry of children) {
+      if (!entry || !entry.id || !entry.name) continue;
+      if (isDriveFolder(entry)) {
+        const childFolderId = resolveDriveFileId(entry);
+        if (childFolderId && !visited.has(childFolderId) && current.depth < maxDepth) {
+          visited.add(childFolderId);
+          queue.push({
+            id: childFolderId,
+            name: entry.name,
+            parentName: current.isRoot ? '' : current.name,
+            depth: current.depth + 1,
+            isRoot: false,
+          });
+        }
+        continue;
+      }
+
+      if (isDriveAudioFile(entry)) {
+        audioFiles.push(entry);
+      } else if (isDriveImageFile(entry)) {
+        if (!coverFile || /cover|folder|front|poster/i.test(entry.name)) {
+          coverFile = entry;
+        }
+      }
+    }
+
+    if (audioFiles.length > 0) {
+      collectedBooks.push(
+        ...buildGroupedDriveBooksFromFolder(
+          current.name,
+          current.parentName,
+          audioFiles,
+          coverFile,
+          current.isRoot,
+        ),
+      );
+    }
+  }
+
+  return deduplicateLibraryItems(collectedBooks);
 }

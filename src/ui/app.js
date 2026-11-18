@@ -163,7 +163,10 @@ class AudiobookApp {
       authEmail: this._loadLastEmail(),
       driveModal: {
         open: false,
-        folderId: '',
+        folderId:
+          typeof globalThis.localStorage !== 'undefined'
+            ? globalThis.localStorage.getItem('audiobook_drive_folder_v1') || ''
+            : '',
         token: '',
         loading: false,
         error: ''
@@ -940,6 +943,13 @@ class AudiobookApp {
 
     this.syncService.setGoogleAccessToken(cleanToken);
     this.audioEngine.setDriveAccessToken(cleanToken);
+    if (typeof globalThis.localStorage !== 'undefined' && cleanFolderId) {
+      try {
+        globalThis.localStorage.setItem('audiobook_drive_folder_v1', cleanFolderId);
+      } catch {
+        // ignore storage errors
+      }
+    }
     this.state.driveModal = {
       ...this.state.driveModal,
       token: cleanToken,
@@ -1449,8 +1459,8 @@ class AudiobookApp {
                 : ''
             }
             <div class="space-y-1.5">
-              <label for="driveFolderIdInput" class="block text-xs font-medium text-[var(--text-secondary)]">Drive Folder ID (optional)</label>
-              <input id="driveFolderIdInput" type="text" value="${escapeHtml(folderId)}" placeholder="Leave blank to scan all Drive audio files" class="w-full px-3.5 py-2.5 rounded-xl bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
+              <label for="driveFolderIdInput" class="block text-xs font-medium text-[var(--text-secondary)]">Google Drive Folder Link or ID</label>
+              <input id="driveFolderIdInput" type="text" value="${escapeHtml(folderId)}" placeholder="Paste Drive folder URL or ID (blank scans all Drive)" class="w-full px-3.5 py-2.5 rounded-xl bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
             </div>
 
             ${

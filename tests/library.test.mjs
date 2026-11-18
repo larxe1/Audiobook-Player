@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   normalizeBookKey,
+  extractGoogleDriveFolderId,
   deduplicateLibraryItems,
   scanLocalFiles,
   scanGoogleDriveFolder,
@@ -413,4 +414,79 @@ test('searchCoverImages upgrades iTunes artwork to 600x600 and includes offline 
   });
   assert.ok(offlineResults.length >= 4);
   assert.ok(offlineResults.every((c) => c.source === 'curated-svg' && c.url.startsWith('data:image/svg+xml')));
+});
+
+test('extractGoogleDriveFolderId parses full Drive URLs and raw IDs', () => {
+  assert.equal(
+    extractGoogleDriveFolderId('https://drive.google.com/drive/u/0/folders/1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD'),
+    '1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD',
+  );
+  assert.equal(
+    extractGoogleDriveFolderId('https://drive.google.com/drive/folders/1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD?usp=sharing'),
+    '1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD',
+  );
+  assert.equal(
+    extractGoogleDriveFolderId('https://drive.google.com/open?id=1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD'),
+    '1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD',
+  );
+  assert.equal(
+    extractGoogleDriveFolderId('1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD'),
+    '1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD',
+  );
+});
+
+test('scanGoogleDriveFolder recursively scans subfolders and groups multi-track audiobook folders', async () => {
+  const driveTree = {
+    '1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD': [
+      { id: 'sub-phm', name: 'Andy Weir - Project Hail Mary', mimeType: 'application/vnd.google-apps.folder' },
+      { id: 'sub-red', name: 'Pierce Brown - Red Rising', mimeType: 'application/vnd.google-apps.folder' },
+      { id: 'sub-series', name: 'First Law World', mimeType: 'application/vnd.google-apps.folder' },
+    ],
+    'sub-phm': [
+      { id: 'file-phm', name: 'Project Hail Mary.m4b', mimeType: 'audio/mp4', size: '512000000' },
+      { id: 'img-phm', name: 'cover.jpg', mimeType: 'image/jpeg', thumbnailLink: 'https://lh3.googleusercontent.com/phm-thumb' },
+    ],
+    'sub-red': [
+      { id: 'rr-1', name: '01 - Part One.mp3', mimeType: 'audio/mpeg', size: '12000000' },
+      { id: 'rr-2', name: '02 - Part Two.mp3', mimeType: 'audio/mpeg', size: '14000000' },
+    ],
+    'sub-series': [
+      { id: 'fl-1', name: 'Joe Abercrombie - The Blade Itself.m4b', mimeType: 'audio/mp4', size: '400000000' },
+      { id: 'fl-2', name: 'Joe Abercrombie - Before They Are Hanged.m4b', mimeType: 'audio/mp4', size: '420000000' },
+    ],
+  };
+
+  const mockFetch = async (url) => {
+    const u = new URL(url);
+    const q = u.searchParams.get('q') || '';
+    const match = q.match(/'([^']+)'\s+in\s+parents/);
+    const parentId = match ? match[1] : '';
+    return {
+      ok: true,
+      json: async () => ({ files: driveTree[parentId] || [] }),
+    };
+  };
+
+  const books = await scanGoogleDriveFolder(
+    'test-token',
+    'https://drive.google.com/drive/u/0/folders/1WO4laKR_L_RhfK6OFypmMFV9GwxZpyuD',
+    mockFetch,
+  );
+
+  assert.equal(books.length, 4);
+
+  const phm = books.find((b) => b.bookKey === 'project-hail-mary::andy-weir');
+  assert.ok(phm);
+  assert.equal(phm.driveFileId, 'file-phm');
+  assert.equal(phm.coverUrl, 'https://lh3.googleusercontent.com/phm-thumb');
+
+  const redRising = books.find((b) => b.bookKey === 'red-rising::pierce-brown');
+  assert.ok(redRising);
+  assert.equal(redRising.chapters.length, 2);
+  assert.equal(redRising.chapters[0].driveFileId, 'rr-1');
+  assert.equal(redRising.chapters[1].driveFileId, 'rr-2');
+
+  const blade = books.find((b) => b.bookKey === 'the-blade-itself::joe-abercrombie');
+  assert.ok(blade);
+  assert.equal(blade.series, 'First Law World');
 });

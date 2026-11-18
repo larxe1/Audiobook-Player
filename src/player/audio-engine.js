@@ -176,6 +176,58 @@ export class AudioEngine {
     return Boolean(record);
   }
 
+  async _resolveChapterMediaUrl(book, chapterIndex = 0) {
+    const ch = Array.isArray(book?.chapters) ? book.chapters[chapterIndex] : null;
+    if (ch?.localFile && typeof URL !== 'undefined') {
+      const url = URL.createObjectURL(ch.localFile);
+      this.activeObjectUrl = url;
+      return url;
+    }
+    if (ch?.localUrl) {
+      return ch.localUrl;
+    }
+    if (book.localFile && typeof URL !== 'undefined') {
+      const url = URL.createObjectURL(book.localFile);
+      this.activeObjectUrl = url;
+      return url;
+    }
+    if (book.localUrl) {
+      return book.localUrl;
+    }
+
+    const cacheKey = ch?.driveFileId ? `${book.bookKey}::${ch.driveFileId}` : book.bookKey;
+    const cached = (await this._readCachedBlob(cacheKey)) || (await this._readCachedBlob(book.bookKey));
+    if (cached && cached.blob && typeof URL !== 'undefined') {
+      const url = URL.createObjectURL(cached.blob);
+      this.activeObjectUrl = url;
+      return url;
+    }
+
+    const streamUrl = ch?.driveStreamUrl || book.driveStreamUrl;
+    if (streamUrl) {
+      if (this.driveAccessToken && streamUrl.includes('googleapis.com')) {
+        try {
+          const resp = await fetch(streamUrl, {
+            headers: {
+              Authorization: `Bearer ${this.driveAccessToken}`
+            }
+          });
+          if (resp.ok) {
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            this.activeObjectUrl = url;
+            return url;
+          }
+        } catch {
+          return null;
+        }
+      } else {
+        return streamUrl;
+      }
+    }
+    return null;
+  }
+
   async loadBook(book, startPositionSec = null) {
     if (!book) return;
     this.pause();
@@ -187,44 +239,12 @@ export class AudioEngine {
       ? Number(startPositionSec)
       : Number(book.positionSec || 0);
     this.positionSec = Math.max(0, Math.min(this.durationSec, initialPos));
-    this.chapterIndex = this.computeChapterIndex(this.positionSec, book.chapters);
+    this.chapterIndex = Number.isInteger(book.chapterIndex)
+      ? Math.max(0, Math.min((book.chapters?.length || 1) - 1, book.chapterIndex))
+      : this.computeChapterIndex(this.positionSec, book.chapters);
     this.usingSynth = false;
 
-    // Priority: 1. Local File/Blob URL, 2. IndexedDB cached blob, 3. Google Drive stream, 4. Built-in Web Audio synth
-    let mediaUrl = null;
-
-    if (book.localFile && typeof URL !== 'undefined') {
-      mediaUrl = URL.createObjectURL(book.localFile);
-      this.activeObjectUrl = mediaUrl;
-    } else if (book.localUrl) {
-      mediaUrl = book.localUrl;
-    } else {
-      const cached = await this._readCachedBlob(book.bookKey);
-      if (cached && cached.blob && typeof URL !== 'undefined') {
-        mediaUrl = URL.createObjectURL(cached.blob);
-        this.activeObjectUrl = mediaUrl;
-      } else if (book.driveStreamUrl) {
-        if (this.driveAccessToken && book.driveStreamUrl.includes('googleapis.com')) {
-          try {
-            const resp = await fetch(book.driveStreamUrl, {
-              headers: {
-                Authorization: `Bearer ${this.driveAccessToken}`,
-                Range: 'bytes=0-10485759'
-              }
-            });
-            if (resp.ok) {
-              const blob = await resp.blob();
-              mediaUrl = URL.createObjectURL(blob);
-              this.activeObjectUrl = mediaUrl;
-            }
-          } catch {
-            mediaUrl = null;
-          }
-        } else {
-          mediaUrl = book.driveStreamUrl;
-        }
-      }
-    }
+    const mediaUrl = await this._resolveChapterMediaUrl(book, this.chapterIndex);
 
     if (mediaUrl && this.audio) {
       this.usingSynth = false;
@@ -452,14 +472,45 @@ export class AudioEngine {
     this.seekToSeconds(next);
   }
 
-  jumpToChapter(index) {
+  async jumpToChapter(index) {
     const chapters = this.currentBook?.chapters || [];
     if (!chapters.length) return;
     const clampedIdx = Math.max(0, Math.min(chapters.length - 1, index));
-    const targetSec = Number(chapters[clampedIdx].startSec || 0);
+    const targetChapter = chapters[clampedIdx];
+    const hasOwnTrack = Boolean(
+      targetChapter?.driveStreamUrl || targetChapter?.localUrl || targetChapter?.localFile
+    );
+
+    if (hasOwnTrack && clampedIdx !== this.chapterIndex) {
+      const wasPlaying = this.playing;
+      this.pause();
+      this._revokeObjectUrl();
+      this.chapterIndex = clampedIdx;
+      this.positionSec = 0;
+      const mediaUrl = await this._resolveChapterMediaUrl(this.currentBook, clampedIdx);
+      if (mediaUrl && this.audio) {
+        this.usingSynth = false;
+        this.audio.src = mediaUrl;
+        this.audio.playbackRate = this.playbackRate;
+        try {
+          this.audio.currentTime = 0;
+        } catch {
+          // ignore
+        }
+        if (wasPlaying) {
+          await this.play();
+        }
+      }
+      this.onChapterChange(clampedIdx, targetChapter);
+      this.onTimeUpdate(this.getSnapshot());
+      this.onStateChange(this.getSnapshot());
+      return;
+    }
+
+    const targetSec = Number(targetChapter.startSec || 0);
     this.chapterIndex = clampedIdx;
     this.seekToSeconds(targetSec);
-    this.onChapterChange(clampedIdx, chapters[clampedIdx]);
+    this.onChapterChange(clampedIdx, targetChapter);
   }
 
   setPlaybackRate(rate) {
