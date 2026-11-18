@@ -314,6 +314,72 @@ input[type="range"]::-moz-range-thumb {
   font-variant-numeric: tabular-nums;
 }
 
+/* Workspace Update & Cloud Sync Banners */
+.update-banner {
+  background: linear-gradient(90deg, rgba(30, 215, 96, 0.14) 0%, rgba(13, 19, 34, 0.92) 70%);
+  border-bottom: 1px solid rgba(30, 215, 96, 0.28);
+}
+
+.theme-pitch .update-banner {
+  background: linear-gradient(90deg, rgba(30, 215, 96, 0.12) 0%, rgba(16, 16, 18, 0.95) 70%);
+}
+
+.sync-reauth-banner {
+  background: linear-gradient(90deg, rgba(96, 165, 250, 0.14) 0%, rgba(13, 19, 34, 0.92) 70%);
+  border-bottom: 1px solid rgba(96, 165, 250, 0.28);
+}
+
+.theme-pitch .sync-reauth-banner {
+  background: linear-gradient(90deg, rgba(96, 165, 250, 0.12) 0%, rgba(16, 16, 18, 0.95) 70%);
+}
+
+/* Continue Playing on Another Device Card */
+.continue-device-card {
+  background:
+    radial-gradient(110% 100% at 0% 0%, rgba(30, 215, 96, 0.16) 0%, transparent 65%),
+    var(--bg-card);
+  border: 1px solid rgba(30, 215, 96, 0.32);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.32);
+  transition:
+    border-color 220ms var(--ease-spring),
+    transform 220ms var(--ease-spring),
+    background-color 220ms var(--ease-spring);
+}
+
+.continue-device-card:hover {
+  border-color: rgba(30, 215, 96, 0.5);
+}
+
+.device-origin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.3;
+  background-color: rgba(148, 163, 184, 0.14);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  max-width: 100%;
+}
+
+@keyframes livePulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.5;
+    transform: scale(0.82);
+  }
+}
+
+.live-dot-pulse {
+  animation: livePulse 1.8s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

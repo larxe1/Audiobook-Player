@@ -7,6 +7,7 @@ import {
 } from '../src/services/offline-queue.js';
 import {
   DEFAULT_GOOGLE_CLIENT_ID,
+  DEFAULT_GOOGLE_SCOPES,
   SUPABASE_CONFIG,
   SupabaseSyncService,
   handleRemoteEvent
@@ -1024,5 +1025,383 @@ test('SupabaseSyncService openBrowserOAuthPopup completes OAuth via postMessage 
   assert.equal(popupClosed, true);
   assert.equal(sync.getGoogleAccessToken(), 'ya29.postmessage_token');
   assert.equal(sync.getUserProfile().email, 'pwa@gmail.com');
+  sync.destroy();
+});
+
+
+test('DEFAULT_GOOGLE_SCOPES includes drive.appdata and signInWithGoogle/Popup pass forceConsent and forceRefresh', async () => {
+  assert.match(DEFAULT_GOOGLE_SCOPES, /drive\.appdata/);
+  assert.match(DEFAULT_GOOGLE_SCOPES, /drive\.readonly/);
+
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://tauri.localhost';
+  const invokeCalls = [];
+  fakeWindow.__TAURI_INTERNALS__ = {
+    invoke: async (cmd, args) => {
+      invokeCalls.push({ cmd, args });
+      if (cmd === 'desktop_start_google_oauth') {
+        return { status: 'success', accessToken: 'ya29.tauri_reauth_token' };
+      }
+      return null;
+    }
+  };
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true, userAgent: 'Windows NT 10.0' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        return { ok: true, status: 200, async json() { return { sub: '1', email: 'u@gmail.com' }; } };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const { url } = await sync.signInWithGoogle({ autoRedirect: false, forceConsent: true });
+  assert.match(url, /drive\.appdata/);
+  assert.match(url, /prompt=select_account\+consent|prompt=select_account%20consent/);
+
+  const res = await sync.signInWithGooglePopup({ forceConsent: true, forceRefresh: true });
+  assert.equal(res.ok, true);
+  assert.equal(invokeCalls[0].cmd, 'desktop_start_google_oauth');
+  assert.equal(invokeCalls[0].args.forceConsent, true);
+  assert.equal(invokeCalls[0].args.forceRefresh, true);
+  sync.destroy();
+});
+
+test('SupabaseSyncService Google appDataFolder sync shares library, tracks, driveFolder, progress, and active device across PC and Android even when access_token is null', async () => {
+  // Simulated shared Google Drive appDataFolder backend
+  const driveCloud = {
+    fileId: 'app-sync-file-1',
+    exists: false,
+    modifiedTime: '2026-11-18T12:00:00.000Z',
+    content: null,
+    mediaFetches: 0
+  };
+
+  const createDriveMockFetch = () => async (url, init = {}) => {
+    // Metadata by ID
+    if (url.startsWith(`https://www.googleapis.com/drive/v3/files/${driveCloud.fileId}?fields=`)) {
+      if (!driveCloud.exists) return { ok: false, status: 404, async text() { return 'Not Found'; } };
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { id: driveCloud.fileId, name: 'audiobook-player-sync-v1.json', modifiedTime: driveCloud.modifiedTime };
+        }
+      };
+    }
+
+    // List spaces=appDataFolder
+    if (url.startsWith('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            files: driveCloud.exists
+              ? [{ id: driveCloud.fileId, name: 'audiobook-player-sync-v1.json', modifiedTime: driveCloud.modifiedTime }]
+              : []
+          };
+        }
+      };
+    }
+
+    // Download alt=media
+    if (url.startsWith(`https://www.googleapis.com/drive/v3/files/${driveCloud.fileId}?alt=media`)) {
+      driveCloud.mediaFetches += 1;
+      const bodyStr = JSON.stringify(driveCloud.content);
+      return {
+        ok: true,
+        status: 200,
+        async text() { return bodyStr; },
+        async json() { return driveCloud.content; }
+      };
+    }
+
+    // Multipart upload (POST create or PATCH update)
+    if (url.startsWith('https://www.googleapis.com/upload/drive/v3/files')) {
+      const rawBody = String(init.body || '');
+      const parts = rawBody.split(/\r?\n\r?\n/);
+      // Last JSON part before closing boundary
+      const payloadPart = parts[parts.length - 1].split(/\r?\n--/)[0];
+      driveCloud.content = JSON.parse(payloadPart);
+      driveCloud.exists = true;
+      driveCloud.modifiedTime = new Date(Date.parse(driveCloud.modifiedTime) + 1000).toISOString();
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { id: driveCloud.fileId, modifiedTime: driveCloud.modifiedTime };
+        }
+      };
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  // Device 1: Windows PC signed in with Google OAuth only (access_token: null)
+  const pcSync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: null,
+    navigatorObj: { onLine: true, userAgent: 'Windows NT 10.0' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: createDriveMockFetch(),
+    deviceId: 'win-pc-sync',
+    deviceName: 'Windows PC'
+  });
+  pcSync.setSession({
+    access_token: null,
+    auth_mode: 'google_oauth',
+    provider_token: 'ya29.pc_google_token',
+    user: { id: 'google_42', email: 'listener@gmail.com' }
+  });
+
+  assert.equal(pcSync.isAuthenticated(), false);
+  assert.equal(pcSync.hasCloudSyncAuth(), true);
+
+  await pcSync.syncDriveFolderConfig({ folderId: 'folder-abc', folderName: 'Audiobooks' });
+  await pcSync.syncLibraryItems([
+    {
+      bookKey: 'first-law::joe-abercrombie',
+      title: 'The Blade Itself',
+      author: 'Joe Abercrombie',
+      series: 'The First Law',
+      seriesOrder: 1,
+      sources: ['drive', 'local'],
+      driveFileId: 'drive-file-1',
+      coverDriveFileId: 'cover-file-1',
+      driveFolderId: 'folder-abc',
+      totalDurationSec: 7200,
+      tracks: [
+        { index: 0, title: 'Part 1', driveFileId: 'drive-file-1', localUrl: 'blob:http://tauri.localhost/123', localFile: { name: 'p1.mp3' } },
+        { index: 1, title: 'Part 2', driveFileId: 'drive-file-2' }
+      ],
+      chapters: [
+        { index: 0, title: 'Chapter 1', startSec: 0, driveFileId: 'drive-file-1' }
+      ]
+    }
+  ]);
+  await pcSync.pushProgress({
+    bookKey: 'first-law::joe-abercrombie',
+    chapterIndex: 1,
+    positionSec: 456,
+    playbackRate: 1.25,
+    completed: false,
+    clientUpdatedAt: '2026-11-18T12:05:00.000Z'
+  });
+  await pcSync.registerDevice({
+    activeBookKey: 'first-law::joe-abercrombie',
+    activeBookTitle: 'The Blade Itself',
+    chapterIndex: 1,
+    positionSec: 456,
+    durationSec: 7200,
+    isPlaying: true,
+    isActivePlayer: true
+  });
+
+  // Device 2: Android APK signed in with Google OAuth only (access_token: null)
+  const androidSync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: null,
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: createDriveMockFetch(),
+    deviceId: 'android-pixel-9',
+    deviceName: 'Android Device'
+  });
+  androidSync.setSession({
+    access_token: null,
+    auth_mode: 'google_oauth',
+    provider_token: 'ya29.android_google_token',
+    user: { id: 'google_42', email: 'listener@gmail.com' }
+  });
+
+  const snap1 = await androidSync.pullCloudSnapshot();
+  assert.equal(snap1.changed, true);
+  assert.equal(snap1.driveFolder.folderId, 'folder-abc');
+  assert.equal(snap1.driveFolder.folderName, 'Audiobooks');
+  assert.equal(snap1.library.length, 1);
+  assert.equal(snap1.library[0].bookKey, 'first-law::joe-abercrombie');
+  assert.equal(snap1.library[0].tracks.length, 2);
+  assert.equal(snap1.library[0].tracks[0].driveFileId, 'drive-file-1');
+  assert.equal(snap1.library[0].tracks[0].localFile, undefined);
+  assert.equal(snap1.library[0].coverDriveFileId, 'cover-file-1');
+  assert.equal(snap1.library[0].originDeviceId, 'win-pc-sync');
+  assert.equal(snap1.progress['first-law::joe-abercrombie'].positionSec, 456);
+  assert.equal(snap1.devices.length, 1);
+  assert.equal(snap1.devices[0].deviceId, 'win-pc-sync');
+  assert.equal(snap1.devices[0].currentBookKey, 'first-law::joe-abercrombie');
+  assert.equal(snap1.devices[0].isPlaying, true);
+
+  // Second lightweight poll with unchanged modifiedTime must skip alt=media download
+  const fetchesBefore = driveCloud.mediaFetches;
+  const snap2 = await androidSync.pullCloudSnapshot();
+  assert.equal(snap2.changed, false);
+  assert.equal(driveCloud.mediaFetches, fetchesBefore);
+
+  // Android registers itself and must NOT clobber PC device or PC library
+  await androidSync.registerDevice({
+    activeBookKey: 'first-law::joe-abercrombie',
+    activeBookTitle: 'The Blade Itself',
+    chapterIndex: 1,
+    positionSec: 500,
+    isPlaying: false,
+    isActivePlayer: true
+  });
+  const devicesOnPc = await pcSync.fetchDevices();
+  assert.equal(devicesOnPc.length, 2);
+  const libOnPc = await pcSync.fetchLibraryItems();
+  assert.equal(libOnPc.length, 1);
+
+  pcSync.destroy();
+  androidSync.destroy();
+});
+
+test('SupabaseSyncService sets needsDriveSyncReauth = true without throwing when appDataFolder returns 403 insufficientPermissions', async () => {
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: null,
+    navigatorObj: { onLine: true },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.includes('spaces=appDataFolder')) {
+        return {
+          ok: false,
+          status: 403,
+          async text() {
+            return JSON.stringify({
+              error: {
+                code: 403,
+                errors: [{ reason: 'insufficientPermissions' }],
+                message: 'Insufficient Permission'
+              }
+            });
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+  sync.setSession({
+    access_token: null,
+    auth_mode: 'google_oauth',
+    provider_token: 'ya29.old_scope_token',
+    user: { id: 'google_1', email: 'old@gmail.com' }
+  });
+
+  const snap = await sync.pullCloudSnapshot();
+  assert.equal(sync.needsDriveSyncReauth, true);
+  assert.deepEqual(snap.library, []);
+
+  // Writing also returns cleanly without throwing
+  const writeRes = await sync.syncDriveFolderConfig({ folderId: 'f1', folderName: 'Books' });
+  assert.equal(writeRes, null);
+  assert.equal(sync.needsDriveSyncReauth, true);
+
+  sync.destroy();
+});
+
+test('SupabaseSyncService sends live Postgres schema columns and refreshes expired Supabase session', async () => {
+  const calls = [];
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: null,
+    navigatorObj: { onLine: true },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url, init = {}) => {
+      const body = init.body ? JSON.parse(init.body) : null;
+      calls.push({ url, method: init.method || 'GET', body });
+      if (url.includes('/auth/v1/token?grant_type=refresh_token')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              access_token: 'jwt-refreshed-2',
+              refresh_token: 'refresh-2',
+              expires_in: 3600
+            };
+          }
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        async text() { return JSON.stringify([]); }
+      };
+    }
+  });
+
+  sync.setSession({
+    access_token: 'jwt-old-1',
+    refresh_token: 'refresh-1',
+    expires_at: Math.floor(Date.now() / 1000) - 10,
+    user: { id: 'uuid-user-1', email: 'supa@gmail.com' }
+  });
+
+  const refreshed = await sync.refreshSupabaseSessionIfNeeded();
+  assert.equal(refreshed.refreshed, true);
+  assert.equal(sync.session.access_token, 'jwt-refreshed-2');
+
+  await sync.syncLibraryItems([
+    {
+      bookKey: 'dune::herbert',
+      title: 'Dune',
+      author: 'Frank Herbert',
+      description: 'Arrakis',
+      driveFileId: 'df-1',
+      driveFolderId: 'fld-1',
+      coverDriveFileId: 'cov-1',
+      tracks: [{ index: 0, title: 'Ch 1', driveFileId: 'df-1' }],
+      chapters: [{ index: 0, title: 'Ch 1', startSec: 0, driveFileId: 'df-1' }]
+    }
+  ]);
+  await sync.pushProgress({
+    bookKey: 'dune::herbert',
+    chapterIndex: 2,
+    positionSec: 321,
+    playbackRate: 1.5,
+    completed: true
+  });
+  await sync.registerDevice({
+    activeBookKey: 'dune::herbert',
+    chapterIndex: 2,
+    positionSec: 321,
+    isPlaying: true,
+    isActivePlayer: true
+  });
+  await sync.syncDriveFolderConfig({ folderId: 'fld-1', folderName: 'Books', lastActiveBookKey: 'dune::herbert' });
+
+  const libCall = calls.find((c) => c.url.includes('/rest/v1/audiobook_library_items'));
+  assert.equal(libCall.body[0].description, 'Arrakis');
+  assert.equal(libCall.body[0].drive_folder_id, 'fld-1');
+  assert.equal(libCall.body[0].chapters_json.length, 1);
+  assert.equal(libCall.body[0].metadata_json.tracks.length, 1);
+  assert.equal(libCall.body[0].metadata_json.coverDriveFileId, 'cov-1');
+
+  const progCall = calls.find((c) => c.url.includes('/rest/v1/audiobook_progress'));
+  assert.equal(progCall.body.is_finished, true);
+  assert.equal(progCall.body.playback_rate, 1.5);
+  assert.equal(progCall.body.completed, undefined);
+
+  const devCall = calls.find((c) => c.url.includes('/rest/v1/audiobook_devices'));
+  assert.equal(devCall.body.current_book_key, 'dune::herbert');
+  assert.equal(devCall.body.current_chapter_index, 2);
+  assert.equal(devCall.body.current_position_sec, 321);
+  assert.equal(devCall.body.is_active_player, true);
+
+  const settingsCall = calls.find((c) => c.url.includes('/rest/v1/audiobook_user_settings'));
+  assert.equal(settingsCall.body.drive_folder_id, 'fld-1');
+  assert.equal(settingsCall.body.drive_folder_name, 'Books');
+  assert.equal(settingsCall.body.last_active_book_key, 'dune::herbert');
+
   sync.destroy();
 });

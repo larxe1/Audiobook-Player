@@ -15,7 +15,7 @@ const GOOGLE_CLIENT_ID: &str =
 const GOOGLE_OAUTH_REDIRECT_URI: &str =
     "https%3A%2F%2Flarxe1.github.io%2FAudiobook-Player%2Foauth-callback.html";
 const GOOGLE_OAUTH_SCOPE: &str =
-    "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly%20email%20profile";
+    "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.appdata%20email%20profile";
 
 struct AppState {
     oauth_path: PathBuf,
@@ -114,6 +114,13 @@ fn url_encode_param(s: &str) -> String {
 fn load_saved_oauth_token(oauth_path: &Path) -> Option<String> {
     let raw = fs::read_to_string(oauth_path).ok()?;
     let json = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let has_appdata = json
+        .get("has_appdata_scope")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !has_appdata {
+        return None;
+    }
     let token = json.get("access_token")?.as_str()?.to_string();
     let saved_at = json.get("saved_at_ms")?.as_u64()?;
     if now_ms().saturating_sub(saved_at) < 52 * 60 * 1000 && token.starts_with("ya29.") {
@@ -127,6 +134,7 @@ fn save_oauth_token(oauth_path: &Path, token: &str) {
     let payload = serde_json::json!({
         "access_token": token,
         "saved_at_ms": now_ms(),
+        "has_appdata_scope": true,
     });
     if let Ok(s) = serde_json::to_string_pretty(&payload) {
         let _ = fs::write(oauth_path, s);
@@ -228,8 +236,10 @@ async fn desktop_start_google_oauth(
     silent: Option<bool>,
     login_hint: Option<String>,
     force_refresh: Option<bool>,
+    force_consent: Option<bool>,
 ) -> Result<OAuthPollResponse, String> {
-    let is_silent = silent.unwrap_or(false);
+    let is_consent = force_consent.unwrap_or(false);
+    let is_silent = silent.unwrap_or(false) && !is_consent;
     let is_force = force_refresh.unwrap_or(false);
 
     if is_silent && !is_force {
@@ -265,7 +275,13 @@ async fn desktop_start_google_oauth(
         .filter(|s| !s.is_empty() && s.contains('@'))
         .unwrap_or_default();
 
-    let prompt_param = if is_silent { "none" } else { "select_account" };
+    let prompt_param = if is_silent {
+        "none"
+    } else if is_consent {
+        "select_account%20consent"
+    } else {
+        "select_account"
+    };
     let hint_clause = if hint_email.is_empty() {
         String::new()
     } else {
@@ -397,6 +413,173 @@ async fn desktop_clear_google_oauth(state: tauri::State<'_, AppState>) -> Result
     Ok(true)
 }
 
+fn is_allowed_update_url(url: &str) -> bool {
+    let allowed_prefixes = [
+        "https://github.com/larxe1/Audiobook-Player/",
+        "https://objects.githubusercontent.com/",
+    ];
+    if !allowed_prefixes.iter().any(|p| url.starts_with(p)) {
+        return false;
+    }
+    !url.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+#[tauri::command]
+async fn desktop_install_update(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<serde_json::Value, String> {
+    let trimmed_url = url.trim().to_string();
+    if !is_allowed_update_url(&trimmed_url) {
+        return Err("Update URL is not from an allowed GitHub release origin.".into());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        use std::io::Read;
+
+        let temp_dir = std::env::temp_dir();
+        let temp_exe = temp_dir.join("Audiobook-Player-update.exe");
+        let _ = fs::remove_file(&temp_exe);
+
+        let mut curl_cmd = std::process::Command::new("curl.exe");
+        curl_cmd
+            .arg("-fSL")
+            .arg("--retry")
+            .arg("2")
+            .arg("--connect-timeout")
+            .arg("15")
+            .arg("-o")
+            .arg(&temp_exe)
+            .arg(&trimmed_url);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            curl_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = curl_cmd
+            .output()
+            .map_err(|e| format!("Failed to invoke curl.exe: {e}"))?;
+        if !output.status.success() {
+            let _ = fs::remove_file(&temp_exe);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Update download failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            ));
+        }
+
+        let meta = fs::metadata(&temp_exe)
+            .map_err(|e| format!("Downloaded update binary missing: {e}"))?;
+        if meta.len() <= 1_000_000 {
+            let _ = fs::remove_file(&temp_exe);
+            return Err(format!(
+                "Downloaded update binary is unexpectedly small ({} bytes).",
+                meta.len()
+            ));
+        }
+
+        let mut header = [0u8; 2];
+        {
+            let mut file = fs::File::open(&temp_exe)
+                .map_err(|e| format!("Failed to inspect downloaded update: {e}"))?;
+            file.read_exact(&mut header)
+                .map_err(|e| format!("Failed to read update header: {e}"))?;
+        }
+        if &header != b"MZ" {
+            let _ = fs::remove_file(&temp_exe);
+            return Err("Downloaded file is not a valid Windows executable (missing MZ header).".into());
+        }
+
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("Failed to resolve current executable path: {e}"))?;
+        let current_exe_raw = current_exe.to_string_lossy();
+        let current_exe_str = current_exe_raw
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&current_exe_raw);
+        let temp_exe_raw = temp_exe.to_string_lossy();
+        let temp_exe_str = temp_exe_raw
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&temp_exe_raw);
+
+        for p in [current_exe_str, temp_exe_str] {
+            if p.contains('"') || p.contains('\r') || p.contains('\n') {
+                return Err("Executable path contains unsupported characters.".into());
+            }
+        }
+
+        let pid = std::process::id();
+        let cmd_path = temp_dir.join("audiobook-self-update.cmd");
+        let script = format!(
+            "@echo off\r\n\
+            setlocal\r\n\
+            set \"PID={pid}\"\r\n\
+            set \"SRC={temp_exe_str}\"\r\n\
+            set \"DST={current_exe_str}\"\r\n\
+            set /a TRIES=0\r\n\
+            :wait_loop\r\n\
+            tasklist /NH /FI \"PID eq %PID%\" 2>NUL | find \"%PID%\" >NUL\r\n\
+            if errorlevel 1 goto replace_loop\r\n\
+            set /a TRIES+=1\r\n\
+            if %TRIES% GEQ 20 goto replace_loop\r\n\
+            ping -n 2 127.0.0.1 >NUL\r\n\
+            goto wait_loop\r\n\
+            :replace_loop\r\n\
+            set /a MOVETRIES=0\r\n\
+            :try_move\r\n\
+            move /Y \"%SRC%\" \"%DST%\" >NUL 2>&1\r\n\
+            if not errorlevel 1 goto launch\r\n\
+            copy /Y \"%SRC%\" \"%DST%\" >NUL 2>&1\r\n\
+            if not errorlevel 1 (\r\n\
+              del /F /Q \"%SRC%\" >NUL 2>&1\r\n\
+              goto launch\r\n\
+            )\r\n\
+            set /a MOVETRIES+=1\r\n\
+            if %MOVETRIES% GEQ 15 goto launch\r\n\
+            ping -n 2 127.0.0.1 >NUL\r\n\
+            goto try_move\r\n\
+            :launch\r\n\
+            start \"\" \"%DST%\"\r\n\
+            (goto) 2>nul & del \"%~f0\"\r\n"
+        );
+        fs::write(&cmd_path, script.as_bytes())
+            .map_err(|e| format!("Failed to write self-update script: {e}"))?;
+
+        let mut updater_cmd = std::process::Command::new("cmd.exe");
+        updater_cmd.arg("/C").arg(&cmd_path);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            updater_cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        }
+        updater_cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to start updater script: {e}"))?;
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Update worker panicked: {e}"))??;
+
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        app_handle.exit(0);
+    });
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "restarting": true
+    }))
+}
+
 fn build_main_window(
     app: &App,
     label: &str,
@@ -463,7 +646,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             desktop_start_google_oauth,
             desktop_poll_google_oauth,
-            desktop_clear_google_oauth
+            desktop_clear_google_oauth,
+            desktop_install_update
         ])
         .setup(|app| {
             let win = create_main_window_with_fallback(app)?;

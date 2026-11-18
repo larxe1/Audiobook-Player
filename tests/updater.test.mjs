@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { LOCAL_VERSION, SelfUpdaterService, compareSemver } from '../src/services/self-updater.js';
+import { LOCAL_VERSION, SelfUpdaterService, compareSemver, detectPlatform } from '../src/services/self-updater.js';
 
 test('version.json matches LOCAL_VERSION and valid schema', async () => {
   const raw = await readFile(new URL('../version.json', import.meta.url), 'utf8');
@@ -154,5 +154,107 @@ test('applyOtaUpdate posts SKIP_WAITING to service worker and reloads', async ()
   assert.equal(res.applied, true);
   assert.equal(updated, true);
   assert.equal(reloaded, true);
+  assert.deepEqual(posted, [{ type: 'SKIP_WAITING' }]);
+});
+
+
+test('LOCAL_VERSION is 1.0.11 and detectPlatform distinguishes windows-tauri, android-apk, and web/PWA', () => {
+  assert.equal(LOCAL_VERSION, '1.0.11');
+  const service = new SelfUpdaterService({ storage: null });
+
+  assert.equal(
+    detectPlatform({ location: { origin: 'https://tauri.localhost' }, __TAURI_INTERNALS__: {} }, { userAgent: 'Windows NT 10.0' }),
+    'windows-tauri'
+  );
+  assert.equal(
+    service.detectPlatform(
+      { location: { origin: 'https://localhost', protocol: 'https:' }, Capacitor: { isNativePlatform: () => true }, AudiobookUpdaterNative: {} },
+      { userAgent: 'Mozilla/5.0 (Linux; Android 14)' }
+    ),
+    'android-apk'
+  );
+  assert.equal(
+    detectPlatform(
+      { location: { origin: 'capacitor://localhost', protocol: 'capacitor:' } },
+      { userAgent: 'Mozilla/5.0 (Linux; Android 14)' }
+    ),
+    'android-apk'
+  );
+  assert.equal(
+    detectPlatform(
+      { location: { origin: 'https://larxe1.github.io', protocol: 'https:' } },
+      { userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 9) Chrome/130.0.0.0 Mobile Safari/537.36' }
+    ),
+    'web'
+  );
+});
+
+test('installNativeUpdate invokes Tauri desktop_install_update, Android AudiobookUpdaterNative, and web OTA', async () => {
+  const service = new SelfUpdaterService({ storage: null });
+  const manifest = {
+    version: '1.0.12',
+    exeDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe',
+    apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk'
+  };
+
+  // 1. Windows Tauri
+  const tauriCalls = [];
+  const winProgress = [];
+  const tauriWin = {
+    __TAURI_INTERNALS__: {
+      invoke: async (cmd, args) => {
+        tauriCalls.push({ cmd, args });
+        return { ok: true, restarting: true };
+      }
+    }
+  };
+  const winRes = await service.installNativeUpdate('windows-tauri', manifest, {
+    windowObj: tauriWin,
+    onProgress: (p) => winProgress.push(p)
+  });
+  assert.equal(winRes.ok, true);
+  assert.equal(winRes.platform, 'windows-tauri');
+  assert.deepEqual(tauriCalls, [{ cmd: 'desktop_install_update', args: { url: manifest.exeDownloadUrl } }]);
+  assert.equal(winProgress.at(-1).status, 'restarting');
+
+  // 2. Android APK
+  const apkCalls = [];
+  const apkProgress = [];
+  const androidWin = {
+    AudiobookUpdaterNative: {
+      startApkUpdate(url) {
+        apkCalls.push(url);
+      }
+    }
+  };
+  const apkRes = await service.installNativeUpdate('android-apk', manifest, {
+    windowObj: androidWin,
+    onProgress: (p) => apkProgress.push(p)
+  });
+  assert.equal(apkRes.ok, true);
+  assert.equal(apkRes.platform, 'android-apk');
+  assert.deepEqual(apkCalls, [manifest.apkDownloadUrl]);
+  assert.equal(typeof androidWin.__onAndroidUpdateProgress, 'function');
+  androidWin.__onAndroidUpdateProgress(JSON.stringify({ status: 'downloading', progress: 55 }));
+  assert.deepEqual(apkProgress, [{ status: 'downloading', progress: 55 }]);
+
+  // 3. Web / Android Chrome PWA
+  const posted = [];
+  const webRes = await service.installNativeUpdate('web', manifest, {
+    env: {
+      serviceWorker: {
+        async getRegistration() {
+          return {
+            async update() {},
+            waiting: { postMessage: (m) => posted.push(m) }
+          };
+        }
+      },
+      reload() {}
+    }
+  });
+  assert.equal(webRes.ok, true);
+  assert.equal(webRes.applied, true);
+  assert.equal(webRes.platform, 'web');
   assert.deepEqual(posted, [{ type: 'SKIP_WAITING' }]);
 });

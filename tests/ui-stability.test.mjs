@@ -694,3 +694,219 @@ test('loading cached split Expanse books normalizes keys/series, deduplicates co
     env.restore();
   }
 });
+
+test('auto-updater banner, dismiss, profile action, and installNativeUpdate progress/permission UX', async () => {
+  const env = createDomEnv({ innerWidth: 1280 });
+  let app = null;
+  try {
+    app = new AudiobookApp(env.rootEl);
+    app._enrichSingleBookInBackground = async () => {};
+    app._runBackgroundMetadataEnrichment = async () => {};
+    app.guestLocalMode = true;
+    app.books = [makeBook(1)];
+    app.state.activeBookKey = app.books[0].bookKey;
+
+    app.updaterService.checkForUpdate = async () => ({
+      updateAvailable: true,
+      currentVersion: '1.0.11',
+      latestVersion: '1.2.0',
+      releaseNotes: 'Adds faster sync and seamless handoff.',
+      exeDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe',
+      apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk'
+    });
+    app.updaterService.lastManifest = {
+      version: '1.2.0',
+      exeDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe'
+    };
+
+    await app.handleCheckForUpdate({ silent: true });
+    assert.equal(app.state.updateState.updateAvailable, true);
+    assert.equal(app.state.updateState.latestVersion, '1.2.0');
+    assert.equal(app.state.updateState.dismissed, false);
+
+    const banner = env.rootEl.querySelector('.update-banner');
+    assert.ok(banner, 'Update Available banner should render on Desktop');
+    assert.match(banner.textContent, /v1\.2\.0 available/);
+    assert.match(banner.textContent, /Adds faster sync/);
+
+    let calledInstall = null;
+    app.updaterService.detectPlatform = () => 'android-apk';
+    app.updaterService.installNativeUpdate = async (platform, manifest, { onProgress }) => {
+      calledInstall = { platform, manifest };
+      onProgress({ status: 'downloading', progress: 45 });
+      assert.match(env.rootEl.querySelector('.update-banner')?.textContent || '', /45%/);
+      onProgress({
+        status: 'permission_required',
+        message: 'Allow Install unknown apps for Audiobook Player, then tap Update Now again.'
+      });
+      return { ok: false, reason: 'permission_required' };
+    };
+
+    const installBtn = env.rootEl.querySelector('[data-action="install-update"]');
+    assert.ok(installBtn);
+    installBtn.click();
+    await new Promise((r) => setTimeout(r, 10));
+
+    assert.equal(calledInstall?.platform, 'android-apk');
+    assert.equal(app.state.updateState.installing, false);
+    assert.match(app.state.updateState.statusText, /Allow Install unknown apps/);
+
+    // Profile menu also exposes Update to v1.2.0
+    app.state.profileOpen = true;
+    app.render();
+    const profileInstallBtn = env.rootEl
+      .querySelector('#appOverlayProfile')
+      ?.querySelector('[data-action="install-update"]');
+    assert.ok(profileInstallBtn);
+    assert.match(profileInstallBtn.textContent, /Update to v1\.2\.0/);
+
+    // Dismissing hides banner
+    const dismissBtn = env.rootEl.querySelector('[data-action="dismiss-update"]');
+    dismissBtn.click();
+    assert.equal(app.state.updateState.dismissed, true);
+    assert.equal(env.rootEl.querySelector('.update-banner'), null);
+  } finally {
+    app?.destroy?.();
+    env.restore();
+  }
+});
+
+test('cross-device library merge, Drive folder auto-link, remote-local badge/notice, reauth banner, and Continue Here handoff', async () => {
+  const env = createDomEnv({ innerWidth: 390 });
+  let app = null;
+  try {
+    app = new AudiobookApp(env.rootEl);
+    app._enrichSingleBookInBackground = async () => {};
+    app._runBackgroundMetadataEnrichment = async () => {};
+    app.audioEngine.loadBook = async () => {};
+    let playedCalls = 0;
+    app.audioEngine.play = async () => {
+      playedCalls += 1;
+      app.audioEngine.playing = true;
+      app.state.snapshot = { ...app.state.snapshot, playing: true };
+    };
+    let seekedTo = null;
+    app.audioEngine.seekToSeconds = (sec) => {
+      seekedTo = sec;
+      app.audioEngine.positionSec = sec;
+      app.state.snapshot = { ...app.state.snapshot, positionSec: sec };
+    };
+
+    app.user = { id: 'google_123', email: 'reader@gmail.com', name: 'Reader' };
+    app.syncService.deviceId = 'dev_android';
+    app.syncService.deviceName = 'Android Device';
+    app.syncService.hasCloudSyncAuth = () => true;
+    app.syncService.needsDriveSyncReauth = true;
+    app.syncService.fetchDriveFolderConfig = async () => ({
+      folderId: 'drive-folder-from-pc',
+      folderName: 'Audiobooks'
+    });
+    app.syncService.fetchLibraryItems = async () => [
+      {
+        bookKey: 'project-hail-mary::andy-weir',
+        title: 'Project Hail Mary',
+        author: 'Andy Weir',
+        sources: ['drive'],
+        driveFileId: 'drv-phm-1',
+        driveStreamUrl: 'https://www.googleapis.com/drive/v3/files/drv-phm-1?alt=media',
+        tracks: [{ name: 'phm.m4b', driveFileId: 'drv-phm-1', driveStreamUrl: 'https://www.googleapis.com/drive/v3/files/drv-phm-1?alt=media' }],
+        chapters: [{ index: 0, title: 'Chapter 1', startSec: 0 }, { index: 1, title: 'Chapter 2', startSec: 300 }],
+        totalDurationSec: 3600
+      },
+      {
+        bookKey: 'pc-local-book::some-author',
+        title: 'PC Local Only Book',
+        author: 'Some Author',
+        sources: ['local'],
+        originDeviceId: 'dev_pc',
+        originDeviceName: 'Windows PC',
+        totalDurationSec: 1800,
+        chapters: [{ index: 0, title: 'Chapter 1', startSec: 0 }]
+      }
+    ];
+    app.syncService.fetchAllProgress = async () => ({
+      'project-hail-mary::andy-weir': {
+        bookKey: 'project-hail-mary::andy-weir',
+        chapterIndex: 1,
+        positionSec: 420,
+        clientUpdatedAt: '2026-11-18T14:50:00.000Z'
+      }
+    });
+    app.syncService.fetchBookmarks = async () => [];
+    app.syncService.fetchDevices = async () => [
+      {
+        deviceId: 'dev_pc',
+        deviceName: 'Windows PC',
+        platform: 'windows',
+        currentBookKey: 'project-hail-mary::andy-weir',
+        currentBookTitle: 'Project Hail Mary',
+        chapterIndex: 1,
+        positionSec: 420,
+        isPlaying: true,
+        isActivePlayer: true,
+        lastSeenAt: '2026-11-18T14:55:00.000Z'
+      }
+    ];
+    const registeredCalls = [];
+    app.syncService.registerDevice = async (payload) => {
+      registeredCalls.push(payload);
+      return payload;
+    };
+
+    await app._loadUserLibraryAndSync();
+    app.render();
+
+    // Auto-linked PC's Drive folder ID
+    assert.equal(globalThis.localStorage.getItem('audiobook_drive_folder_v1'), 'drive-folder-from-pc');
+    assert.equal(app.state.driveModal.folderId, 'drive-folder-from-pc');
+
+    // Reauth banner renders when needsDriveSyncReauth is true
+    const reauthBtn = env.rootEl.querySelector('[data-action="reauth-drive-sync"]');
+    assert.ok(reauthBtn, 'Enable Cloud Library Sync button should render');
+    let consentOpts = null;
+    app.syncService.signInWithGoogle = async (opts) => {
+      consentOpts = opts;
+      return { ok: false, mode: 'popup' };
+    };
+    reauthBtn.click();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(consentOpts?.forceConsent, true);
+
+    // Remote-local-only book shows "On Windows PC" badge and shows friendly message on play click
+    assert.match(env.rootEl.querySelector('#appMainLayer').innerHTML, /On Windows PC/);
+    const remoteLocalBtn = env.rootEl
+      .querySelectorAll('[data-action="play-book"]')
+      .find((b) => b.dataset.book === 'pc-local-only-book::some-author');
+    assert.ok(remoteLocalBtn);
+    remoteLocalBtn.click();
+    assert.equal(app.state.errorModal.open, true);
+    assert.match(app.state.errorModal.message, /stored locally on Windows PC/);
+    app.state.errorModal.open = false;
+    app.render();
+
+    // Continue from Windows PC banner renders and Continue Here switches/seeks/plays
+    const continueCard = env.rootEl.querySelector('.continue-device-card');
+    assert.ok(continueCard, 'Continue from Windows PC card should render');
+    assert.match(continueCard.textContent, /Continue from Windows PC/);
+    assert.match(continueCard.textContent, /Playing now/);
+
+    const continueBtn = continueCard.querySelector('[data-action="continue-remote-device"]');
+    continueBtn.click();
+    await new Promise((r) => setTimeout(r, 15));
+
+    assert.equal(app.state.activeBookKey, 'project-hail-mary::andy-weir');
+    assert.equal(seekedTo, 420);
+    assert.equal(playedCalls, 1);
+    assert.ok(registeredCalls.some((c) => c.isPlaying === true && c.activeBookKey === 'project-hail-mary::andy-weir'));
+
+    // Devices modal opens in #appOverlayDevices
+    app.state.devicesModalOpen = true;
+    app.render();
+    const devicesSlot = env.rootEl.querySelector('#appOverlayDevices');
+    assert.match(devicesSlot.innerHTML, /Signed-In Devices/);
+    assert.match(devicesSlot.innerHTML, /Windows PC/);
+  } finally {
+    app?.destroy?.();
+    env.restore();
+  }
+});

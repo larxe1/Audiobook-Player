@@ -1,11 +1,11 @@
 {
-  "version": "1.0.10",
-  "build": 11,
+  "version": "1.0.11",
+  "build": 12,
   "channel": "stable",
-  "publishedAt": "2026-11-18T06:33:00Z",
+  "publishedAt": "2026-11-18T15:05:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Fix Android APK Google OAuth via Chrome Custom Tabs and deep link callback, update Google OAuth client ID across platforms, and fix root PWA service worker OTA caching"
+  "releaseNotes": ""
 }

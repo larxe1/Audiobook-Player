@@ -1,4 +1,40 @@
-export const LOCAL_VERSION = '1.0.10';
+export const LOCAL_VERSION = '1.0.11';
+
+/**
+ * Detect the runtime platform for update delivery.
+ * Distinguishes Tauri Windows desktop ('windows-tauri'), Capacitor Android APK ('android-apk'),
+ * and Web/PWA including Android Chrome PWA ('web').
+ * @param {any} [win]
+ * @param {any} [nav]
+ * @returns {'windows-tauri' | 'android-apk' | 'web'}
+ */
+export function detectPlatform(
+  win = typeof globalThis.window !== 'undefined' ? globalThis.window : null,
+  nav = typeof globalThis.navigator !== 'undefined' ? globalThis.navigator : null
+) {
+  const origin = win?.location?.origin || '';
+  const protocol = win?.location?.protocol || '';
+  const ua = nav?.userAgent || '';
+
+  if (win?.__TAURI__ || win?.__TAURI_INTERNALS__ || /tauri\.localhost/i.test(origin)) {
+    return 'windows-tauri';
+  }
+
+  const isCapacitorNative =
+    Boolean(win?.AudiobookUpdaterNative) ||
+    Boolean(win?.AudiobookOAuthNative) ||
+    (typeof win?.Capacitor?.isNativePlatform === 'function' && win.Capacitor.isNativePlatform()) ||
+    Boolean(win?.Capacitor?.isNative) ||
+    protocol === 'capacitor:' ||
+    /^capacitor:\/\//i.test(origin) ||
+    (/Android/i.test(ua) && /^https?:\/\/localhost(?::\d+)?$/i.test(origin));
+
+  if (isCapacitorNative) {
+    return 'android-apk';
+  }
+
+  return 'web';
+}
 
 export const DEFAULT_MANIFEST_URL =
   'https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json';
@@ -310,5 +346,161 @@ export class SelfUpdaterService {
     }
 
     return { triggered: false, platform: targetPlatform, url };
+  }
+
+  /**
+   * Detect the current runtime platform ('windows-tauri' | 'android-apk' | 'web').
+   * @param {any} [win]
+   * @param {any} [nav]
+   * @returns {'windows-tauri' | 'android-apk' | 'web'}
+   */
+  detectPlatform(
+    win = typeof globalThis.window !== 'undefined' ? globalThis.window : null,
+    nav = typeof globalThis.navigator !== 'undefined' ? globalThis.navigator : null
+  ) {
+    return detectPlatform(win, nav);
+  }
+
+  /**
+   * Install an available update natively on Windows Tauri, Android Capacitor APK, or Web PWA.
+   * @param {'windows-tauri' | 'android-apk' | 'web' | string} [platform]
+   * @param {Record<string, any> | null} [manifest=this.lastManifest]
+   * @param {{ onProgress?: (progress: any) => void, windowObj?: any, navigatorObj?: any, env?: any }} [callbacks={}]
+   */
+  async installNativeUpdate(platform, manifest = this.lastManifest, callbacks = {}) {
+    const win =
+      callbacks.windowObj !== undefined
+        ? callbacks.windowObj
+        : typeof globalThis.window !== 'undefined'
+          ? globalThis.window
+          : null;
+    const nav =
+      callbacks.navigatorObj !== undefined
+        ? callbacks.navigatorObj
+        : typeof globalThis.navigator !== 'undefined'
+          ? globalThis.navigator
+          : null;
+    const targetPlatform = platform || this.detectPlatform(win, nav);
+    const activeManifest = manifest || this.lastManifest || {};
+
+    if (targetPlatform === 'windows-tauri') {
+      const url = activeManifest.exeDownloadUrl || this.exeDownloadUrl || '';
+      const tauriInvoke = win?.__TAURI_INTERNALS__?.invoke || win?.__TAURI__?.core?.invoke;
+      if (typeof tauriInvoke !== 'function') {
+        return {
+          ok: false,
+          started: false,
+          platform: 'windows-tauri',
+          url,
+          error: 'Tauri desktop updater is unavailable.'
+        };
+      }
+      if (!url) {
+        return {
+          ok: false,
+          started: false,
+          platform: 'windows-tauri',
+          url: '',
+          error: 'No Windows installer URL available.'
+        };
+      }
+      try {
+        callbacks.onProgress?.({
+          status: 'downloading',
+          progress: 0,
+          message: 'Downloading Windows update...'
+        });
+        const result = await tauriInvoke('desktop_install_update', { url });
+        callbacks.onProgress?.({
+          status: 'restarting',
+          progress: 100,
+          message: 'Installing update and restarting...'
+        });
+        return {
+          ok: true,
+          started: true,
+          platform: 'windows-tauri',
+          url,
+          result
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || 'Windows update failed.');
+        callbacks.onProgress?.({ status: 'error', message });
+        return {
+          ok: false,
+          started: false,
+          platform: 'windows-tauri',
+          url,
+          error: message
+        };
+      }
+    }
+
+    if (targetPlatform === 'android-apk') {
+      const url = activeManifest.apkDownloadUrl || this.apkDownloadUrl || '';
+      if (!url) {
+        return {
+          ok: false,
+          started: false,
+          platform: 'android-apk',
+          url: '',
+          error: 'No Android APK URL available.'
+        };
+      }
+
+      if (win && typeof callbacks.onProgress === 'function') {
+        win.__onAndroidUpdateProgress = (payload) => {
+          let parsed = payload;
+          if (typeof payload === 'string') {
+            try {
+              parsed = JSON.parse(payload);
+            } catch {
+              parsed = { status: 'downloading', message: payload };
+            }
+          }
+          callbacks.onProgress(parsed);
+        };
+      }
+
+      const updaterNative = win?.AudiobookUpdaterNative;
+      if (typeof updaterNative?.startApkUpdate === 'function') {
+        try {
+          updaterNative.startApkUpdate(url);
+          return {
+            ok: true,
+            started: true,
+            platform: 'android-apk',
+            url
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error || 'APK update failed.');
+          callbacks.onProgress?.({ status: 'error', message });
+          return {
+            ok: false,
+            started: false,
+            platform: 'android-apk',
+            url,
+            error: message
+          };
+        }
+      }
+
+      const fallback = this.downloadNativeUpdate('android', activeManifest, callbacks.openUrl || null);
+      return {
+        ok: fallback.triggered,
+        started: fallback.triggered,
+        fallback: true,
+        platform: 'android-apk',
+        url: fallback.url
+      };
+    }
+
+    const otaResult = await this.applyOtaUpdate(callbacks.env || {});
+    return {
+      ok: Boolean(otaResult?.applied),
+      applied: Boolean(otaResult?.applied),
+      platform: 'web',
+      ...otaResult
+    };
   }
 }

@@ -1,4 +1,4 @@
-name: Deploy PWA & Release Android APK
+name: Deploy PWA & Release Multi-Platform Binaries
 
 on:
   push:
@@ -55,8 +55,12 @@ jobs:
         uses: actions/deploy-pages@v4
 
   build-android-release:
-    name: Build & Release Android APK
+    name: Build Android APK
     runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.changes.outputs.should_build }}
+      version: ${{ steps.meta.outputs.version }}
+      notes: ${{ steps.meta.outputs.notes }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -107,13 +111,26 @@ jobs:
           npx cap add android
           npx cap sync android
           mkdir -p android/app/src/main/java/com/audiobook/player
+          mkdir -p android/app/src/main/res/xml
           cp android-auto/AudiobookOAuthBridge.java android/app/src/main/java/com/audiobook/player/AudiobookOAuthBridge.java
+          cp android-auto/AudiobookUpdaterBridge.java android/app/src/main/java/com/audiobook/player/AudiobookUpdaterBridge.java
+          cp android-auto/res/xml/file_paths.xml android/app/src/main/res/xml/file_paths.xml
           node << 'EOF'
           const fs = require('fs');
 
-          // 1. Ensure androidx.browser:browser dependency in android/app/build.gradle
+          const versionMeta = JSON.parse(fs.readFileSync('version.json', 'utf8'));
+          const buildCode = Number(versionMeta.build) || 1;
+          const versionName = String(versionMeta.version || '1.0.0');
+
+          // 1. Patch android/app/build.gradle: versionCode/versionName + androidx.browser:browser
           const gradlePath = 'android/app/build.gradle';
           let gradle = fs.readFileSync(gradlePath, 'utf8');
+          if (!/\bversionCode\s+\d+/.test(gradle) || !/\bversionName\s+"[^"]*"/.test(gradle)) {
+            throw new Error('Could not find versionCode/versionName in android/app/build.gradle');
+          }
+          gradle = gradle.replace(/\bversionCode\s+\d+/, `versionCode ${buildCode}`);
+          gradle = gradle.replace(/\bversionName\s+"[^"]*"/, `versionName "${versionName}"`);
+
           if (!gradle.includes('androidx.browser:browser')) {
             if (!/dependencies\s*\{/.test(gradle)) {
               throw new Error('Could not find dependencies block in android/app/build.gradle');
@@ -122,10 +139,10 @@ jobs:
               /dependencies\s*\{/,
               'dependencies {\n    implementation "androidx.browser:browser:1.8.0"'
             );
-            fs.writeFileSync(gradlePath, gradle);
           }
+          fs.writeFileSync(gradlePath, gradle);
 
-          // 2. Patch MainActivity.java to register AudiobookOAuthNative and forward redirect intents
+          // 2. Patch MainActivity.java to register both AudiobookOAuthNative and AudiobookUpdaterNative
           const mainActivityPath = 'android/app/src/main/java/com/audiobook/player/MainActivity.java';
           const mainActivitySrc = `package com.audiobook.player;
 
@@ -135,13 +152,16 @@ jobs:
 
           public class MainActivity extends BridgeActivity {
               private AudiobookOAuthBridge oauthBridge;
+              private AudiobookUpdaterBridge updaterBridge;
 
               @Override
               public void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
                   oauthBridge = new AudiobookOAuthBridge(this);
+                  updaterBridge = new AudiobookUpdaterBridge(this);
                   if (getBridge() != null && getBridge().getWebView() != null) {
                       getBridge().getWebView().addJavascriptInterface(oauthBridge, "AudiobookOAuthNative");
+                      getBridge().getWebView().addJavascriptInterface(updaterBridge, "AudiobookUpdaterNative");
                   }
                   oauthBridge.handleRedirectIntent(getIntent());
               }
@@ -158,7 +178,7 @@ jobs:
           `.replace(/^          /gm, '');
           fs.writeFileSync(mainActivityPath, mainActivitySrc);
 
-          // 3. Patch AndroidManifest.xml: preserve 5 permissions, enforce singleTask, add OAuth deep-link intent-filter
+          // 3. Patch AndroidManifest.xml: preserve 5 permissions, enforce singleTask, add OAuth deep-link + FileProvider
           const manifestPath = 'android/app/src/main/AndroidManifest.xml';
           let xml = fs.readFileSync(manifestPath, 'utf8');
           const perms = [
@@ -203,26 +223,66 @@ jobs:
             xml = xml.replace(activityBlockRe, `$1${oauthFilter}\n        $2`);
           }
 
-          if (!xml.includes('android:launchMode="singleTask"') || !xml.includes('android:scheme="com.audiobook.player"')) {
-            throw new Error('AndroidManifest.xml OAuth patch verification failed');
+          if (!xml.includes('androidx.core.content.FileProvider')) {
+            const providerXml = [
+              '        <provider',
+              '            android:name="androidx.core.content.FileProvider"',
+              '            android:authorities="${applicationId}.fileprovider"',
+              '            android:exported="false"',
+              '            android:grantUriPermissions="true">',
+              '            <meta-data',
+              '                android:name="android.support.FILE_PROVIDER_PATHS"',
+              '                android:resource="@xml/file_paths" />',
+              '        </provider>'
+            ].join('\n');
+            if (!xml.includes('</application>')) {
+              throw new Error('Could not find </application> in AndroidManifest.xml');
+            }
+            xml = xml.replace('</application>', `${providerXml}\n    </application>`);
+          }
+
+          if (
+            !xml.includes('android:launchMode="singleTask"') ||
+            !xml.includes('android:scheme="com.audiobook.player"') ||
+            !xml.includes('androidx.core.content.FileProvider')
+          ) {
+            throw new Error('AndroidManifest.xml patch verification failed');
           }
           fs.writeFileSync(manifestPath, xml);
           EOF
 
-      - name: Build debug-signed APK
+      - name: Build Android APK
         if: steps.changes.outputs.should_build == 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug
-          cd ..
-          cp android/app/build/outputs/apk/debug/app-debug.apk Audiobook-Player.apk
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > app/release-keystore.jks
+            KEY_PASS="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
+            ./gradlew assembleRelease \
+              -Pandroid.injected.signing.store.file="$PWD/app/release-keystore.jks" \
+              -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+              -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+              -Pandroid.injected.signing.key.password="$KEY_PASS"
+            rm -f app/release-keystore.jks
+            cd ..
+            cp android/app/build/outputs/apk/release/app-release.apk Audiobook-Player.apk
+          else
+            ./gradlew assembleDebug
+            cd ..
+            cp android/app/build/outputs/apk/debug/app-debug.apk Audiobook-Player.apk
+          fi
 
       - name: Read release metadata from version.json
         if: steps.changes.outputs.should_build == 'true'
         id: meta
         run: |
-          node -e "const fs=require('fs');const v=JSON.parse(fs.readFileSync('version.json','utf8'));fs.appendFileSync(process.env.GITHUB_OUTPUT,'version='+v.version+'\nnotes='+(v.releaseNotes||'Audiobook Player release')+'\n');"
+          node -e "const fs=require('fs');const v=JSON.parse(fs.readFileSync('version.json','utf8'));const notes=(v.releaseNotes||'Audiobook Player release');fs.appendFileSync(process.env.GITHUB_OUTPUT,'version='+v.version+'\nnotes<<GH_EOF\n'+notes+'\nGH_EOF\n');"
 
       - name: Upload APK workflow artifact
         if: steps.changes.outputs.should_build == 'true'
@@ -231,12 +291,92 @@ jobs:
           name: Audiobook-Player-apk
           path: Audiobook-Player.apk
 
-      - name: Publish GitHub Release with Audiobook-Player.apk
+  build-windows-release:
+    name: Build Windows Desktop EXE
+    runs-on: windows-latest
+    outputs:
+      should_build: ${{ steps.changes.outputs.should_build }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if version.json changed
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ] || [ -z "${{ github.event.before }}" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif ! git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -qx "version.json"; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
         if: steps.changes.outputs.should_build == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Rust toolchain
+        if: steps.changes.outputs.should_build == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run unit tests
+        if: steps.changes.outputs.should_build == 'true'
+        shell: bash
+        run: npm test
+
+      - name: Prepare Tauri UI assets
+        if: steps.changes.outputs.should_build == 'true'
+        shell: bash
+        run: node scripts/prepare-tauri-ui.mjs
+
+      - name: Build Windows Tauri release binary
+        if: steps.changes.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          cargo build --release --manifest-path src-tauri/Cargo.toml
+          cp src-tauri/target/release/audiobook-player.exe Audiobook-Player.exe
+
+      - name: Upload EXE workflow artifact
+        if: steps.changes.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Audiobook-Player-exe
+          path: Audiobook-Player.exe
+
+  publish-release:
+    name: Publish Multi-Platform GitHub Release
+    needs: [build-android-release, build-windows-release]
+    runs-on: ubuntu-latest
+    if: needs.build-android-release.outputs.should_build == 'true'
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Audiobook-Player-apk
+          path: release-assets
+
+      - name: Download EXE artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Audiobook-Player-exe
+          path: release-assets
+
+      - name: Publish GitHub Release with APK and EXE
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.meta.outputs.version }}
-          name: Audiobook Player v${{ steps.meta.outputs.version }}
-          body: ${{ steps.meta.outputs.notes }}
-          files: Audiobook-Player.apk
+          tag_name: v${{ needs.build-android-release.outputs.version }}
+          name: Audiobook Player v${{ needs.build-android-release.outputs.version }}
+          body: ${{ needs.build-android-release.outputs.notes }}
+          files: |
+            release-assets/Audiobook-Player.apk
+            release-assets/Audiobook-Player.exe
           make_latest: true
