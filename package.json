@@ -1,0 +1,9 @@
+{
+  "name": "audiobook-player",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Cross-platform Spotify-inspired audiobook player with Google Drive streaming, local folder deduplication, and Supabase cross-device sync.",
+  "scripts": {
+    "test": "node --test tests/sync.test.mjs tests/library.test.mjs tests/updater.test.mjs"
+  }
+}

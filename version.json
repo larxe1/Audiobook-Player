@@ -1,0 +1,10 @@
+{
+  "version": "1.0.0",
+  "build": 1,
+  "channel": "stable",
+  "publishedAt": "2026-11-18T00:00:00Z",
+  "apkDownloadUrl": "",
+  "exeDownloadUrl": "",
+  "otaBundleUrl": "",
+  "releaseNotes": "Initial release of Audiobook Player"
+}
