@@ -32,6 +32,9 @@ const isDriveThumbnailOrMissingCover =
     !url ||
     /googleusercontent\.com|drive\.google\.com\/thumbnail|docs\.google\.com/i.test(String(url)));
 
+const isLikelyNonEnglishText =
+  metadataEnrichment.isLikelyNonEnglishText || (() => false);
+
 const parseSeriesAndOrder =
   metadataEnrichment.parseSeriesAndOrder ||
   ((title = '', author = '', series = '') => ({
@@ -249,6 +252,7 @@ class AudiobookApp {
       },
       showWipeSyncedModal: false,
       wipeClearDriveFolder: false,
+      wipeInProgress: false,
       expandedSeries: new Set(),
       groupBySeries: true,
       collapsedChapterSections: new Set(),
@@ -280,6 +284,11 @@ class AudiobookApp {
     this._seenSeriesKeys = new Set();
     this._sessionEnrichedKeys = new Set();
     this._statusToastTimer = null;
+    this._suppressOfflineRender = false;
+    this._shellEls = null;
+    this._lastMainHtml = null;
+    this._prevMainViewMeta = null;
+    this._overlayState = {};
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
       window.addEventListener('error', (event) => {
@@ -350,10 +359,17 @@ class AudiobookApp {
     };
     this.state.syncProgress = next;
 
-    if (typeof document !== 'undefined') {
-      const bars = document.querySelectorAll('[data-sync-progress-bar]');
-      const labels = document.querySelectorAll('[data-sync-progress-label]');
-      const pcts = document.querySelectorAll('[data-sync-progress-pct]');
+    const searchRoot =
+      this.rootEl && typeof this.rootEl.querySelectorAll === 'function'
+        ? this.rootEl
+        : typeof document !== 'undefined'
+          ? document
+          : null;
+
+    if (searchRoot) {
+      const bars = searchRoot.querySelectorAll('[data-sync-progress-bar]');
+      const labels = searchRoot.querySelectorAll('[data-sync-progress-label]');
+      const pcts = searchRoot.querySelectorAll('[data-sync-progress-pct]');
       if (bars.length > 0) {
         bars.forEach((el) => {
           el.style.width = `${next.percent}%`;
@@ -370,6 +386,26 @@ class AudiobookApp {
         });
         return;
       }
+    }
+
+    const shell = this._ensureRootShell();
+    if (shell) {
+      const isLoggedIn = Boolean(this.user || this.guestLocalMode);
+      if (this.state.driveModal.open) {
+        this._syncOverlaySlot('drive', shell.drive, isLoggedIn, () => this._renderDriveSyncModal(), {
+          isDriveSlot: true,
+          sig: this._getDriveOverlaySignature()
+        });
+      } else {
+        this._syncOverlaySlot(
+          'syncProgress',
+          shell.syncProgress,
+          isLoggedIn && !this.state.driveModal.open,
+          () => this._renderSyncProgressOverlay(),
+          { isProgressSlot: true }
+        );
+      }
+      return;
     }
     this.render();
   }
@@ -689,7 +725,6 @@ class AudiobookApp {
         void this.syncService.syncLibraryItems(imported).catch(() => null);
       }
       await this.selectBook(imported[0].bookKey, false);
-      this.render();
       void this._runBackgroundMetadataEnrichment();
     } catch (err) {
       this.state.syncProgress.active = false;
@@ -939,6 +974,9 @@ class AudiobookApp {
       book.offlineCached = cached;
       book.isOffline = Boolean(cached || hasLocal);
       book.offline = book.isOffline;
+      if (this._suppressOfflineRender) {
+        return;
+      }
       this._persistBooks();
       this.render();
     }
@@ -1153,17 +1191,26 @@ class AudiobookApp {
         ? enriched.chapters
         : existing.chapters;
 
+    const nextDescription =
+      existing.description &&
+      isLikelyNonEnglishText(existing.description) &&
+      enriched.description &&
+      !isLikelyNonEnglishText(enriched.description)
+        ? enriched.description
+        : existing.description || enriched.description || '';
+
     return this._normalizeBookRecord({
       ...existing,
       author: nextAuthor,
       narrator: existing.narrator || enriched.narrator || '',
-      description: existing.description || enriched.description || '',
+      description: nextDescription,
       totalDurationSec: existing.totalDurationSec || enriched.totalDurationSec || 0,
       coverUrl: nextCoverUrl,
       series: existing.series || enriched.series || '',
       seriesOrder: existing.seriesOrder ?? enriched.seriesOrder ?? null,
       year: existing.year || enriched.year || null,
       chapters: nextChapters,
+      enrichmentVersion: enriched.enrichmentVersion ?? existing.enrichmentVersion ?? null,
       enrichmentCheckedAt: new Date().toISOString()
     });
   }
@@ -1278,134 +1325,148 @@ class AudiobookApp {
   }
 
   async handleWipeSyncedFiles() {
+    if (this.state.wipeInProgress) return;
+    this.state.wipeInProgress = true;
+    this.render();
+
     const wipedBookKeys = [];
     const updatedHybridBooks = [];
     const nextBooks = [];
 
-    for (const book of this.books) {
-      const sources = Array.isArray(book.sources) ? book.sources : [];
-      if (!sources.includes('drive')) {
-        nextBooks.push(book);
-        continue;
-      }
+    try {
+      this._suppressOfflineRender = true;
+      try {
+        for (const book of this.books) {
+          const sources = Array.isArray(book.sources) ? book.sources : [];
+          if (!sources.includes('drive')) {
+            nextBooks.push(book);
+            continue;
+          }
 
-      if (!sources.includes('local')) {
-        wipedBookKeys.push(book.bookKey);
-        if (book.offlineCached || typeof this.audioEngine?.removeOfflineCopy === 'function') {
-          await this.audioEngine?.removeOfflineCopy?.(book).catch(() => null);
+          if (!sources.includes('local')) {
+            wipedBookKeys.push(book.bookKey);
+            if (book.offlineCached || typeof this.audioEngine?.removeOfflineCopy === 'function') {
+              await this.audioEngine?.removeOfflineCopy?.(book).catch(() => null);
+            }
+          } else {
+            const strippedChapters = Array.isArray(book.chapters)
+              ? book.chapters.map((ch) => {
+                  const { driveFileId, driveStreamUrl, streamUrl, ...restCh } = ch;
+                  return restCh;
+                })
+              : [];
+            const strippedBook = {
+              ...book,
+              sources: sources.filter((s) => s !== 'drive'),
+              preferredPlaybackSource: 'local',
+              driveFileId: null,
+              driveStreamUrl: '',
+              streamUrl: '',
+              coverDriveFileId: null,
+              coverUrl: isDriveThumbnailOrMissingCover(book.coverUrl) ? '' : book.coverUrl,
+              chapters: strippedChapters
+            };
+            updatedHybridBooks.push(strippedBook);
+            nextBooks.push(strippedBook);
+          }
         }
-      } else {
-        const strippedChapters = Array.isArray(book.chapters)
-          ? book.chapters.map((ch) => {
-              const { driveFileId, driveStreamUrl, streamUrl, ...restCh } = ch;
-              return restCh;
-            })
-          : [];
-        const strippedBook = {
-          ...book,
-          sources: sources.filter((s) => s !== 'drive'),
-          preferredPlaybackSource: 'local',
-          driveFileId: null,
-          driveStreamUrl: '',
-          streamUrl: '',
-          coverDriveFileId: null,
-          coverUrl: isDriveThumbnailOrMissingCover(book.coverUrl) ? '' : book.coverUrl,
-          chapters: strippedChapters
+      } finally {
+        this._suppressOfflineRender = false;
+      }
+
+      const totalWiped = wipedBookKeys.length + updatedHybridBooks.length;
+      this.books = nextBooks;
+
+      const activeWasRemoved =
+        this.state.activeBookKey && wipedBookKeys.includes(this.state.activeBookKey);
+      const detailWasRemoved =
+        this.state.detailBookKey && wipedBookKeys.includes(this.state.detailBookKey);
+
+      if (activeWasRemoved) {
+        try {
+          this.audioEngine?.pause?.();
+        } catch {
+          // ignore
+        }
+        try {
+          localStorage.removeItem(STORAGE_ACTIVE_BOOK_KEY);
+        } catch {
+          // ignore
+        }
+        this.state.activeBookKey = null;
+        this.state.mobileSheetOpen = false;
+      }
+
+      if (detailWasRemoved) {
+        this.state.detailBookKey = null;
+        if (this.state.desktopView === 'detail') {
+          this.state.desktopView = 'home';
+        }
+      }
+
+      this._persistBooks();
+
+      const remoteClient =
+        typeof this.supabase?.deleteLibraryItems === 'function'
+          ? this.supabase
+          : this.syncService;
+
+      if (wipedBookKeys.length > 0) {
+        try {
+          await remoteClient?.deleteLibraryItems?.(wipedBookKeys);
+        } catch {
+          // ignore remote delete failures
+        }
+      }
+      if (updatedHybridBooks.length > 0) {
+        try {
+          await remoteClient?.syncLibraryItems?.(updatedHybridBooks);
+        } catch {
+          // ignore remote sync failures
+        }
+      }
+
+      if (this.state.wipeClearDriveFolder) {
+        try {
+          localStorage.removeItem('audiobook_drive_folder_v1');
+        } catch {
+          // ignore
+        }
+        this.state.driveModal.folderId = '';
+      }
+
+      this.state.wipeInProgress = false;
+      this.state.showWipeSyncedModal = false;
+      this.state.wipeClearDriveFolder = false;
+      if (this.state.driveModal.open) {
+        this.state.driveModal.open = false;
+      }
+
+      if (nextBooks.length > 0 && !this.state.activeBookKey) {
+        await this.selectBook(nextBooks[0].bookKey, false);
+      } else if (nextBooks.length === 0) {
+        if (this.audioEngine) {
+          this.audioEngine.currentBook = null;
+        }
+        this.state.snapshot = {
+          ...this.state.snapshot,
+          bookKey: null,
+          playing: false,
+          positionSec: 0,
+          durationSec: 0,
+          chapterIndex: 0
         };
-        updatedHybridBooks.push(strippedBook);
-        nextBooks.push(strippedBook);
       }
+
+      this.showStatusToast(
+        totalWiped > 0
+          ? `Wiped ${totalWiped} synced Drive book${totalWiped === 1 ? '' : 's'}`
+          : 'No synced Drive books to wipe'
+      );
+    } finally {
+      this._suppressOfflineRender = false;
+      this.state.wipeInProgress = false;
     }
-
-    const totalWiped = wipedBookKeys.length + updatedHybridBooks.length;
-    this.books = nextBooks;
-
-    const activeWasRemoved =
-      this.state.activeBookKey && wipedBookKeys.includes(this.state.activeBookKey);
-    const detailWasRemoved =
-      this.state.detailBookKey && wipedBookKeys.includes(this.state.detailBookKey);
-
-    if (activeWasRemoved) {
-      try {
-        this.audioEngine?.pause?.();
-      } catch {
-        // ignore
-      }
-      try {
-        localStorage.removeItem(STORAGE_ACTIVE_BOOK_KEY);
-      } catch {
-        // ignore
-      }
-      this.state.activeBookKey = null;
-      this.state.mobileSheetOpen = false;
-    }
-
-    if (detailWasRemoved) {
-      this.state.detailBookKey = null;
-      if (this.state.desktopView === 'detail') {
-        this.state.desktopView = 'home';
-      }
-    }
-
-    this._persistBooks();
-
-    const remoteClient =
-      typeof this.supabase?.deleteLibraryItems === 'function'
-        ? this.supabase
-        : this.syncService;
-
-    if (wipedBookKeys.length > 0) {
-      try {
-        await remoteClient?.deleteLibraryItems?.(wipedBookKeys);
-      } catch {
-        // ignore remote delete failures
-      }
-    }
-    if (updatedHybridBooks.length > 0) {
-      try {
-        await remoteClient?.syncLibraryItems?.(updatedHybridBooks);
-      } catch {
-        // ignore remote sync failures
-      }
-    }
-
-    if (this.state.wipeClearDriveFolder) {
-      try {
-        localStorage.removeItem('audiobook_drive_folder_v1');
-      } catch {
-        // ignore
-      }
-      this.state.driveModal.folderId = '';
-    }
-
-    this.state.showWipeSyncedModal = false;
-    this.state.wipeClearDriveFolder = false;
-    if (this.state.driveModal.open) {
-      this.state.driveModal.open = false;
-    }
-
-    if (nextBooks.length > 0 && !this.state.activeBookKey) {
-      await this.selectBook(nextBooks[0].bookKey, false);
-    } else if (nextBooks.length === 0) {
-      if (this.audioEngine) {
-        this.audioEngine.currentBook = null;
-      }
-      this.state.snapshot = {
-        ...this.state.snapshot,
-        bookKey: null,
-        playing: false,
-        positionSec: 0,
-        durationSec: 0,
-        chapterIndex: 0
-      };
-    }
-
-    this.showStatusToast(
-      totalWiped > 0
-        ? `Wiped ${totalWiped} synced Drive book${totalWiped === 1 ? '' : 's'}`
-        : 'No synced Drive books to wipe'
-    );
-    this.render();
   }
 
   _extractSeriesBasePrefix(title = '') {
@@ -1595,6 +1656,7 @@ class AudiobookApp {
   }
 
   async runGoogleDriveSync(folderIdInput = '', tokenInput = '') {
+    if (this.state.driveModal.loading) return;
     const cleanToken = (tokenInput || this.syncService.getGoogleAccessToken() || '').trim();
     const cleanFolderId = (folderIdInput || '').trim();
     if (!cleanToken) {
@@ -1655,11 +1717,13 @@ class AudiobookApp {
         if (this.syncService.isAuthenticated()) {
           void this.syncService.syncLibraryItems(normalizedDriveBooks).catch(() => null);
         }
-        if (!this.state.activeBookKey) {
-          await this.selectBook(normalizedDriveBooks[0].bookKey, false);
-        }
         this.state.driveModal.open = false;
         this.state.driveModal.loading = false;
+        if (!this.state.activeBookKey) {
+          await this.selectBook(normalizedDriveBooks[0].bookKey, false);
+        } else {
+          this.render();
+        }
         void this._runBackgroundMetadataEnrichment();
       } else {
         this.state.driveModal.loading = false;
@@ -1673,13 +1737,13 @@ class AudiobookApp {
       this._syncAbortController = null;
       if (err?.name === 'AbortError') {
         this.state.driveModal.error = 'Sync cancelled.';
+        this.render();
       } else {
         const errMsg = err?.message || 'Google Drive sync failed.';
         this.state.driveModal.error = errMsg;
         this.showError('Google Drive Sync Error', errMsg, { showRelogin: err?.status === 401 });
       }
     }
-    this.render();
   }
 
   _loadLastEmail() {
@@ -2279,6 +2343,7 @@ class AudiobookApp {
   _renderWipeSyncedModal() {
     if (!this.state.showWipeSyncedModal) return '';
     const { driveOnlyCount, hybridCount, totalDriveCount } = this._getDriveSyncedBooksStats();
+    const wipeInProgress = Boolean(this.state.wipeInProgress);
 
     return `
       <div class="fixed inset-0 z-[65] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
@@ -2288,7 +2353,7 @@ class AudiobookApp {
               <span class="text-red-400 shrink-0">${ICON_TRASH(17)}</span>
               <h2 class="text-base font-bold text-white truncate">Wipe Synced Drive Files</h2>
             </div>
-            <button type="button" data-action="close-wipe-synced-modal" aria-label="Close" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white">
+            <button type="button" data-action="close-wipe-synced-modal" ${wipeInProgress ? 'disabled' : ''} aria-label="Close" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white disabled:opacity-40 disabled:cursor-not-allowed">
               ${ICON_CLOSE(18)}
             </button>
           </div>
@@ -2317,13 +2382,13 @@ class AudiobookApp {
             </div>
 
             <label class="flex items-start gap-2.5 cursor-pointer select-none px-1">
-              <input id="wipeClearDriveFolderCheckbox" data-action="toggle-wipe-clear-folder" type="checkbox" ${this.state.wipeClearDriveFolder ? 'checked' : ''} class="mt-0.5 rounded border-[var(--border-subtle)] bg-white/5 accent-[#1ed760]" />
+              <input id="wipeClearDriveFolderCheckbox" data-action="toggle-wipe-clear-folder" type="checkbox" ${this.state.wipeClearDriveFolder ? 'checked' : ''} ${wipeInProgress ? 'disabled' : ''} class="mt-0.5 rounded border-[var(--border-subtle)] bg-white/5 accent-[#1ed760]" />
               <span class="text-xs text-[var(--text-secondary)] leading-snug">Also disconnect and forget saved Google Drive folder ID</span>
             </label>
 
             <div class="flex items-center justify-end gap-2 pt-1">
-              <button type="button" data-action="close-wipe-synced-modal" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Cancel</button>
-              <button type="button" data-action="confirm-wipe-synced" ${totalDriveCount === 0 ? 'disabled' : ''} class="btn-press px-4 py-2 rounded-full bg-red-500 text-white text-xs font-bold hover:bg-red-400 disabled:opacity-40 disabled:cursor-not-allowed">Wipe Synced Files</button>
+              <button type="button" data-action="close-wipe-synced-modal" ${wipeInProgress ? 'disabled' : ''} class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white disabled:opacity-40 disabled:cursor-not-allowed">Cancel</button>
+              <button type="button" data-action="confirm-wipe-synced" ${totalDriveCount === 0 || wipeInProgress ? 'disabled' : ''} class="btn-press px-4 py-2 rounded-full bg-red-500 text-white text-xs font-bold hover:bg-red-400 disabled:opacity-40 disabled:cursor-not-allowed">${wipeInProgress ? 'Wiping...' : 'Wipe Synced Files'}</button>
             </div>
           </div>
         </div>
@@ -2346,9 +2411,13 @@ class AudiobookApp {
   }
 
   _renderNotificationShade(book, snap) {
+    const noAnimCls =
+      this._prevMainViewMeta?.layoutMode === 'android' && this._prevMainViewMeta?.shadeOpen
+        ? ' no-enter-anim'
+        : '';
     if (!book) {
       return `
-        <div class="notif-shade rounded-3xl p-4 w-full max-w-[390px] mx-auto space-y-3 overflow-hidden">
+        <div class="notif-shade${noAnimCls} rounded-3xl p-4 w-full max-w-[390px] mx-auto space-y-3 overflow-hidden">
           <div class="flex items-center justify-between gap-2 min-w-0">
             <div class="flex items-center gap-2 min-w-0">
               <span class="w-4 h-4 rounded-full bg-white/15 text-[var(--text-secondary)] flex items-center justify-center shrink-0">${ICON_PLAY(9)}</span>
@@ -2380,7 +2449,7 @@ class AudiobookApp {
     const chapter = book.chapters?.[snap.chapterIndex];
 
     return `
-      <div class="notif-shade rounded-3xl p-4 w-full max-w-[390px] mx-auto space-y-3 overflow-hidden">
+      <div class="notif-shade${noAnimCls} rounded-3xl p-4 w-full max-w-[390px] mx-auto space-y-3 overflow-hidden">
         <div class="flex items-center justify-between gap-2 min-w-0">
           <div class="flex items-center gap-2 min-w-0">
             <span class="w-4 h-4 rounded-full bg-[#1ed760] text-[#050506] flex items-center justify-center shrink-0">${ICON_PLAY(9)}</span>
@@ -2869,7 +2938,7 @@ class AudiobookApp {
         }
 
         <!-- Mobile Scrollable Content -->
-        <div class="flex-1 overflow-y-auto px-4 pb-24 space-y-6 min-w-0 flex flex-col">
+        <div id="mobileMainScroll" class="flex-1 overflow-y-auto px-4 pb-24 space-y-6 min-w-0 flex flex-col">
           ${
             this.books.length === 0
               ? this._renderEmptyLibraryCard()
@@ -2902,7 +2971,7 @@ class AudiobookApp {
           <!-- Jump back in (zero subtitle!) -->
           <section class="space-y-3">
             <h2 class="text-lg font-bold tracking-tight text-[var(--text-primary)]">Jump back in</h2>
-            <div class="flex gap-3 overflow-x-auto pb-1">
+            <div id="mobileJumpStrip" class="flex gap-3 overflow-x-auto pb-1">
               ${filtered
                 .map(
                   (book) => `
@@ -3000,9 +3069,13 @@ class AudiobookApp {
     const chapter = book.chapters?.[snap.chapterIndex];
     const chapters = book.chapters || [];
     const bookmarks = this.state.bookmarksByBook[book.bookKey] || [];
+    const noAnimCls =
+      this._prevMainViewMeta?.layoutMode === 'android' && this._prevMainViewMeta?.mobileSheetOpen
+        ? ' no-enter-anim'
+        : '';
 
     return `
-      <div class="sheet-modal ambient-surface absolute inset-0 z-30 flex flex-col p-5 overflow-y-auto">
+      <div id="mobileSheetScroll" class="sheet-modal${noAnimCls} ambient-surface absolute inset-0 z-30 flex flex-col p-5 overflow-y-auto">
         <div class="flex items-center justify-between gap-2 pb-4">
           <button data-action="close-mobile-sheet" aria-label="Close" class="btn-press p-2 rounded-full hover:bg-white/10 text-white">
             ${ICON_CHEVRON('down', 20)}
@@ -3212,7 +3285,7 @@ class AudiobookApp {
               </div>
             </div>
 
-            <div class="flex-1 overflow-y-auto p-5 space-y-7 min-w-0 flex flex-col">
+            <div id="desktopMainScroll" class="flex-1 overflow-y-auto p-5 space-y-7 min-w-0 flex flex-col">
               ${
                 desktopView === 'detail' && detailBook
                   ? this._renderDesktopDetail(detailBook)
@@ -3231,7 +3304,7 @@ class AudiobookApp {
               <span class="text-xs font-bold uppercase tracking-wider text-[var(--text-secondary)] truncate">Now Playing</span>
               <button data-action="toggle-right-panel" aria-label="Close Panel" class="btn-press p-1 rounded-lg hover:bg-white/10 text-[var(--text-secondary)]">${ICON_CLOSE(15)}</button>
             </div>
-            <div class="flex-1 overflow-y-auto p-4 space-y-4 min-w-0">
+            <div id="desktopRightScroll" class="flex-1 overflow-y-auto p-4 space-y-4 min-w-0">
               <button data-action="open-cover-search" data-book="${escapeHtml(activeBook.bookKey)}" class="w-full aspect-square rounded-2xl overflow-hidden shadow-xl block relative group">
                 ${this._renderCoverImg(activeBook)}
                 <span class="absolute bottom-2 right-2 px-2.5 py-1 rounded-full bg-black/70 text-[11px] font-medium text-white opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
@@ -3596,77 +3669,343 @@ class AudiobookApp {
     `;
   }
 
-  render() {
-    if (!this.rootEl) return;
+  _applyNoEnterAnimHtml(html) {
+    return String(html || '').replace(
+      /class="([^"]*\b(?:sheet-modal|notif-shade|popover-menu)\b[^"]*)"/g,
+      (match, classes) =>
+        classes.includes('no-enter-anim') ? match : `class="${classes} no-enter-anim"`
+    );
+  }
 
-    if (!this.user && !this.guestLocalMode) {
-      this.rootEl.innerHTML = `
-        <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
-          ${this._renderLoginView()}
-          ${this._renderWipeSyncedModal()}
-          ${this._renderStatusToast()}
-          ${this._renderErrorModal()}
-        </div>
-      `;
-      this._bindViewEvents();
-      return;
-    }
+  _getDriveOverlaySignature() {
+    const { open, folderId, token, loading, error } = this.state.driveModal;
+    const hasToken = Boolean(token || this.syncService.getGoogleAccessToken());
+    const driveStats = this._getDriveSyncedBooksStats();
+    return JSON.stringify({
+      open: Boolean(open),
+      folderId: folderId || '',
+      token: token || '',
+      loading: Boolean(loading),
+      error: error || '',
+      hasToken,
+      totalDriveCount: loading ? 0 : driveStats.totalDriveCount
+    });
+  }
 
-    const activeBook = this.getActiveBook();
-    const snap = this.state.snapshot;
-    const layoutMode = this._detectViewportLayout();
-    this.state.layoutMode = layoutMode;
-
-    let bodyView = '';
-    if (layoutMode === 'watch') {
-      bodyView = this._renderGalaxyWatchView(activeBook, snap);
-    } else if (layoutMode === 'auto') {
-      bodyView = this._renderAndroidAutoView(activeBook, snap);
-    } else if (layoutMode === 'android') {
-      bodyView = this._renderAndroidMobileView(activeBook, snap);
-    } else {
-      bodyView = this._renderDesktopView(activeBook, snap);
+  _ensureRootShell() {
+    if (!this.rootEl || typeof this.rootEl.querySelector !== 'function') return null;
+    const existingMain = this.rootEl.querySelector('#appMainLayer');
+    if (existingMain && this._shellEls?.main === existingMain) {
+      return this._shellEls;
     }
 
     this.rootEl.innerHTML = `
       <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
-        ${bodyView}
-        ${this._renderProfilePopover()}
-        ${this._renderCoverSearchModal()}
-        ${this._renderDriveSyncModal()}
-        ${this._renderWipeSyncedModal()}
-        ${this._renderSyncProgressOverlay()}
-        ${this._renderStatusToast()}
-        ${this._renderErrorModal()}
+        <div id="appMainLayer" class="flex-1 flex flex-col min-h-0"></div>
+        <div id="appOverlayProfile"></div>
+        <div id="appOverlayCover"></div>
+        <div id="appOverlayDrive"></div>
+        <div id="appOverlayWipe"></div>
+        <div id="appOverlaySyncProgress"></div>
+        <div id="appOverlayToast"></div>
+        <div id="appOverlayError"></div>
       </div>
     `;
 
-    if (this.state.profileOpen && typeof document !== 'undefined' && typeof window !== 'undefined') {
-      const btn = document.getElementById('profileAvatarBtn');
-      const pop = document.getElementById('profilePopover');
-      if (btn && pop && typeof btn.getBoundingClientRect === 'function') {
-        const rect = btn.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          const rightOffset = Math.max(12, window.innerWidth - rect.right);
-          const topOffset = Math.min(window.innerHeight - 20, rect.bottom + 8);
-          pop.style.right = `${Math.round(rightOffset)}px`;
-          pop.style.top = `${Math.round(topOffset)}px`;
-        }
-      }
-    }
-
-    this._bindViewEvents();
+    this._shellEls = {
+      main: this.rootEl.querySelector('#appMainLayer'),
+      profile: this.rootEl.querySelector('#appOverlayProfile'),
+      cover: this.rootEl.querySelector('#appOverlayCover'),
+      drive: this.rootEl.querySelector('#appOverlayDrive'),
+      wipe: this.rootEl.querySelector('#appOverlayWipe'),
+      syncProgress: this.rootEl.querySelector('#appOverlaySyncProgress'),
+      toast: this.rootEl.querySelector('#appOverlayToast'),
+      error: this.rootEl.querySelector('#appOverlayError')
+    };
+    this._lastMainHtml = null;
+    this._prevMainViewMeta = null;
+    this._overlayState = {};
+    return this._shellEls;
   }
 
-  _bindViewEvents() {
-    const searchInput = document.getElementById('desktopSearchInput');
+  _syncOverlaySlot(slotName, slotEl, shouldShow, renderFn, options = {}) {
+    if (!slotEl) return false;
+    const prev = this._overlayState[slotName] || { open: false, rawHtml: '', sig: null };
+
+    if (!shouldShow) {
+      if (prev.open || slotEl.innerHTML) {
+        slotEl.innerHTML = '';
+      }
+      this._overlayState[slotName] = { open: false, rawHtml: '', sig: null };
+      return false;
+    }
+
+    // Preserve active progress DOM when drive modal is loading or floating sync progress is mounted
+    if (options.isDriveSlot && prev.open && this.state.driveModal.loading) {
+      const nextSig = options.sig ?? null;
+      if (prev.sig === nextSig && slotEl.querySelector?.('[data-sync-progress-bar]')) {
+        return false;
+      }
+    }
+    if (options.isProgressSlot && prev.open && slotEl.querySelector?.('[data-sync-progress-bar]')) {
+      return false;
+    }
+
+    const rawHtml = renderFn();
+    if (!rawHtml) {
+      if (prev.open || slotEl.innerHTML) {
+        slotEl.innerHTML = '';
+      }
+      this._overlayState[slotName] = { open: false, rawHtml: '', sig: null };
+      return false;
+    }
+
+    const nextSig = options.sig ?? null;
+    if (prev.open && prev.rawHtml === rawHtml && (nextSig === null || prev.sig === nextSig)) {
+      return false;
+    }
+
+    const finalHtml = prev.open ? this._applyNoEnterAnimHtml(rawHtml) : rawHtml;
+    slotEl.innerHTML = finalHtml;
+    this._overlayState[slotName] = { open: true, rawHtml, sig: nextSig };
+    this._bindContainerEvents(slotEl);
+    return true;
+  }
+
+  _snapshotMainScroll(mainLayer) {
+    if (!mainLayer || typeof mainLayer.querySelector !== 'function') return null;
+    const getTop = (id) => {
+      const el = mainLayer.querySelector(`#${id}`);
+      return el && typeof el.scrollTop === 'number' ? el.scrollTop : 0;
+    };
+    const getLeft = (id) => {
+      const el = mainLayer.querySelector(`#${id}`);
+      return el && typeof el.scrollLeft === 'number' ? el.scrollLeft : 0;
+    };
+    return {
+      bookListTop: getTop('book-list'),
+      desktopMainTop: getTop('desktopMainScroll'),
+      desktopRightTop: getTop('desktopRightScroll'),
+      mobileMainTop: getTop('mobileMainScroll'),
+      mobileJumpLeft: getLeft('mobileJumpStrip'),
+      mobileSheetTop: getTop('mobileSheetScroll')
+    };
+  }
+
+  _restoreMainScroll(mainLayer, prevMeta, nextMeta, scrollSnap) {
+    if (!mainLayer || !scrollSnap || typeof mainLayer.querySelector !== 'function') return;
+    const authOrLayoutChanged =
+      !prevMeta ||
+      prevMeta.isLoggedIn !== nextMeta.isLoggedIn ||
+      prevMeta.layoutMode !== nextMeta.layoutMode;
+    const filterOrSearchChanged =
+      authOrLayoutChanged ||
+      prevMeta.filterSource !== nextMeta.filterSource ||
+      prevMeta.searchQuery !== nextMeta.searchQuery;
+    const detailChanged =
+      authOrLayoutChanged ||
+      prevMeta.desktopView !== nextMeta.desktopView ||
+      prevMeta.detailBookKey !== nextMeta.detailBookKey;
+    const activeBookChanged = authOrLayoutChanged || prevMeta.activeBookKey !== nextMeta.activeBookKey;
+    const mobileSheetNewlyOpened = Boolean(!prevMeta?.mobileSheetOpen && nextMeta.mobileSheetOpen);
+
+    const setTop = (id, val) => {
+      const el = mainLayer.querySelector(`#${id}`);
+      if (el) el.scrollTop = val;
+    };
+    const setLeft = (id, val) => {
+      const el = mainLayer.querySelector(`#${id}`);
+      if (el) el.scrollLeft = val;
+    };
+
+    setTop('book-list', filterOrSearchChanged ? 0 : scrollSnap.bookListTop);
+    setTop('mobileMainScroll', filterOrSearchChanged ? 0 : scrollSnap.mobileMainTop);
+    setTop('desktopMainScroll', detailChanged ? 0 : scrollSnap.desktopMainTop);
+    setTop('desktopRightScroll', activeBookChanged ? 0 : scrollSnap.desktopRightTop);
+    setLeft('mobileJumpStrip', filterOrSearchChanged ? 0 : scrollSnap.mobileJumpLeft);
+    if (nextMeta.mobileSheetOpen) {
+      setTop(
+        'mobileSheetScroll',
+        mobileSheetNewlyOpened || activeBookChanged ? 0 : scrollSnap.mobileSheetTop
+      );
+    }
+  }
+
+  _positionProfilePopover(shell) {
+    if (!this.state.profileOpen || typeof window === 'undefined') return;
+    const btn =
+      shell?.main?.querySelector?.('#profileAvatarBtn') ||
+      (typeof document !== 'undefined' ? document.getElementById('profileAvatarBtn') : null);
+    const pop =
+      shell?.profile?.querySelector?.('#profilePopover') ||
+      (typeof document !== 'undefined' ? document.getElementById('profilePopover') : null);
+    if (btn && pop && typeof btn.getBoundingClientRect === 'function') {
+      const rect = btn.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        const rightOffset = Math.max(12, window.innerWidth - rect.right);
+        const topOffset = Math.min(window.innerHeight - 20, rect.bottom + 8);
+        pop.style.right = `${Math.round(rightOffset)}px`;
+        pop.style.top = `${Math.round(topOffset)}px`;
+      }
+    }
+  }
+
+  render() {
+    if (!this.rootEl) return;
+
+    const isLoggedIn = Boolean(this.user || this.guestLocalMode);
+    const shell = this._ensureRootShell();
+    if (!shell || !shell.main) {
+      if (!isLoggedIn) {
+        this.rootEl.innerHTML = `
+          <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
+            ${this._renderLoginView()}
+            ${this._renderWipeSyncedModal()}
+            ${this._renderStatusToast()}
+            ${this._renderErrorModal()}
+          </div>
+        `;
+        this._bindContainerEvents(this.rootEl);
+        return;
+      }
+      const activeBook = this.getActiveBook();
+      const snap = this.state.snapshot;
+      const layoutMode = this._detectViewportLayout();
+      this.state.layoutMode = layoutMode;
+      const bodyView =
+        layoutMode === 'watch'
+          ? this._renderGalaxyWatchView(activeBook, snap)
+          : layoutMode === 'auto'
+            ? this._renderAndroidAutoView(activeBook, snap)
+            : layoutMode === 'android'
+              ? this._renderAndroidMobileView(activeBook, snap)
+              : this._renderDesktopView(activeBook, snap);
+      this.rootEl.innerHTML = `
+        <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
+          ${bodyView}
+          ${this._renderProfilePopover()}
+          ${this._renderCoverSearchModal()}
+          ${this._renderDriveSyncModal()}
+          ${this._renderWipeSyncedModal()}
+          ${this._renderSyncProgressOverlay()}
+          ${this._renderStatusToast()}
+          ${this._renderErrorModal()}
+        </div>
+      `;
+      this._positionProfilePopover(null);
+      this._bindContainerEvents(this.rootEl);
+      return;
+    }
+
+    let bodyView = '';
+    let nextViewMeta;
+
+    if (!isLoggedIn) {
+      bodyView = this._renderLoginView();
+      nextViewMeta = {
+        isLoggedIn: false,
+        layoutMode: this.state.layoutMode,
+        desktopView: this.state.desktopView,
+        detailBookKey: this.state.detailBookKey,
+        activeBookKey: this.state.activeBookKey,
+        filterSource: this.state.filterSource,
+        searchQuery: this.state.searchQuery,
+        mobileSheetOpen: false,
+        shadeOpen: false
+      };
+    } else {
+      const activeBook = this.getActiveBook();
+      const snap = this.state.snapshot;
+      const layoutMode = this._detectViewportLayout();
+      this.state.layoutMode = layoutMode;
+
+      if (layoutMode === 'watch') {
+        bodyView = this._renderGalaxyWatchView(activeBook, snap);
+      } else if (layoutMode === 'auto') {
+        bodyView = this._renderAndroidAutoView(activeBook, snap);
+      } else if (layoutMode === 'android') {
+        bodyView = this._renderAndroidMobileView(activeBook, snap);
+      } else {
+        bodyView = this._renderDesktopView(activeBook, snap);
+      }
+
+      nextViewMeta = {
+        isLoggedIn: true,
+        layoutMode,
+        desktopView: this.state.desktopView,
+        detailBookKey: this.state.detailBookKey,
+        activeBookKey: this.state.activeBookKey,
+        filterSource: this.state.filterSource,
+        searchQuery: this.state.searchQuery,
+        mobileSheetOpen: Boolean(this.state.mobileSheetOpen),
+        shadeOpen: Boolean(this.state.shadeOpen)
+      };
+    }
+
+    if (this._lastMainHtml !== bodyView) {
+      const prevMeta = this._prevMainViewMeta;
+      const scrollSnap = this._snapshotMainScroll(shell.main);
+      shell.main.innerHTML = bodyView;
+      this._lastMainHtml = bodyView;
+      this._bindContainerEvents(shell.main);
+      this._restoreMainScroll(shell.main, prevMeta, nextViewMeta, scrollSnap);
+    }
+    this._prevMainViewMeta = nextViewMeta;
+
+    this._syncOverlaySlot(
+      'profile',
+      shell.profile,
+      isLoggedIn && Boolean(this.state.profileOpen),
+      () => this._renderProfilePopover()
+    );
+    this._syncOverlaySlot(
+      'cover',
+      shell.cover,
+      isLoggedIn && Boolean(this.state.coverModal.open),
+      () => this._renderCoverSearchModal()
+    );
+    this._syncOverlaySlot(
+      'drive',
+      shell.drive,
+      isLoggedIn && Boolean(this.state.driveModal.open),
+      () => this._renderDriveSyncModal(),
+      { isDriveSlot: true, sig: this._getDriveOverlaySignature() }
+    );
+    this._syncOverlaySlot('wipe', shell.wipe, Boolean(this.state.showWipeSyncedModal), () =>
+      this._renderWipeSyncedModal()
+    );
+    this._syncOverlaySlot(
+      'syncProgress',
+      shell.syncProgress,
+      isLoggedIn && Boolean(this.state.syncProgress.active && !this.state.driveModal.open),
+      () => this._renderSyncProgressOverlay(),
+      { isProgressSlot: true }
+    );
+    this._syncOverlaySlot('toast', shell.toast, Boolean(this.state.statusToast?.message), () =>
+      this._renderStatusToast()
+    );
+    this._syncOverlaySlot('error', shell.error, Boolean(this.state.errorModal.open), () =>
+      this._renderErrorModal()
+    );
+
+    if (isLoggedIn && this.state.profileOpen) {
+      this._positionProfilePopover(shell);
+    }
+  }
+
+  _bindContainerEvents(containerEl) {
+    if (!containerEl || typeof containerEl.querySelector !== 'function') return;
+
+    const searchInput = containerEl.querySelector('#desktopSearchInput');
     if (searchInput) {
       searchInput.addEventListener('input', (e) => {
         const val = e.target.value;
         const selStart = e.target.selectionStart;
         this.state.searchQuery = val;
         this.render();
-        const nextInput = document.getElementById('desktopSearchInput');
+        const nextInput =
+          this.rootEl?.querySelector?.('#desktopSearchInput') ||
+          (typeof document !== 'undefined' ? document.getElementById('desktopSearchInput') : null);
         if (nextInput) {
           nextInput.focus();
           try {
@@ -3678,42 +4017,48 @@ class AudiobookApp {
       });
     }
 
-    const coverForm = document.getElementById('coverSearchForm');
+    const coverForm = containerEl.querySelector('#coverSearchForm');
     if (coverForm) {
       coverForm.addEventListener('submit', (e) => {
         e.preventDefault();
-        const input = document.getElementById('coverSearchInput');
+        const input =
+          containerEl.querySelector('#coverSearchInput') ||
+          (typeof document !== 'undefined' ? document.getElementById('coverSearchInput') : null);
         if (input) {
           void this.runCoverSearch(input.value);
         }
       });
     }
 
-    const driveSyncForm = document.getElementById('driveSyncForm');
+    const driveSyncForm = containerEl.querySelector('#driveSyncForm');
     if (driveSyncForm) {
       driveSyncForm.addEventListener('submit', (e) => {
         e.preventDefault();
-        const tokenInput = document.getElementById('driveTokenInput');
-        const folderInput = document.getElementById('driveFolderIdInput');
+        const tokenInput =
+          containerEl.querySelector('#driveTokenInput') ||
+          (typeof document !== 'undefined' ? document.getElementById('driveTokenInput') : null);
+        const folderInput =
+          containerEl.querySelector('#driveFolderIdInput') ||
+          (typeof document !== 'undefined' ? document.getElementById('driveFolderIdInput') : null);
         void this.runGoogleDriveSync(folderInput?.value || '', tokenInput?.value || '');
       });
     }
 
-    const wipeFolderCheckbox = document.getElementById('wipeClearDriveFolderCheckbox');
+    const wipeFolderCheckbox = containerEl.querySelector('#wipeClearDriveFolderCheckbox');
     if (wipeFolderCheckbox) {
       wipeFolderCheckbox.addEventListener('change', (e) => {
         this.state.wipeClearDriveFolder = Boolean(e.target.checked);
       });
     }
 
-    this.rootEl.querySelectorAll('[data-action="seek-range"]').forEach((rangeEl) => {
+    containerEl.querySelectorAll('[data-action="seek-range"]').forEach((rangeEl) => {
       rangeEl.addEventListener('input', (e) => {
         const val = Number(e.target.value || 0);
         this.audioEngine.seekToSeconds(val);
       });
     });
 
-    this.rootEl.querySelectorAll('[data-action]').forEach((el) => {
+    containerEl.querySelectorAll('[data-action]').forEach((el) => {
       const action = el.dataset.action;
       if (
         action === 'seek-range' ||
@@ -3886,6 +4231,7 @@ class AudiobookApp {
             break;
           }
           case 'close-wipe-synced-modal': {
+            if (this.state.wipeInProgress) break;
             this.state.showWipeSyncedModal = false;
             this.state.wipeClearDriveFolder = false;
             this.render();
@@ -3896,6 +4242,10 @@ class AudiobookApp {
             break;
           }
           case 'dismiss-status-toast': {
+            if (this._statusToastTimer) {
+              clearTimeout(this._statusToastTimer);
+              this._statusToastTimer = null;
+            }
             this.state.statusToast = null;
             this.render();
             break;

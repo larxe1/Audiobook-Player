@@ -271,6 +271,145 @@ export function parseSeriesAndOrder(title = '', author = '', series = '', parent
   };
 }
 
+const NON_LATIN_SCRIPT_RE =
+  /[\u0370-\u03FF\u0400-\u052F\u0590-\u05FF\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\u0900-\u0DFF\u0E00-\u0E7F\u10A0-\u10FF\u1100-\u11FF\u3040-\u30FF\u3130-\u318F\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF]/;
+
+const ENGLISH_STOPWORDS = new Set([
+  'the', 'and', 'of', 'to', 'in', 'is', 'with', 'for', 'that', 'from', 'by',
+  'his', 'her', 'their', 'who', 'when', 'which', 'an', 'into', 'about', 'story',
+  'world', 'life', 'after', 'before', 'are', 'have', 'has', 'had', 'this',
+  'these', 'those', 'our', 'your', 'you', 'they', 'she', 'its', 'where',
+  'what', 'why', 'how', 'not', 'would', 'could', 'should', 'there', 'here',
+  'than', 'then', 'only', 'other', 'another', 'between', 'through', 'against',
+  'during', 'without', 'under', 'over',
+]);
+
+// Words in non-English stopword lists that also appear as common English words.
+const ENGLISH_HOMOGRAPH_WORDS = new Set([
+  'son', 'per', 'par', 'plus', 'roman', 'die', 'den', 'as', 'no', 'do',
+]);
+
+const NON_ENGLISH_LANGUAGE_SPECS = [
+  {
+    code: 'es',
+    diacriticRe: /[¿¡ñáéíóúü]/i,
+    strongMarkerRe: /[¿¡ñ]/,
+    words: new Set([
+      'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'del', 'al',
+      'para', 'con', 'por', 'como', 'más', 'pero', 'sus', 'entre', 'sobre',
+      'desde', 'hasta', 'también', 'cuando', 'donde', 'quien', 'mientras',
+      'historia', 'novela', 'edición', 'audiolibro', 'está', 'son', 'fue', 'ser',
+    ]),
+  },
+  {
+    code: 'it',
+    diacriticRe: /[àèéìíîòóùú]/i,
+    strongMarkerRe: null,
+    words: new Set([
+      'il', 'lo', 'la', 'gli', 'le', 'un', 'una', 'uno', 'dei', 'degli',
+      'delle', 'dello', 'della', 'nel', 'nella', 'nell', 'con', 'per', 'che',
+      'non', 'sono', 'anche', 'come', 'più', 'tutto', 'tutti', 'questo',
+      'questa', 'storia', 'romanzo', 'libro', 'edizione', 'tra', 'fra', 'dal', 'dalla',
+    ]),
+  },
+  {
+    code: 'fr',
+    diacriticRe: /[àâæçéèêëîïôœùûüÿ]/i,
+    strongMarkerRe: /[œæ]/i,
+    words: new Set([
+      'le', 'la', 'les', 'des', 'du', 'un', 'une', 'dans', 'avec', 'pour',
+      'par', 'sur', 'qui', 'que', 'est', 'sont', 'cette', 'mais', 'plus',
+      'tout', 'tous', 'histoire', 'roman', 'livre',
+    ]),
+  },
+  {
+    code: 'de',
+    diacriticRe: /[äöüß]/i,
+    strongMarkerRe: /ß/,
+    words: new Set([
+      'der', 'die', 'das', 'den', 'dem', 'des', 'ein', 'eine', 'einer',
+      'und', 'mit', 'für', 'auf', 'ist', 'sind', 'nicht', 'auch', 'von',
+      'zu', 'buch', 'geschichte',
+    ]),
+  },
+  {
+    code: 'pt',
+    diacriticRe: /[ãõçáéíóúâêôà]/i,
+    strongMarkerRe: /[ãõ]/i,
+    words: new Set([
+      'os', 'as', 'um', 'uma', 'uns', 'umas', 'do', 'da', 'dos', 'das',
+      'no', 'na', 'para', 'com', 'por', 'não', 'mais', 'também', 'história', 'livro',
+    ]),
+  },
+];
+
+/**
+ * Returns true when text is likely written in a non-English language (non-Latin
+ * scripts or clear Romance/Germanic stopword dominance). Conservative on short
+ * strings and English prose containing isolated foreign names or loanwords.
+ * @param {string} [text='']
+ * @returns {boolean}
+ */
+export function isLikelyNonEnglishText(text = '') {
+  if (!text || typeof text !== 'string') return false;
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+
+  if (NON_LATIN_SCRIPT_RE.test(trimmed)) return true;
+
+  const words = trimmed.toLowerCase().match(/[\p{L}]+/gu) || [];
+  if (trimmed.length < 15 || words.length < 3) return false;
+
+  let enScore = 0;
+  for (const word of words) {
+    if (ENGLISH_STOPWORDS.has(word)) {
+      enScore += word === 'in' ? 0.5 : 1;
+    }
+  }
+
+  if (enScore === 0 && /[¿¡ß]/.test(trimmed)) {
+    return true;
+  }
+
+  let bestScore = 0;
+  let bestDistinct = 0;
+
+  for (const spec of NON_ENGLISH_LANGUAGE_SPECS) {
+    const matchedTypes = new Set();
+    let score = 0;
+    for (const word of words) {
+      if (spec.words.has(word)) {
+        matchedTypes.add(word);
+        score += ENGLISH_HOMOGRAPH_WORDS.has(word) ? 0.5 : 1;
+      }
+    }
+    if (matchedTypes.size > 0 && spec.diacriticRe.test(trimmed)) {
+      score += 0.5;
+    }
+    if (matchedTypes.size > 0 && spec.strongMarkerRe && spec.strongMarkerRe.test(trimmed)) {
+      score += 0.5;
+    }
+    if (score > bestScore || (score === bestScore && matchedTypes.size > bestDistinct)) {
+      bestScore = score;
+      bestDistinct = matchedTypes.size;
+    }
+  }
+
+  if (bestDistinct < 2 || bestScore < 2) return false;
+  if (enScore === 0) return true;
+  return bestScore > enScore * 1.25;
+}
+
+/**
+ * Returns true when text is non-empty and not detected as non-English.
+ * @param {string} [text='']
+ * @returns {boolean}
+ */
+export function isLikelyEnglishText(text = '') {
+  if (!text || typeof text !== 'string' || !text.trim()) return false;
+  return !isLikelyNonEnglishText(text);
+}
+
 /**
  * Returns true if the cover URL is missing or a Google Drive thumbnail URL that
  * often fails or renders as a black box for audio files.
@@ -289,12 +428,16 @@ export function isDriveThumbnailOrMissingCover(url = '') {
 
 /**
  * Returns true if a book has not yet been automatically enriched and is missing
- * cover art, real author, series order, or meaningful chapter metadata.
+ * cover art, real author, series order, or meaningful chapter metadata, or if
+ * it has a cached non-English description from before enrichment v2.
  * @param {object} book
  * @returns {boolean}
  */
 export function needsAutomatedEnrichment(book) {
   if (!book || typeof book !== 'object') return false;
+  if (Number(book.enrichmentVersion || 0) < 2 && isLikelyNonEnglishText(book.description || '')) {
+    return true;
+  }
   if (book.enrichmentCheckedAt) return false;
   if (isDriveThumbnailOrMissingCover(book.coverUrl)) return true;
   const author = String(book.author || '').trim();
@@ -1184,17 +1327,77 @@ function cleanSearchTitleForLookup(title = '') {
     .trim();
 }
 
-function pickBestHit(items, getTitle, targetTitle) {
+function isEnglishLanguageTag(tag = '') {
+  const norm = String(tag || '').trim().toLowerCase();
+  if (!norm) return false;
+  return (
+    norm === 'en' ||
+    norm === 'eng' ||
+    norm === 'english' ||
+    norm.startsWith('en-') ||
+    norm.startsWith('en_')
+  );
+}
+
+function classifyHitLanguage(item, getLanguages, getTextParts) {
+  const rawLangs = typeof getLanguages === 'function' ? getLanguages(item) : [];
+  const langs = (Array.isArray(rawLangs) ? rawLangs : [rawLangs])
+    .map((l) => String(l || '').trim().toLowerCase())
+    .filter(Boolean);
+
+  const hasEnglishLang = langs.some(isEnglishLanguageTag);
+  const hasNonEnglishLang = langs.some((l) => !isEnglishLanguageTag(l));
+
+  if (hasNonEnglishLang && !hasEnglishLang) {
+    return { rejected: true, hasEnglishLang: false, hasNonEnglishLang: true };
+  }
+
+  const rawTexts = typeof getTextParts === 'function' ? getTextParts(item) : [];
+  const texts = (Array.isArray(rawTexts) ? rawTexts : [rawTexts]).filter(
+    (t) => typeof t === 'string' && t.trim(),
+  );
+  if (texts.some((t) => isLikelyNonEnglishText(t))) {
+    return { rejected: true, hasEnglishLang, hasNonEnglishLang: true };
+  }
+
+  return { rejected: false, hasEnglishLang, hasNonEnglishLang };
+}
+
+function pickBestHit(items, getTitle, targetTitle, options = {}) {
   if (!Array.isArray(items) || items.length === 0) return null;
   const normTarget = normalizeMatchText(targetTitle);
-  if (!normTarget) return items[0];
-  const exact = items.find((item) => normalizeMatchText(getTitle(item)) === normTarget);
-  if (exact) return exact;
-  const partial = items.find((item) => {
-    const cand = normalizeMatchText(getTitle(item));
-    return cand && (cand.includes(normTarget) || normTarget.includes(cand));
-  });
-  return partial || items[0];
+  const { getLanguages, getTextParts } = options;
+
+  let bestItem = null;
+  let bestScore = -Infinity;
+
+  for (const item of items) {
+    const langInfo = classifyHitLanguage(
+      item,
+      getLanguages,
+      getTextParts || ((cand) => [getTitle(cand)]),
+    );
+    if (langInfo.rejected) continue;
+
+    let score = 0;
+    if (normTarget) {
+      const cand = normalizeMatchText(getTitle(item));
+      if (cand === normTarget) {
+        score += 100;
+      } else if (cand && (cand.includes(normTarget) || normTarget.includes(cand))) {
+        score += 50;
+      }
+    }
+    if (langInfo.hasEnglishLang) score += 20;
+    if (!langInfo.hasNonEnglishLang) score += 5;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestItem = item;
+    }
+  }
+
+  return bestItem;
 }
 
 function parseNumericSeriesPosition(pos) {
@@ -1267,14 +1470,14 @@ export async function enrichBookMetadata(book = {}, fetchImplOrOptions = globalT
     return normalized;
   }
 
-  const itunesUrl = `https://itunes.apple.com/search?media=audiobook&limit=5&term=${encodeURIComponent(query)}`;
+  const itunesUrl = `https://itunes.apple.com/search?media=audiobook&limit=5&term=${encodeURIComponent(query)}&country=US&lang=en_us`;
   const openLibUrl = searchTitle
     ? `https://openlibrary.org/search.json?title=${encodeURIComponent(searchTitle)}${searchAuthor ? `&author=${encodeURIComponent(searchAuthor)}` : ''}&limit=5`
     : `https://openlibrary.org/search.json?q=${encodeURIComponent(query)}&limit=5`;
   const audnexusUrl = book.asin
     ? `https://api.audnex.us/books/${encodeURIComponent(book.asin)}`
-    : `https://api.audnex.us/books?title=${encodeURIComponent(searchTitle || query)}${searchAuthor ? `&author=${encodeURIComponent(searchAuthor)}` : ''}`;
-  const googleBooksUrl = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(query)}&maxResults=5`;
+    : `https://api.audnex.us/books?title=${encodeURIComponent(searchTitle || query)}${searchAuthor ? `&author=${encodeURIComponent(searchAuthor)}` : ''}&region=us`;
+  const googleBooksUrl = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(query)}&maxResults=5&langRestrict=en`;
 
   const [itunesRes, audnexusRes, openLibRes, googleBooksRes] = await Promise.allSettled([
     safeFetchJson(itunesUrl, fetchImpl),
@@ -1292,14 +1495,47 @@ export async function enrichBookMetadata(book = {}, fetchImplOrOptions = globalT
     itunesData?.results,
     (item) => item?.collectionName || item?.trackName || '',
     searchTitle,
+    {
+      getLanguages: (item) => (item?.language ? [item.language] : []),
+      getTextParts: (item) => [
+        item?.collectionName,
+        item?.trackName,
+        stripHtml(item?.description || ''),
+      ],
+    },
   );
   const audnexusList = Array.isArray(audnexusData) ? audnexusData : audnexusData ? [audnexusData] : [];
-  const audnexusHit = pickBestHit(audnexusList, (item) => item?.title || '', searchTitle);
-  const openLibHit = pickBestHit(openLibData?.docs, (item) => item?.title || '', searchTitle);
+  const audnexusHit = pickBestHit(audnexusList, (item) => item?.title || '', searchTitle, {
+    getLanguages: (item) => (item?.language ? [item.language] : []),
+    getTextParts: (item) => [
+      item?.title,
+      item?.subtitle,
+      stripHtml(item?.summary || item?.description || ''),
+    ],
+  });
+  const openLibHit = pickBestHit(openLibData?.docs, (item) => item?.title || '', searchTitle, {
+    getLanguages: (item) => (Array.isArray(item?.language) ? item.language : item?.language ? [item.language] : []),
+    getTextParts: (item) => [
+      item?.title,
+      ...(Array.isArray(item?.first_sentence)
+        ? item.first_sentence
+        : typeof item?.first_sentence === 'string'
+          ? [item.first_sentence]
+          : []),
+    ],
+  });
   const googleHit = pickBestHit(
     googleBooksData?.items,
     (item) => item?.volumeInfo?.title || '',
     searchTitle,
+    {
+      getLanguages: (item) => (item?.volumeInfo?.language ? [item.volumeInfo.language] : []),
+      getTextParts: (item) => [
+        item?.volumeInfo?.title,
+        item?.volumeInfo?.subtitle,
+        stripHtml(item?.volumeInfo?.description || ''),
+      ],
+    },
   );
 
   const audnexusNarrator = Array.isArray(audnexusHit?.narrators)
@@ -1311,6 +1547,7 @@ export async function enrichBookMetadata(book = {}, fetchImplOrOptions = globalT
   const audnexusDurationSec = audnexusHit?.runtimeLengthMin
     ? Math.round(Number(audnexusHit.runtimeLengthMin) * 60)
     : Number(audnexusHit?.totalDurationSec || 0);
+  const audnexusDescription = stripHtml(audnexusHit?.summary || audnexusHit?.description || '');
 
   const itunesDurationSec = itunesHit?.trackTimeMillis
     ? Math.round(Number(itunesHit.trackTimeMillis) / 1000)
@@ -1319,7 +1556,7 @@ export async function enrichBookMetadata(book = {}, fetchImplOrOptions = globalT
 
   // Attempt to extract "narrated by X" from description if narrator still missing
   let inferredNarrator = '';
-  if (!normalized.narrator && !audnexusNarrator && itunesDescription) {
+  if (!normalized.narrator && !audnexusNarrator && itunesDescription && !isLikelyNonEnglishText(itunesDescription)) {
     const narrMatch = itunesDescription.match(/narrated by\s+([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3})/);
     if (narrMatch) inferredNarrator = narrMatch[1].trim();
   }
@@ -1340,8 +1577,12 @@ export async function enrichBookMetadata(book = {}, fetchImplOrOptions = globalT
       ? openLibHit.first_sentence
       : '';
 
-  // Series & numeric seriesOrder resolution
-  const audnexusSeriesName = audnexusHit?.seriesPrimary?.name || '';
+  // Series & numeric seriesOrder resolution (skip non-English series hints)
+  const rawAudnexusSeriesName = audnexusHit?.seriesPrimary?.name || '';
+  const audnexusSeriesName =
+    rawAudnexusSeriesName && !isLikelyNonEnglishText(rawAudnexusSeriesName)
+      ? rawAudnexusSeriesName
+      : '';
   const audnexusSeriesOrder = parseNumericSeriesPosition(audnexusHit?.seriesPrimary?.position);
 
   const remoteTitleHints = [
@@ -1349,7 +1590,7 @@ export async function enrichBookMetadata(book = {}, fetchImplOrOptions = globalT
     googleInfo?.title && googleInfo?.subtitle ? `${googleInfo.title}: ${googleInfo.subtitle}` : googleInfo?.title,
     googleInfo?.subtitle,
     openLibHit?.title,
-  ].filter(Boolean);
+  ].filter((hint) => hint && !isLikelyNonEnglishText(hint));
 
   let remoteSeries = audnexusSeriesName || '';
   let remoteSeriesOrder = audnexusSeriesOrder;
@@ -1361,6 +1602,19 @@ export async function enrichBookMetadata(book = {}, fetchImplOrOptions = globalT
       remoteSeriesOrder = hintParsed.seriesOrder;
     }
   }
+
+  const englishOnlineDescription =
+    [audnexusDescription, itunesDescription, googleDescription, openLibDescription].find(
+      (desc) => desc && !isLikelyNonEnglishText(desc),
+    ) || '';
+  const existingDescription = String(normalized.description || '').trim();
+  const hasNonEnglishExistingDesc = Boolean(
+    existingDescription && isLikelyNonEnglishText(existingDescription),
+  );
+  const resolvedDescription =
+    existingDescription && !hasNonEnglishExistingDesc
+      ? normalized.description
+      : englishOnlineDescription || (hasNonEnglishExistingDesc ? normalized.description : '');
 
   const resolvedAuthor = authorIsInvalid
     ? (audnexusAuthor || itunesHit?.artistName || googleAuthor || openLibAuthor || parsedLocal.inferredAuthor || currentAuthor || '')
@@ -1424,13 +1678,7 @@ export async function enrichBookMetadata(book = {}, fetchImplOrOptions = globalT
     ...(matchedAsin ? { asin: matchedAsin } : {}),
     author: resolvedAuthor,
     narrator: normalized.narrator || audnexusNarrator || inferredNarrator || '',
-    description:
-      normalized.description ||
-      stripHtml(audnexusHit?.summary || audnexusHit?.description || '') ||
-      itunesDescription ||
-      googleDescription ||
-      openLibDescription ||
-      '',
+    description: resolvedDescription,
     totalDurationSec: resolvedDurationSec,
     coverUrl: resolvedCover,
     series: normalized.series || remoteSeries || '',
@@ -1445,5 +1693,6 @@ export async function enrichBookMetadata(book = {}, fetchImplOrOptions = globalT
       googleYear ||
       (openLibHit?.first_publish_year ? String(openLibHit.first_publish_year) : ''),
     enrichmentCheckedAt: new Date().toISOString(),
+    enrichmentVersion: 2,
   };
 }

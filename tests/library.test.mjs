@@ -15,6 +15,8 @@ import {
   normalizeBookChapters,
   normalizeBookSeriesAndChapters,
   isDriveThumbnailOrMissingCover,
+  isLikelyNonEnglishText,
+  isLikelyEnglishText,
   needsAutomatedEnrichment,
   enrichBookMetadata,
 } from '../src/services/metadata-enrichment.js';
@@ -946,4 +948,249 @@ test('SupabaseSyncService deleteLibraryItems deletes keys and syncLibraryItems/f
   assert.ok(delReq);
   assert.match(delReq.url, /audiobook_library_items\?user_id=eq\.user-123&book_key=in\./);
   client.destroy();
+});
+
+test('isLikelyNonEnglishText detects Spanish, Italian, French, German, Portuguese, and non-Latin scripts without false-flagging English prose', () => {
+  // Positive cases: Romance & Germanic languages
+  assert.equal(
+    isLikelyNonEnglishText(
+      'En esta apasionante novela, el protagonista viaja por el universo para salvar la Tierra antes de que sea demasiado tarde.',
+    ),
+    true,
+  );
+  assert.equal(
+    isLikelyNonEnglishText(
+      'Un romanzo straordinario che racconta la storia di un uomo solo nello spazio, tra misteri e scoperte per il futuro.',
+    ),
+    true,
+  );
+  assert.equal(
+    isLikelyNonEnglishText(
+      'Dans ce roman captivant, le héros traverse les étoiles avec une équipe qui lutte pour sa survie dans un monde hostile.',
+    ),
+    true,
+  );
+  assert.equal(
+    isLikelyNonEnglishText(
+      'Ein fesselnder Roman über einen Astronauten, der allein im All aufwacht und mit Mut und Verstand um sein Überleben kämpft.',
+    ),
+    true,
+  );
+  assert.equal(
+    isLikelyNonEnglishText(
+      'Um livro envolvente sobre um astronauta que acorda sozinho no espaço e precisa lutar para salvar a humanidade com ajuda de um amigo.',
+    ),
+    true,
+  );
+
+  // Positive cases: Non-Latin scripts (even when short)
+  assert.equal(isLikelyNonEnglishText('三体'), true);
+  assert.equal(isLikelyNonEnglishText('Дюна'), true);
+  assert.equal(isLikelyNonEnglishText('العربية'), true);
+  assert.equal(isLikelyNonEnglishText('한국어'), true);
+
+  // Negative cases: Empty, short, and English prose with foreign names or loanwords
+  assert.equal(isLikelyNonEnglishText(''), false);
+  assert.equal(isLikelyNonEnglishText('Dune'), false);
+  assert.equal(isLikelyNonEnglishText('El Camino'), false);
+  assert.equal(isLikelyNonEnglishText('Las Vegas Nights'), false);
+  assert.equal(
+    isLikelyNonEnglishText(
+      'In 1984, José Arcadio Buendía and his family build the town of Macondo in a story about life, love, and solitude.',
+    ),
+    false,
+  );
+  assert.equal(
+    isLikelyNonEnglishText(
+      'Set in a Paris café, Clara and her fiancé uncover a secret from before the war while Jean-Luc watches from the street.',
+    ),
+    false,
+  );
+  assert.equal(
+    isLikelyNonEnglishText(
+      'The story follows Don Quixote de la Mancha and his loyal squire Sancho Panza across the countryside.',
+    ),
+    false,
+  );
+  assert.equal(
+    isLikelyNonEnglishText(
+      'Do as you wish, no regrets, for life is short and this world rewards the bold.',
+    ),
+    false,
+  );
+
+  assert.equal(isLikelyEnglishText('A gripping story about survival on Mars.'), true);
+  assert.equal(isLikelyEnglishText(''), false);
+});
+
+test('enrichBookMetadata requests English params, rejects Spanish/Italian hits, and upgrades cached non-English descriptions', async () => {
+  const seenUrls = [];
+  const spanishSummary =
+    'Un astronauta despierta solo en una nave espacial sin recordar su misión y debe salvar la Tierra.';
+  const italianSummary =
+    'Un astronauta si risveglia solo nello spazio senza ricordare la sua missione e deve salvare la Terra.';
+  const englishSummary =
+    'Ryland Grace is the sole survivor on a desperate, last-chance mission to save humanity and Earth.';
+
+  const mockFetch = async (url) => {
+    seenUrls.push(url);
+    if (url.includes('itunes.apple.com')) {
+      return {
+        ok: true,
+        json: async () => ({
+          results: [
+            {
+              collectionName: 'Proyecto Hail Mary (Edición en Español)',
+              artistName: 'Andy Weir',
+              description: spanishSummary,
+            },
+            {
+              collectionName: 'Project Hail Mary',
+              artistName: 'Andy Weir',
+              description: `<p>${englishSummary}</p>`,
+              artworkUrl100: 'https://is1-ssl.mzstatic.com/image/thumb/100x100bb.jpg',
+            },
+          ],
+        }),
+      };
+    }
+    if (url.includes('api.audnex.us/books?')) {
+      return {
+        ok: true,
+        json: async () => [
+          {
+            asin: 'B0SPANISH1',
+            title: 'Project Hail Mary',
+            language: 'spanish',
+            authors: [{ name: 'Andy Weir' }],
+            narrators: [{ name: 'Narrador Español' }],
+            seriesPrimary: { name: 'La Serie Espacial', position: '1' },
+            summary: spanishSummary,
+          },
+          {
+            asin: 'B0ENGLISH1',
+            title: 'Project Hail Mary',
+            language: 'english',
+            authors: [{ name: 'Andy Weir' }],
+            narrators: [{ name: 'Ray Porter' }],
+            runtimeLengthMin: 970,
+            summary: englishSummary,
+          },
+        ],
+      };
+    }
+    if (url.includes('googleapis.com/books')) {
+      return {
+        ok: true,
+        json: async () => ({
+          items: [
+            {
+              volumeInfo: {
+                title: 'Project Hail Mary',
+                language: 'it',
+                authors: ['Andy Weir'],
+                description: italianSummary,
+              },
+            },
+            {
+              volumeInfo: {
+                title: 'Project Hail Mary',
+                language: 'en',
+                authors: ['Andy Weir'],
+                description: englishSummary,
+              },
+            },
+          ],
+        }),
+      };
+    }
+    if (url.includes('openlibrary.org')) {
+      return {
+        ok: true,
+        json: async () => ({
+          docs: [
+            { title: 'Project Hail Mary', language: ['ita'], cover_i: 111111, first_sentence: [italianSummary] },
+            { title: 'Project Hail Mary', language: ['eng'], cover_i: 222222, first_sentence: ['I woke up alone.'] },
+          ],
+        }),
+      };
+    }
+    return { ok: false };
+  };
+
+  // Book with previously-cached Spanish description and old enrichmentCheckedAt
+  const staleBook = {
+    title: 'Project Hail Mary',
+    author: 'Andy Weir',
+    description: spanishSummary,
+    coverUrl: 'https://is1-ssl.mzstatic.com/image/thumb/600x600bb.jpg',
+    seriesOrder: 1,
+    chapters: [{ index: 0, title: 'Chapter 1: Wake Up', startSec: 0 }],
+    enrichmentCheckedAt: '2025-12-01T00:00:00Z',
+  };
+
+  assert.equal(needsAutomatedEnrichment(staleBook), true);
+
+  const enriched = await enrichBookMetadata(staleBook, mockFetch);
+
+  // Verify English query params on outbound requests
+  assert.ok(seenUrls.some((u) => u.includes('itunes.apple.com') && u.includes('country=US') && u.includes('lang=en_us')));
+  assert.ok(seenUrls.some((u) => u.includes('api.audnex.us/books?') && u.includes('region=us')));
+  assert.ok(seenUrls.some((u) => u.includes('googleapis.com/books') && u.includes('langRestrict=en')));
+
+  // Verify English hit won over Spanish/Italian hits
+  assert.equal(enriched.asin, 'B0ENGLISH1');
+  assert.equal(enriched.narrator, 'Ray Porter');
+  assert.equal(enriched.description, englishSummary);
+  assert.equal(enriched.series, '');
+  assert.equal(enriched.enrichmentVersion, 2);
+
+  // Once upgraded to enrichmentVersion 2, needsAutomatedEnrichment returns false
+  assert.equal(needsAutomatedEnrichment(enriched), false);
+  assert.equal(
+    needsAutomatedEnrichment({
+      ...staleBook,
+      enrichmentVersion: 2,
+    }),
+    false,
+  );
+});
+
+test('enrichBookMetadata never falls back to Spanish/Italian description when no English description exists', async () => {
+  const onlyNonEnglishFetch = async (url) => {
+    if (url.includes('itunes.apple.com')) {
+      return {
+        ok: true,
+        json: async () => ({
+          results: [
+            {
+              collectionName: 'Dune',
+              artistName: 'Frank Herbert',
+              description:
+                'En el planeta desértico Arrakis, la historia sigue al joven Paul Atreides y su familia en una lucha por la supervivencia.',
+            },
+          ],
+        }),
+      };
+    }
+    if (url.includes('api.audnex.us/books?')) {
+      return {
+        ok: true,
+        json: async () => [
+          {
+            asin: 'B0ONLYES',
+            title: 'Dune',
+            language: 'spanish',
+            summary: 'La novela clásica de ciencia ficción en español sobre el planeta Arrakis.',
+          },
+        ],
+      };
+    }
+    return { ok: false };
+  };
+
+  const enrichedNoDesc = await enrichBookMetadata({ title: 'Dune', author: 'Frank Herbert' }, onlyNonEnglishFetch);
+  assert.equal(enrichedNoDesc.description, '');
+  assert.equal(enrichedNoDesc.asin, undefined);
+  assert.equal(enrichedNoDesc.enrichmentVersion, 2);
 });

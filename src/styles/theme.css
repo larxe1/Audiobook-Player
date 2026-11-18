@@ -211,6 +211,12 @@ body {
   animation: popoverScaleIn 220ms var(--ease-spring) both;
 }
 
+.sheet-modal.no-enter-anim,
+.notif-shade.no-enter-anim,
+.popover-menu.no-enter-anim {
+  animation: none !important;
+}
+
 /* Strict 2-Line Clamping & Text Containment */
 .clamp-2 {
   display: -webkit-box;
