@@ -1,0 +1,137 @@
+name: Deploy PWA & Release Android APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy-pages:
+    name: Deploy Web / PWA to GitHub Pages
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Stage static PWA site
+        run: |
+          mkdir -p _site
+          cp index.html version.json _site/
+          cp -r public src _site/
+          touch _site/.nojekyll
+
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  build-android-release:
+    name: Build & Release Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if version.json changed
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -qx "version.json"; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
+        if: steps.changes.outputs.should_build == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup Java 21
+        if: steps.changes.outputs.should_build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Run unit tests
+        if: steps.changes.outputs.should_build == 'true'
+        run: npm test
+
+      - name: Prepare Capacitor Android project
+        if: steps.changes.outputs.should_build == 'true'
+        run: |
+          mkdir -p dist
+          cp index.html version.json dist/
+          cp -r public src dist/
+          node -e "const fs=require('fs');const c=JSON.parse(fs.readFileSync('capacitor.config.json','utf8'));c.webDir='dist';fs.writeFileSync('capacitor.config.json',JSON.stringify(c,null,2));"
+          npm install --no-save @capacitor/core @capacitor/cli @capacitor/android
+          npx cap add android
+          node -e "const fs=require('fs');const p='android/app/src/main/AndroidManifest.xml';let xml=fs.readFileSync(p,'utf8');const perms=['android.permission.WAKE_LOCK','android.permission.FOREGROUND_SERVICE','android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK','android.permission.POST_NOTIFICATIONS','android.permission.REQUEST_INSTALL_PACKAGES'];const add=perms.filter(n=>!xml.includes(n)).map(n=>'    <uses-permission android:name=\"'+n+'\" />').join('\n');if(add){xml=xml.replace('<application',add+'\n\n    <application');fs.writeFileSync(p,xml);}"
+          npx cap sync android
+
+      - name: Build debug-signed APK
+        if: steps.changes.outputs.should_build == 'true'
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+          cd ..
+          cp android/app/build/outputs/apk/debug/app-debug.apk Audiobook-Player.apk
+
+      - name: Read release metadata from version.json
+        if: steps.changes.outputs.should_build == 'true'
+        id: meta
+        run: |
+          node -e "const fs=require('fs');const v=JSON.parse(fs.readFileSync('version.json','utf8'));fs.appendFileSync(process.env.GITHUB_OUTPUT,'version='+v.version+'\nnotes='+(v.releaseNotes||'Audiobook Player release')+'\n');"
+
+      - name: Upload APK workflow artifact
+        if: steps.changes.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Audiobook-Player-apk
+          path: Audiobook-Player.apk
+
+      - name: Publish GitHub Release with Audiobook-Player.apk
+        if: steps.changes.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.meta.outputs.version }}
+          name: Audiobook Player v${{ steps.meta.outputs.version }}
+          body: ${{ steps.meta.outputs.notes }}
+          files: Audiobook-Player.apk
+          make_latest: true

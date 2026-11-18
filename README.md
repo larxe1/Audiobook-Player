@@ -1,0 +1,50 @@
+# Audiobook-Player
+
+Cross-platform audiobook player with a Spotify-inspired dark interface, Google Drive streaming, local folder deduplication, and automatic self-updates wired to `https://github.com/larxe1/Audiobook-Player`.
+
+## Features
+
+- **Midnight Black & Pitch Black Themes**: Defaults to Midnight Black (`#060911`) with an instant switch to Pitch Black (`#050506`) for OLED displays.
+- **Google Drive + Local Folder Deduplication**: Combines cloud audiobooks from Google Drive with local device folders into a single unified library without duplicate entries.
+- **Android Notification Shade Mini-Player**: MediaSession-backed lock screen and notification shade playback controls (`-15s`, Play/Pause, `+30s`).
+- **Samsung Galaxy Watch (Wear OS) Circular Controller**: Dedicated 270×270 circular watch controller preview and companion media controls with ambient cover backdrop.
+- **Conditional Android Auto Car Mode**: Automatically surfaces a driver-friendly Car Mode interface when Android Auto / automotive playback is active, and stays hidden when disconnected.
+- **Cover Image Search**: Search and apply crisp audiobook artwork online or pick a local image file.
+- **Automatic Self-Updater**: Checks `version.json` on GitHub (`raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json`), triggers direct `.apk` downloads from GitHub Releases on Android, and applies Service Worker OTA updates seamlessly on Desktop/PWA.
+
+## Installation
+
+### Android
+
+Choose either option:
+
+1. **Install Native Android APK (Recommended for Android + Self-Updates)**
+   - Download the latest [`Audiobook-Player.apk`](https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk) from **GitHub Releases**.
+   - Open the `.apk` on your Android phone and allow installation from your browser/files app when prompted.
+   - Future releases update directly inside the app via **Profile → Update**.
+
+2. **Install as a Progressive Web App (PWA)**
+   - Open [`https://larxe1.github.io/Audiobook-Player/`](https://larxe1.github.io/Audiobook-Player/) in Chrome on Android.
+   - Tap the browser menu (`⋮`) → **Install app** (or **Add to Home screen**).
+
+### Windows PC
+
+Choose either option:
+
+1. **One-Click Desktop App Launcher (`Launch-Audiobook-Player.bat`)**
+   - Ensure [Node.js](https://nodejs.org/) (v18+) is installed.
+   - Double-click `Launch-Audiobook-Player.bat` in the repository root.
+   - It starts the local server on `http://127.0.0.1:4173` (if not already running) and opens Microsoft Edge or Google Chrome in standalone borderless app mode (`--app=http://127.0.0.1:4173`).
+
+2. **Install via Edge / Chrome (GitHub Pages or Local Server)**
+   - Open [`https://larxe1.github.io/Audiobook-Player/`](https://larxe1.github.io/Audiobook-Player/) (or `http://127.0.0.1:4173`) in Microsoft Edge or Google Chrome.
+   - Click the **Install Audiobook Player** icon in the address bar (or browser menu → **Apps → Install this site as an app**).
+
+## Development & Releases
+
+- Run unit tests:
+  ```bash
+  npm test
+  ```
+- Pushing changes to `main` automatically deploys the web/PWA build to GitHub Pages.
+- Updating `version.json` on `main` (or triggering the workflow manually via **Actions → workflow_dispatch**) builds `Audiobook-Player.apk` with Capacitor Android and attaches it to the GitHub Release.

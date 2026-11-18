@@ -1,5 +1,11 @@
 export const LOCAL_VERSION = '1.0.0';
 
+export const DEFAULT_MANIFEST_URL =
+  'https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json';
+export const DEFAULT_APK_DOWNLOAD_URL =
+  'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk';
+export const DEFAULT_OTA_BUNDLE_URL = 'https://larxe1.github.io/Audiobook-Player/';
+
 const STORAGE_UPDATE_URL_KEY = 'audiobook_remote_version_url';
 
 /**
@@ -42,11 +48,16 @@ export function compareSemver(vA, vB) {
 /**
  * Normalize either a direct version.json manifest or a GitHub Releases API payload.
  * @param {Record<string, any>} payload
+ * @param {{ manifestUrl?: string, apkDownloadUrl?: string, otaBundleUrl?: string }} [defaults]
  */
-function normalizeManifest(payload) {
+function normalizeManifest(payload, defaults = {}) {
   if (!payload || typeof payload !== 'object') {
     return null;
   }
+
+  const defaultManifestUrl = defaults.manifestUrl || DEFAULT_MANIFEST_URL;
+  const defaultApkUrl = defaults.apkDownloadUrl || DEFAULT_APK_DOWNLOAD_URL;
+  const defaultOtaUrl = defaults.otaBundleUrl || DEFAULT_OTA_BUNDLE_URL;
 
   // GitHub Releases API shape
   if (typeof payload.tag_name === 'string') {
@@ -63,9 +74,10 @@ function normalizeManifest(payload) {
       build: Number(payload.id) || 1,
       channel: payload.prerelease ? 'beta' : 'stable',
       publishedAt: payload.published_at || '',
-      apkDownloadUrl: apkAsset?.browser_download_url || '',
+      manifestUrl: defaultManifestUrl,
+      apkDownloadUrl: apkAsset?.browser_download_url || defaultApkUrl,
       exeDownloadUrl: exeAsset?.browser_download_url || '',
-      otaBundleUrl: otaAsset?.browser_download_url || '',
+      otaBundleUrl: otaAsset?.browser_download_url || defaultOtaUrl,
       releaseNotes: payload.body || payload.name || ''
     };
   }
@@ -76,9 +88,10 @@ function normalizeManifest(payload) {
       build: Number(payload.build) || 1,
       channel: payload.channel || 'stable',
       publishedAt: payload.publishedAt || '',
-      apkDownloadUrl: payload.apkDownloadUrl || '',
+      manifestUrl: payload.manifestUrl || defaultManifestUrl,
+      apkDownloadUrl: payload.apkDownloadUrl ?? defaultApkUrl,
       exeDownloadUrl: payload.exeDownloadUrl || '',
-      otaBundleUrl: payload.otaBundleUrl || '',
+      otaBundleUrl: payload.otaBundleUrl ?? defaultOtaUrl,
       releaseNotes: payload.releaseNotes || ''
     };
   }
@@ -90,17 +103,24 @@ export class SelfUpdaterService {
   /**
    * @param {Object} [options]
    * @param {string} [options.currentVersion]
+   * @param {string} [options.manifestUrl]
    * @param {string} [options.remoteVersionUrl]
+   * @param {string} [options.apkDownloadUrl]
+   * @param {string} [options.otaBundleUrl]
    * @param {string} [options.localVersionUrl]
    * @param {Storage} [options.storage]
    */
   constructor(options = {}) {
     this.currentVersion = options.currentVersion || LOCAL_VERSION;
     this.storage = options.storage ?? (typeof globalThis.localStorage !== 'undefined' ? globalThis.localStorage : null);
-    this.remoteVersionUrl =
+    this.manifestUrl =
+      options.manifestUrl ||
       options.remoteVersionUrl ||
       this.storage?.getItem?.(STORAGE_UPDATE_URL_KEY) ||
-      '';
+      DEFAULT_MANIFEST_URL;
+    this.remoteVersionUrl = this.manifestUrl;
+    this.apkDownloadUrl = options.apkDownloadUrl || DEFAULT_APK_DOWNLOAD_URL;
+    this.otaBundleUrl = options.otaBundleUrl || DEFAULT_OTA_BUNDLE_URL;
     this.localVersionUrl = options.localVersionUrl || './version.json';
     this.lastManifest = null;
   }
@@ -110,10 +130,12 @@ export class SelfUpdaterService {
    * @param {string} url
    */
   setRemoteVersionUrl(url) {
-    this.remoteVersionUrl = String(url || '').trim();
+    const cleaned = String(url || '').trim();
+    this.manifestUrl = cleaned || DEFAULT_MANIFEST_URL;
+    this.remoteVersionUrl = this.manifestUrl;
     if (this.storage?.setItem) {
-      if (this.remoteVersionUrl) {
-        this.storage.setItem(STORAGE_UPDATE_URL_KEY, this.remoteVersionUrl);
+      if (cleaned) {
+        this.storage.setItem(STORAGE_UPDATE_URL_KEY, cleaned);
       } else {
         this.storage.removeItem?.(STORAGE_UPDATE_URL_KEY);
       }
@@ -131,7 +153,11 @@ export class SelfUpdaterService {
       const response = await fetchImpl(url, { cache: 'no-store' });
       if (!response || !response.ok) return null;
       const data = await response.json();
-      return normalizeManifest(data);
+      return normalizeManifest(data, {
+        manifestUrl: this.manifestUrl,
+        apkDownloadUrl: this.apkDownloadUrl,
+        otaBundleUrl: this.otaBundleUrl
+      });
     } catch {
       return null;
     }
@@ -242,7 +268,9 @@ export class SelfUpdaterService {
 
     const url = isWindows
       ? manifest?.exeDownloadUrl || manifest?.otaBundleUrl || ''
-      : manifest?.apkDownloadUrl || manifest?.otaBundleUrl || '';
+      : manifest
+        ? manifest.apkDownloadUrl || manifest.otaBundleUrl || ''
+        : this.apkDownloadUrl || this.otaBundleUrl || '';
 
     if (!url) {
       return {

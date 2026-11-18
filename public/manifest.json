@@ -2,16 +2,16 @@
   "name": "Audiobook Player",
   "short_name": "Audiobook",
   "description": "Personal cross-platform audiobook player with Google Drive streaming, local folder deduplication, and seamless device handoff.",
-  "start_url": "/",
-  "scope": "/",
+  "start_url": "./index.html",
+  "scope": "./",
   "display": "standalone",
   "orientation": "any",
   "background_color": "#060911",
   "theme_color": "#1ed760",
   "icons": [
     {
-      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='112' fill='%23060911'/%3E%3Ccircle cx='256' cy='256' r='164' fill='%231ed760'/%3E%3Cpath d='M214 176l136 80-136 80V176z' fill='%23060911'/%3E%3C/svg%3E",
-      "sizes": "192x192 512x512",
+      "src": "./icon.svg",
+      "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "any maskable"
     }

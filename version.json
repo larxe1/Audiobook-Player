@@ -3,8 +3,9 @@
   "build": 1,
   "channel": "stable",
   "publishedAt": "2026-11-18T00:00:00Z",
-  "apkDownloadUrl": "",
+  "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
+  "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "",
-  "otaBundleUrl": "",
+  "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
   "releaseNotes": "Initial release of Audiobook Player"
 }
