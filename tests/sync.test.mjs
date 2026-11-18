@@ -737,3 +737,105 @@ test('SupabaseSyncService Capacitor Android uses popup rather than replacing Web
   assert.equal(fakeWindow.location.assignedUrl, null);
   sync.destroy();
 });
+
+test('SupabaseSyncService Tauri native OAuth popup invokes desktop commands and hydrates Gmail profile', async () => {
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://tauri.localhost';
+  const invokeCalls = [];
+  let pollCount = 0;
+  fakeWindow.__TAURI_INTERNALS__ = {
+    invoke: async (cmd) => {
+      invokeCalls.push(cmd);
+      if (cmd === 'desktop_start_google_oauth') {
+        return { status: 'pending', accessToken: null };
+      }
+      if (cmd === 'desktop_poll_google_oauth') {
+        pollCount++;
+        if (pollCount >= 1) {
+          return { status: 'success', accessToken: 'ya29.tauri_native_popup_token' };
+        }
+        return { status: 'pending', accessToken: null };
+      }
+      return true;
+    }
+  };
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true, userAgent: 'Windows NT 10.0' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.endsWith('/auth/v1/settings')) {
+        return { ok: true, status: 200, async json() { return { external: { google: false } }; } };
+      }
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              sub: '9988',
+              email: 'reader@gmail.com',
+              name: 'Reader User',
+              picture: 'https://lh3.googleusercontent.com/avatar.jpg'
+            };
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const res = await sync.signInWithGoogle({ autoRedirect: true, fallbackToDirectGoogleOAuth: true });
+  assert.equal(res.ok, true);
+  assert.ok(invokeCalls.includes('desktop_start_google_oauth'));
+  assert.ok(invokeCalls.includes('desktop_poll_google_oauth'));
+  assert.equal(sync.getUserProfile().email, 'reader@gmail.com');
+  assert.equal(sync.getGoogleAccessToken(), 'ya29.tauri_native_popup_token');
+  sync.destroy();
+});
+
+test('SupabaseSyncService Android native OAuth bridge hydrates Gmail profile on Capacitor', async () => {
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://localhost';
+  fakeWindow.Capacitor = { isNativePlatform: () => true };
+  fakeWindow.__ANDROID_GOOGLE_OAUTH__ = async () => ({
+    access_token: 'ya29.android_native_popup_token'
+  });
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.endsWith('/auth/v1/settings')) {
+        return { ok: true, status: 200, async json() { return { external: { google: false } }; } };
+      }
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              sub: '7766',
+              email: 'driver@gmail.com',
+              name: 'Driver User',
+              picture: 'https://lh3.googleusercontent.com/driver.jpg'
+            };
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const res = await sync.signInWithGoogle({ autoRedirect: true, fallbackToDirectGoogleOAuth: true });
+  assert.equal(res.ok, true);
+  assert.equal(sync.getUserProfile().email, 'driver@gmail.com');
+  assert.equal(sync.getGoogleAccessToken(), 'ya29.android_native_popup_token');
+  sync.destroy();
+});

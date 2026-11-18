@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default desktop capabilities",
-  "windows": ["main", "main-*"],
+  "windows": ["main", "main-*", "google-auth"],
   "permissions": [
     "core:default"
   ]

@@ -1082,20 +1082,13 @@ class AudiobookApp {
       }
 
       const fallbackMsg =
-        result?.error || 'Google OAuth unavailable in this window. Sign in with Gmail & password above.';
+        result?.error || 'Google sign-in popup could not complete. Please try again.';
       if (this.state.driveModal.open) {
         this.state.driveModal.error = fallbackMsg;
       } else {
         this.state.authError = fallbackMsg;
       }
       this.render();
-
-      if (typeof document !== 'undefined') {
-        const emailEl = document.getElementById('gmailEmailInput');
-        if (emailEl && typeof emailEl.focus === 'function') {
-          emailEl.focus();
-        }
-      }
     } catch (err) {
       this.state.authLoading = false;
       const msg = err?.message || 'Google OAuth could not start. Sign in with Gmail & password above.';
@@ -1350,7 +1343,7 @@ class AudiobookApp {
           ${
             user.authenticated
               ? `<button data-action="sign-out" class="btn-press w-full py-1.5 rounded-xl surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Sign Out</button>`
-              : `<button data-action="login-google" class="btn-press w-full py-1.5 rounded-xl bg-[#1ed760] text-xs font-bold text-[#050506]">Sign In with Google</button>
+              : `<button data-action="login-google" class="btn-press w-full py-1.5 rounded-xl bg-[#1ed760] text-xs font-bold text-[#050506]">Continue with Google</button>
                  <button data-action="sign-out" class="btn-press w-full py-1.5 rounded-xl surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Return to Login</button>`
           }
         </div>
@@ -1359,7 +1352,7 @@ class AudiobookApp {
   }
 
   _renderLoginView() {
-    const { authError, authNotice, authLoading, authEmail } = this.state;
+    const { authError, authNotice, authLoading } = this.state;
     return `
       <main class="min-h-screen w-full flex items-center justify-center p-4 sm:p-6 bg-[var(--bg-canvas)]">
         <div class="w-full max-w-sm surface-panel rounded-3xl p-6 sm:p-8 border border-[var(--border-subtle)] shadow-2xl space-y-6 text-center">
@@ -1373,7 +1366,6 @@ class AudiobookApp {
             </div>
             <div class="space-y-1">
               <h1 class="text-2xl font-bold tracking-tight text-white">Audiobook Player</h1>
-              <p class="text-xs text-[var(--text-secondary)]">Sign in with Gmail to sync your library</p>
             </div>
           </div>
 
@@ -1388,24 +1380,12 @@ class AudiobookApp {
               : ''
           }
 
-          <form id="gmailLoginForm" class="space-y-3 text-left">
-            <div>
-              <input id="gmailEmailInput" type="email" required autocomplete="email" value="${escapeHtml(authEmail || '')}" placeholder="you@gmail.com" class="w-full px-4 py-3 rounded-2xl bg-white/5 border border-[var(--border-subtle)] text-sm text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
-            </div>
-            <div>
-              <input id="gmailPasswordInput" type="password" required minlength="6" autocomplete="current-password" placeholder="Password (6+ characters)" class="w-full px-4 py-3 rounded-2xl bg-white/5 border border-[var(--border-subtle)] text-sm text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
-            </div>
-            <button type="submit" ${authLoading ? 'disabled' : ''} class="btn-press w-full py-3 px-4 rounded-full bg-[#1ed760] hover:brightness-105 text-[#050506] text-sm font-bold flex items-center justify-center gap-2 shadow-lg disabled:opacity-60">
-              <span>${authLoading ? 'Signing in...' : 'Sign In with Gmail'}</span>
-            </button>
-          </form>
-
-          <div class="space-y-2.5 pt-1">
-            <button type="button" data-action="login-google" ${authLoading ? 'disabled' : ''} class="btn-press w-full py-2.5 px-4 rounded-full surface-card hover:bg-white/10 text-white text-xs font-semibold flex items-center justify-center gap-2 disabled:opacity-60">
-              <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true">
+          <div class="space-y-3 pt-1">
+            <button type="button" data-action="login-google" ${authLoading ? 'disabled' : ''} class="btn-press w-full py-3 px-4 rounded-full bg-[#1ed760] hover:brightness-105 text-[#050506] text-sm font-bold flex items-center justify-center gap-2.5 shadow-lg disabled:opacity-60">
+              <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
                 <path fill="currentColor" d="M21.35 11.1h-9.17v2.73h6.51c-.33 3.81-3.5 5.44-6.5 5.44C8.36 19.27 5 16.25 5 12c0-4.1 3.2-7.27 7.2-7.27c3.09 0 4.9 1.97 4.9 1.97L19 4.72S16.56 2 12.1 2C6.42 2 2.03 6.8 2.03 12c0 5.05 4.13 10 10.22 10c5.35 0 9.25-3.67 9.25-9.09c0-1.15-.15-1.81-.15-1.81Z"/>
               </svg>
-              <span>Continue with Google OAuth</span>
+              <span>${authLoading ? 'Signing in...' : 'Continue with Google'}</span>
             </button>
 
             <button type="button" data-action="login-local" class="btn-press w-full py-2.5 px-4 rounded-full bg-white/5 hover:bg-white/10 text-[var(--text-secondary)] hover:text-white text-xs font-semibold">
@@ -2548,22 +2528,6 @@ class AudiobookApp {
         if (input) {
           void this.runCoverSearch(input.value);
         }
-      });
-    }
-
-    const gmailForm = document.getElementById('gmailLoginForm');
-    if (gmailForm) {
-      const emailEl = document.getElementById('gmailEmailInput');
-      if (emailEl) {
-        emailEl.addEventListener('input', (e) => {
-          this.state.authEmail = e.target.value;
-        });
-      }
-      gmailForm.addEventListener('submit', (e) => {
-        e.preventDefault();
-        const emailVal = document.getElementById('gmailEmailInput')?.value || '';
-        const passVal = document.getElementById('gmailPasswordInput')?.value || '';
-        void this.handleGmailSignIn(emailVal, passVal);
       });
     }
 

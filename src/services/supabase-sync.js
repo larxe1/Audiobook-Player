@@ -831,7 +831,8 @@ export class SupabaseSyncService {
   }
 
   /**
-   * Runs direct Google OAuth via GIS Token Client or a popup window (never replacing the main window).
+   * Runs direct Google OAuth via native Tauri popup, Android native bridge, GIS Token Client,
+   * or browser popup window (never replacing the main window).
    * @param {object} [options]
    * @returns {Promise<{ ok: boolean, session?: object|null, reason?: string, error?: string }>}
    */
@@ -841,7 +842,7 @@ export class SupabaseSyncService {
       return {
         ok: false,
         reason: 'no_google_client_id',
-        error: 'No Google OAuth Client ID configured. Sign in with Gmail & password below.'
+        error: 'No Google Client ID configured.'
       };
     }
 
@@ -849,7 +850,161 @@ export class SupabaseSyncService {
       options.scopes ||
       'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile';
 
-    // Prefer Google Identity Services token client when available
+    // 1. Native Tauri Desktop Google Sign-In Popup (opens dedicated WebviewWindow to accounts.google.com)
+    const tauriInvoke = this.windowObj?.__TAURI_INTERNALS__?.invoke || this.windowObj?.__TAURI__?.core?.invoke;
+    if (!options.forceBrowserPopup && this._isTauriEnvironment() && typeof tauriInvoke === 'function') {
+      try {
+        const startRes = await tauriInvoke('desktop_start_google_oauth', {
+          silent: Boolean(options.silent),
+          loginHint: options.hint || null,
+          forceRefresh: Boolean(options.forceRefresh)
+        });
+        if (startRes?.status === 'success' && startRes?.accessToken) {
+          return await this.completeGoogleOAuthToken(startRes.accessToken);
+        }
+        const startedAt = Date.now();
+        while (Date.now() - startedAt < 180000) {
+          await new Promise((r) => setTimeout(r, 350));
+          const pollRes = await tauriInvoke('desktop_poll_google_oauth', {});
+          if (pollRes?.status === 'success' && pollRes?.accessToken) {
+            return await this.completeGoogleOAuthToken(pollRes.accessToken);
+          }
+          if (pollRes?.status === 'closed') {
+            return {
+              ok: false,
+              reason: 'popup_closed',
+              error: 'Google sign-in popup was closed.'
+            };
+          }
+          if (pollRes?.status === 'needs_interactive' && options.silent) {
+            return this.signInWithGooglePopup({ ...options, silent: false });
+          }
+        }
+        return {
+          ok: false,
+          reason: 'oauth_timeout',
+          error: 'Google sign-in timed out.'
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          reason: 'tauri_oauth_error',
+          error: err?.message || 'Unable to open Google sign-in popup.'
+        };
+      }
+    }
+
+    // 2. Native Android (Capacitor) Google Sign-In Bridge if registered by the .apk shell
+    if (this._isCapacitorEnvironment() && typeof this.windowObj?.__ANDROID_GOOGLE_OAUTH__ === 'function') {
+      try {
+        const androidRes = await this.windowObj.__ANDROID_GOOGLE_OAUTH__(clientId, scopes, options.hint || '');
+        if (androidRes?.access_token || androidRes?.accessToken) {
+          return await this.completeGoogleOAuthToken(androidRes.access_token || androidRes.accessToken);
+        }
+        return {
+          ok: false,
+          reason: androidRes?.error || 'android_oauth_cancelled',
+          error: androidRes?.error_description || 'Google sign-in did not complete.'
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          reason: 'android_oauth_error',
+          error: err?.message || 'Google sign-in popup failed on Android.'
+        };
+      }
+    }
+
+    // 3. Browser / PWA: try Google Identity Services token client first, falling back to popup window
+    const openBrowserOAuthPopup = () => {
+      if (typeof this.windowObj?.open !== 'function') {
+        return Promise.resolve({
+          ok: false,
+          reason: 'popup_unavailable',
+          error: 'Google sign-in popup is unavailable in this window.'
+        });
+      }
+
+      const origin = this.windowObj?.location?.origin || 'http://localhost';
+      const pathname = this.windowObj?.location?.pathname || '/';
+      const redirectUri = options.redirectTo || `${origin}${pathname}`;
+      const authParams = new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_type: 'token',
+        scope: scopes,
+        include_granted_scopes: 'true',
+        prompt: 'select_account'
+      });
+      if (options.hint) authParams.set('login_hint', options.hint);
+      const oauthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${authParams.toString()}`;
+      let popup = null;
+      try {
+        popup = this.windowObj.open(
+          oauthUrl,
+          'audiobook_google_oauth',
+          'width=500,height=680,menubar=no,toolbar=no'
+        );
+      } catch {
+        popup = null;
+      }
+
+      if (!popup || (this._isCapacitorEnvironment() && typeof popup.closed !== 'boolean')) {
+        return Promise.resolve({
+          ok: false,
+          reason: 'popup_blocked',
+          error: 'Google sign-in popup was blocked. Allow popups and try again.'
+        });
+      }
+
+      return new Promise((resolve) => {
+        const startedAt = Date.now();
+        const poll = setInterval(async () => {
+          if (popup.closed) {
+            clearInterval(poll);
+            resolve({
+              ok: false,
+              reason: 'popup_closed',
+              error: 'Google sign-in window was closed.'
+            });
+            return;
+          }
+          try {
+            const hash = popup.location?.hash || '';
+            if (hash.includes('access_token=')) {
+              clearInterval(poll);
+              const params = new URLSearchParams(hash.replace(/^#/, ''));
+              const token = params.get('access_token');
+              try { popup.close(); } catch {}
+              resolve(await this.completeGoogleOAuthToken(token));
+              return;
+            }
+            if (hash.includes('error=')) {
+              clearInterval(poll);
+              try { popup.close(); } catch {}
+              resolve({
+                ok: false,
+                reason: 'oauth_error',
+                error: 'Google sign-in was cancelled or rejected.'
+              });
+              return;
+            }
+          } catch {
+            // Cross-origin while user is on accounts.google.com
+          }
+          if (Date.now() - startedAt > 120000) {
+            clearInterval(poll);
+            try { popup.close(); } catch {}
+            resolve({
+              ok: false,
+              reason: 'oauth_timeout',
+              error: 'Google sign-in timed out.'
+            });
+          }
+        }, 300);
+      });
+    };
+
     if (!options.forcePopup && (await this._ensureGoogleIdentityScript())) {
       const oauth2 = this.windowObj?.google?.accounts?.oauth2;
       if (oauth2?.initTokenClient) {
@@ -861,7 +1016,7 @@ export class SupabaseSyncService {
               resolve({
                 ok: false,
                 reason: 'oauth_timeout',
-                error: 'Google OAuth window timed out. Sign in with Gmail & password below.'
+                error: 'Google sign-in timed out.'
               });
             }
           }, 60000);
@@ -879,125 +1034,32 @@ export class SupabaseSyncService {
                   resolve({
                     ok: false,
                     reason: resp?.error || 'oauth_cancelled',
-                    error: resp?.error_description || 'Google OAuth did not complete. Use Gmail & password below.'
+                    error: resp?.error_description || 'Google sign-in did not complete.'
                   });
                   return;
                 }
                 resolve(await this.completeGoogleOAuthToken(resp.access_token));
               },
-              error_callback: (err) => {
+              error_callback: async () => {
                 if (settled) return;
                 settled = true;
                 clearTimeout(timeout);
-                resolve({
-                  ok: false,
-                  reason: err?.type || 'oauth_popup_error',
-                  error: 'Google OAuth popup could not complete in this window. Use Gmail & password below.'
-                });
+                resolve(await openBrowserOAuthPopup());
               }
             });
             client.requestAccessToken({ prompt: 'select_account' });
-          } catch (err) {
+          } catch {
             if (!settled) {
               settled = true;
               clearTimeout(timeout);
-              resolve({
-                ok: false,
-                reason: 'oauth_init_failed',
-                error: err?.message || 'Google OAuth popup unavailable. Use Gmail & password below.'
-              });
+              void openBrowserOAuthPopup().then(resolve);
             }
           }
         });
       }
     }
 
-    // Fallback: explicit OAuth popup window (never replacing window.location.href)
-    if (typeof this.windowObj?.open !== 'function') {
-      return {
-        ok: false,
-        reason: 'popup_unavailable',
-        error: 'Google OAuth popup is unavailable. Sign in with Gmail & password below.'
-      };
-    }
-
-    const origin = this.windowObj?.location?.origin || 'http://localhost';
-    const pathname = this.windowObj?.location?.pathname || '/';
-    const redirectUri = options.redirectTo || `${origin}${pathname}`;
-    const authParams = new URLSearchParams({
-      client_id: clientId,
-      redirect_uri: redirectUri,
-      response_type: 'token',
-      scope: scopes,
-      include_granted_scopes: 'true',
-      prompt: 'select_account'
-    });
-    const oauthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${authParams.toString()}`;
-    let popup = null;
-    try {
-      popup = this.windowObj.open(
-        oauthUrl,
-        'audiobook_google_oauth',
-        'width=520,height=680,menubar=no,toolbar=no'
-      );
-    } catch {
-      popup = null;
-    }
-
-    if (!popup || (this._isCapacitorEnvironment() && typeof popup.closed !== 'boolean')) {
-      return {
-        ok: false,
-        reason: 'popup_blocked',
-        error: 'Google OAuth popup was blocked. Sign in with Gmail & password above.'
-      };
-    }
-
-    return new Promise((resolve) => {
-      const startedAt = Date.now();
-      const poll = setInterval(async () => {
-        if (popup.closed) {
-          clearInterval(poll);
-          resolve({
-            ok: false,
-            reason: 'popup_closed',
-            error: 'Google OAuth window was closed. Sign in with Gmail & password below.'
-          });
-          return;
-        }
-        try {
-          const hash = popup.location?.hash || '';
-          if (hash.includes('access_token=')) {
-            clearInterval(poll);
-            const params = new URLSearchParams(hash.replace(/^#/, ''));
-            const token = params.get('access_token');
-            try { popup.close(); } catch {}
-            resolve(await this.completeGoogleOAuthToken(token));
-            return;
-          }
-          if (hash.includes('error=')) {
-            clearInterval(poll);
-            try { popup.close(); } catch {}
-            resolve({
-              ok: false,
-              reason: 'oauth_error',
-              error: 'Google OAuth was rejected. Sign in with Gmail & password below.'
-            });
-            return;
-          }
-        } catch {
-          // Cross-origin while user is on accounts.google.com
-        }
-        if (Date.now() - startedAt > 120000) {
-          clearInterval(poll);
-          try { popup.close(); } catch {}
-          resolve({
-            ok: false,
-            reason: 'oauth_timeout',
-            error: 'Google OAuth timed out. Sign in with Gmail & password below.'
-          });
-        }
-      }, 300);
-    });
+    return openBrowserOAuthPopup();
   }
 
   /**
@@ -1041,7 +1103,7 @@ export class SupabaseSyncService {
         supported: false,
         ok: false,
         reason: 'provider_not_enabled',
-        error: 'Google OAuth provider is not enabled on Supabase. Sign in with your Gmail address & password.'
+        error: 'Google sign-in is not enabled on the Supabase server.'
       };
     }
 
@@ -1062,7 +1124,7 @@ export class SupabaseSyncService {
         supported: true,
         ok: false,
         reason: 'popup_unavailable',
-        error: 'Popup unavailable in this app window. Sign in with Gmail & password.'
+        error: 'Popup unavailable in this app window.'
       };
     }
 
@@ -1151,6 +1213,14 @@ export class SupabaseSyncService {
     this.setGoogleAccessToken(null);
     this._saveSession(null);
     this.disconnectRealtime();
+    const tauriInvoke = this.windowObj?.__TAURI_INTERNALS__?.invoke || this.windowObj?.__TAURI__?.core?.invoke;
+    if (this._isTauriEnvironment() && typeof tauriInvoke === 'function') {
+      try {
+        await tauriInvoke('desktop_clear_google_oauth', {});
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
   }
 
   /**
