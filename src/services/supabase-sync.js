@@ -439,6 +439,18 @@ export class SupabaseSyncService {
     );
   }
 
+  _isCapacitorEnvironment() {
+    const origin = this.windowObj?.location?.origin || '';
+    const protocol = this.windowObj?.location?.protocol || '';
+    const ua = this.navigatorObj?.userAgent || '';
+    return Boolean(
+      this.windowObj?.Capacitor ||
+        protocol === 'capacitor:' ||
+        /^capacitor:\/\//i.test(origin) ||
+        (/Android/i.test(ua) && /^https?:\/\/localhost(?::\d+)?$/i.test(origin))
+    );
+  }
+
   /**
    * Queries Supabase /auth/v1/settings to inspect enabled auth providers before navigating.
    * @param {{ forceRefresh?: boolean }} [options]
@@ -921,17 +933,22 @@ export class SupabaseSyncService {
       prompt: 'select_account'
     });
     const oauthUrl = `https://accounts.google.com/o/oauth2/v2/auth?${authParams.toString()}`;
-    const popup = this.windowObj.open(
-      oauthUrl,
-      'audiobook_google_oauth',
-      'width=520,height=680,menubar=no,toolbar=no'
-    );
+    let popup = null;
+    try {
+      popup = this.windowObj.open(
+        oauthUrl,
+        'audiobook_google_oauth',
+        'width=520,height=680,menubar=no,toolbar=no'
+      );
+    } catch {
+      popup = null;
+    }
 
-    if (!popup) {
+    if (!popup || (this._isCapacitorEnvironment() && typeof popup.closed !== 'boolean')) {
       return {
         ok: false,
         reason: 'popup_blocked',
-        error: 'Popup was blocked. Sign in with Gmail & password below.'
+        error: 'Google OAuth popup was blocked. Sign in with Gmail & password above.'
       };
     }
 
@@ -1028,17 +1045,24 @@ export class SupabaseSyncService {
       };
     }
 
-    if (this._isTauriEnvironment() || options.preferPopup) {
+    if (this._isTauriEnvironment() || this._isCapacitorEnvironment() || options.preferPopup) {
       if (typeof this.windowObj?.open === 'function') {
-        this.windowObj.open(authUrl, 'audiobook_supabase_google', 'width=520,height=680');
-        return { url: authUrl, supported: true, mode: 'popup' };
+        let popup = null;
+        try {
+          popup = this.windowObj.open(authUrl, 'audiobook_supabase_google', 'width=520,height=680');
+        } catch {
+          popup = null;
+        }
+        if (popup) {
+          return { url: authUrl, supported: true, mode: 'popup' };
+        }
       }
       return {
         url: authUrl,
         supported: true,
         ok: false,
         reason: 'popup_unavailable',
-        error: 'Popup unavailable in desktop window.'
+        error: 'Popup unavailable in this app window. Sign in with Gmail & password.'
       };
     }
 

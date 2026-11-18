@@ -1,11 +1,11 @@
 {
-  "version": "1.0.2",
-  "build": 3,
+  "version": "1.0.3",
+  "build": 4,
   "channel": "stable",
   "publishedAt": "2026-11-18T00:00:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Direct Gmail sign-in with auto-signup, Google OAuth popup/settings guard preventing raw JSON redirect"
+  "releaseNotes": "Windows + Android cross-platform parity: Capacitor/PWA OAuth guard, mobile audio file picker fallback, Gmail sign-in"
 }

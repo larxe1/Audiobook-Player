@@ -205,6 +205,13 @@ class AudiobookApp {
     this.state.books = Array.isArray(nextBooks) ? nextBooks : [];
   }
 
+  _isAndroidOrMobileViewport() {
+    const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+    const isAndroidUa = /Android/i.test(ua);
+    const isNarrow = typeof window !== 'undefined' && window.innerWidth < 768;
+    return isAndroidUa || isNarrow;
+  }
+
   _detectViewportLayout(androidAutoOverride = null) {
     if (typeof window === 'undefined') return 'desktop';
     const search = window.location?.search || '';
@@ -1311,7 +1318,7 @@ class AudiobookApp {
               : ''
           }
           <button data-action="trigger-local-folder" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            <span class="truncate">Add Local Folder</span>
+            <span class="truncate">${this._isAndroidOrMobileViewport() ? 'Add Local Folder / Files' : 'Add Local Folder'}</span>
           </button>
           <button data-action="trigger-local-files" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span class="truncate">Add Audio Files</span>
@@ -1354,8 +1361,8 @@ class AudiobookApp {
   _renderLoginView() {
     const { authError, authNotice, authLoading, authEmail } = this.state;
     return `
-      <main class="min-h-screen w-full flex items-center justify-center p-6 bg-[var(--bg-canvas)]">
-        <div class="w-full max-w-sm surface-panel rounded-3xl p-8 border border-[var(--border-subtle)] shadow-2xl space-y-6 text-center">
+      <main class="min-h-screen w-full flex items-center justify-center p-4 sm:p-6 bg-[var(--bg-canvas)]">
+        <div class="w-full max-w-sm surface-panel rounded-3xl p-6 sm:p-8 border border-[var(--border-subtle)] shadow-2xl space-y-6 text-center">
           <div class="flex flex-col items-center gap-4">
             <div class="w-16 h-16 rounded-2xl bg-[#1ed760]/15 border border-[#1ed760]/35 flex items-center justify-center text-[#1ed760] shadow-lg">
               <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1423,7 +1430,7 @@ class AudiobookApp {
           </div>
           <div class="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center justify-center gap-2.5 pt-1">
             <button data-action="trigger-local-folder" class="btn-press px-4 py-2.5 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold">
-              Add Local Folder
+              ${this._isAndroidOrMobileViewport() ? 'Add Local Folder / Files' : 'Add Local Folder'}
             </button>
             <button data-action="trigger-local-files" class="btn-press px-4 py-2.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white text-xs font-semibold">
               Add Audio Files
@@ -2738,8 +2745,14 @@ class AudiobookApp {
           }
           case 'trigger-local-folder': {
             this.state.profileOpen = false;
-            const folderInput = document.getElementById('localFolderInput');
-            if (folderInput) folderInput.click();
+            const targetId = this._isAndroidOrMobileViewport()
+              ? 'localAudioFilesInput'
+              : 'localFolderInput';
+            const inputEl =
+              document.getElementById(targetId) ||
+              document.getElementById('localAudioFilesInput') ||
+              document.getElementById('localFolderInput');
+            if (inputEl) inputEl.click();
             break;
           }
           case 'trigger-local-files': {

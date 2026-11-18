@@ -656,3 +656,84 @@ test('SupabaseSyncService completeGoogleOAuthToken hydrates Google userinfo and 
   });
   sync.destroy();
 });
+
+test('SupabaseSyncService Android Capacitor and Mobile Chrome PWA never redirect to disabled Google provider and handle blocked popups cleanly', async () => {
+  for (const env of [
+    { origin: 'https://localhost', protocol: 'https:', ua: 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36', capacitor: { isNativePlatform: () => true } },
+    { origin: 'capacitor://localhost', protocol: 'capacitor:', ua: 'Mozilla/5.0 (Linux; Android 14)', capacitor: null },
+    { origin: 'https://larxe1.github.io', protocol: 'https:', ua: 'Mozilla/5.0 (Linux; Android 14; Pixel 9) Chrome/130.0', capacitor: null }
+  ]) {
+    const fakeWindow = createFakeWindow();
+    fakeWindow.location.origin = env.origin;
+    fakeWindow.location.protocol = env.protocol;
+    fakeWindow.location.pathname = '/Audiobook-Player/';
+    if (env.capacitor) fakeWindow.Capacitor = env.capacitor;
+    fakeWindow.open = () => null; // Simulate WebView / mobile popup blocked
+
+    const sync = new SupabaseSyncService({
+      storage: createMemoryStorage(),
+      windowObj: fakeWindow,
+      navigatorObj: { onLine: true, userAgent: env.ua },
+      BroadcastChannelImpl: null,
+      WebSocketImpl: null,
+      fetchImpl: async (url) => {
+        if (url.endsWith('/auth/v1/settings')) {
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return { external: { google: false, email: true } };
+            }
+          };
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      }
+    });
+
+    const res = await sync.signInWithGoogle({
+      autoRedirect: true,
+      fallbackToDirectGoogleOAuth: true,
+      forcePopup: true
+    });
+    assert.equal(res.supported, false);
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, 'popup_blocked');
+    assert.equal(fakeWindow.location.assignedUrl, null);
+    sync.destroy();
+  }
+});
+
+test('SupabaseSyncService Capacitor Android uses popup rather than replacing WebView when Supabase Google provider is enabled', async () => {
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://localhost';
+  fakeWindow.location.protocol = 'https:';
+  fakeWindow.Capacitor = { isNativePlatform: () => true };
+  fakeWindow.open = () => null;
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.endsWith('/auth/v1/settings')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { external: { google: true, email: true } };
+          }
+        };
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }
+  });
+
+  const res = await sync.signInWithGoogle({ autoRedirect: true });
+  assert.equal(res.supported, true);
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, 'popup_unavailable');
+  assert.equal(fakeWindow.location.assignedUrl, null);
+  sync.destroy();
+});
