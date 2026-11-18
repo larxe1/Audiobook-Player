@@ -172,23 +172,38 @@ function buildDriveStreamUrl(fileId) {
   return clean ? `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(clean)}?alt=media` : '';
 }
 
+const MAX_CLOUD_DATA_COVER_LEN = 32 * 1024;
+
+function sanitizeCoverUrlForCloud(rawCoverUrl) {
+  const clean = String(rawCoverUrl || '').trim();
+  if (!clean || clean.startsWith('blob:')) return '';
+  if (clean.startsWith('data:image/') && clean.length > MAX_CLOUD_DATA_COVER_LEN) {
+    return '';
+  }
+  return clean;
+}
+
 function sanitizeMediaEntry(entry, index = 0) {
   if (!entry || typeof entry !== 'object') return null;
   const driveFileId = String(entry.driveFileId || entry.drive_file_id || '').trim();
   const rawStreamUrl = String(entry.driveStreamUrl || entry.drive_stream_url || '').trim();
   const driveStreamUrl = rawStreamUrl || (driveFileId ? buildDriveStreamUrl(driveFileId) : '');
+  const durationNum = Number(entry.durationSec ?? entry.duration_sec ?? entry.duration);
+  const hasPositiveDuration = Number.isFinite(durationNum) && durationNum > 0;
+  const hasExplicitZeroDuration = entry.duration !== undefined && durationNum === 0;
+  const mimeType = String(entry.mimeType || entry.mime_type || '').trim();
   const clean = {
     index: Number.isFinite(Number(entry.index)) ? Number(entry.index) : index,
     title: entry.title || entry.name || `Chapter ${index + 1}`,
     ...(entry.fileName ? { fileName: entry.fileName } : {}),
     ...(entry.name ? { name: entry.name } : {}),
     startSec: Number.isFinite(Number(entry.startSec)) ? Number(entry.startSec) : 0,
-    ...(Number.isFinite(Number(entry.durationSec)) && Number(entry.durationSec) > 0
-      ? { durationSec: Number(entry.durationSec) }
-      : {}),
+    ...(hasPositiveDuration ? { durationSec: durationNum, duration: durationNum } : {}),
+    ...(!hasPositiveDuration && hasExplicitZeroDuration ? { duration: 0 } : {}),
     ...(Number.isFinite(Number(entry.sizeBytes ?? entry.size)) && Number(entry.sizeBytes ?? entry.size) > 0
       ? { sizeBytes: Number(entry.sizeBytes ?? entry.size) }
       : {}),
+    ...(mimeType ? { mimeType } : {}),
     ...(driveFileId ? { driveFileId } : {}),
     ...(driveStreamUrl ? { driveStreamUrl } : {})
   };
@@ -211,8 +226,7 @@ function normalizeCloudBook(rawBook, fallbackDevice = {}) {
     rawBook.driveFolderId || rawBook.drive_folder_id || meta.driveFolderId || ''
   ).trim();
   const coverDriveFileId = String(rawBook.coverDriveFileId || meta.coverDriveFileId || '').trim();
-  const rawCoverUrl = String(rawBook.coverUrl || rawBook.cover_url || '').trim();
-  const coverUrl = rawCoverUrl.startsWith('blob:') ? '' : rawCoverUrl;
+  const coverUrl = sanitizeCoverUrlForCloud(rawBook.coverUrl || rawBook.cover_url || '');
 
   const rawChapters = rawBook.chapters_json ?? rawBook.chapters ?? meta.chapters;
   const chapters = sanitizeMediaList(rawChapters);
@@ -232,7 +246,11 @@ function normalizeCloudBook(rawBook, fallbackDevice = {}) {
     (tracks.find((t) => t.driveStreamUrl)?.driveStreamUrl || '') ||
     (chapters.find((c) => c.driveStreamUrl)?.driveStreamUrl || '');
 
-  const rawSources = Array.isArray(rawBook.sources) ? rawBook.sources.filter(Boolean) : [];
+  const rawSources = [
+    ...(Array.isArray(rawBook.sources) ? rawBook.sources : []),
+    ...(rawBook.source ? [rawBook.source] : []),
+    ...(meta.source ? [meta.source] : [])
+  ].filter(Boolean);
   const hasDriveMedia = Boolean(
     driveFileId ||
       driveStreamUrl ||
@@ -240,6 +258,14 @@ function normalizeCloudBook(rawBook, fallbackDevice = {}) {
       chapters.some((c) => c.driveFileId || c.driveStreamUrl)
   );
   const sources = Array.from(new Set(hasDriveMedia && !rawSources.includes('drive') ? [...rawSources, 'drive'] : rawSources));
+  const source = String(
+    rawBook.source || meta.source || (sources.includes('drive') ? 'drive' : sources[0] || '')
+  ).trim();
+
+  const durationSec = Number(
+    rawBook.totalDurationSec ?? rawBook.total_duration_sec ?? rawBook.durationSec ?? rawBook.duration_sec ?? 0
+  );
+  const safeDurationSec = Number.isFinite(durationSec) ? durationSec : 0;
 
   const enrichmentCheckedAt = rawBook.enrichmentCheckedAt || meta.enrichmentCheckedAt || null;
   const originDeviceId = rawBook.originDeviceId || meta.originDeviceId || fallbackDevice.deviceId || null;
@@ -257,8 +283,10 @@ function normalizeCloudBook(rawBook, fallbackDevice = {}) {
     description: rawBook.description ?? meta.description ?? '',
     coverUrl,
     coverDriveFileId,
-    totalDurationSec: Number(rawBook.totalDurationSec ?? rawBook.total_duration_sec ?? rawBook.durationSec ?? 0),
+    durationSec: safeDurationSec,
+    totalDurationSec: safeDurationSec,
     sources,
+    ...(source ? { source } : {}),
     driveFileId,
     driveStreamUrl,
     driveFolderId,
@@ -339,7 +367,14 @@ function normalizeDeviceRecord(row, currentDeviceId) {
   const currentPositionSec = Number(
     row.current_position_sec ?? row.currentPositionSec ?? row.positionSec ?? 0
   );
-  const lastSeenAt = row.last_seen_at ?? row.lastSeenAt ?? null;
+  const lastSeenAt =
+    row.last_seen_at ??
+    row.lastSeenAt ??
+    row.updated_at ??
+    row.updatedAt ??
+    row.last_played_at ??
+    row.lastPlayedAt ??
+    null;
   const isPlaying = Boolean(row.is_playing ?? row.isPlaying);
   const isActivePlayer = Boolean(row.is_active_player ?? row.isActivePlayer ?? isPlaying);
   return {
@@ -348,7 +383,7 @@ function normalizeDeviceRecord(row, currentDeviceId) {
     platform: row.platform ?? 'web',
     activeBookKey: currentBookKey,
     currentBookKey,
-    activeBookTitle: row.active_book_title ?? row.activeBookTitle ?? '',
+    activeBookTitle: row.active_book_title ?? row.activeBookTitle ?? row.book_title ?? row.bookTitle ?? '',
     chapterIndex: Number.isFinite(currentChapterIndex) ? currentChapterIndex : 0,
     currentChapterIndex: Number.isFinite(currentChapterIndex) ? currentChapterIndex : 0,
     positionSec: Number.isFinite(currentPositionSec) ? currentPositionSec : 0,
@@ -586,6 +621,13 @@ export class SupabaseSyncService {
     this._lastDrivePayload = null;
     this._lastLocalDeviceState = null;
     this._driveWriteQueue = Promise.resolve();
+    this.googleAccessToken =
+      this.session?.provider_token ||
+      this.session?.googleAccessToken ||
+      this._loadManualGoogleToken() ||
+      null;
+    this._bridgeInFlight = new Map();
+    this._bridgeFailedEmails = new Set();
 
     this._onOnlineBound = () => {
       void this.flushOfflineQueue();
@@ -654,7 +696,7 @@ export class SupabaseSyncService {
     };
   }
 
-  async _rest(path, { method = 'GET', body, headers = {} } = {}) {
+  async _rest(path, { method = 'GET', body, headers = {}, _retried = false } = {}) {
     if (!this.fetchImpl) {
       throw new Error('fetch implementation is not available');
     }
@@ -664,6 +706,28 @@ export class SupabaseSyncService {
       headers: this._getHeaders(headers),
       body: body !== undefined ? JSON.stringify(body) : undefined
     });
+    if (res.status === 401 && !_retried && this.isAuthenticated()) {
+      const prevToken = this.session?.access_token;
+      const refreshed = await this._refreshAccessToken().catch(() => false);
+      if (!refreshed && this.session?.auth_mode === 'google_oauth' && this.session?.user?.email) {
+        await this._ensureSupabaseSessionForGoogleUser(
+          this.session.user.email,
+          this.session.user.user_metadata || {},
+          { force: true }
+        ).catch(() => null);
+      }
+      if (this.session?.access_token && this.session.access_token !== prevToken) {
+        const retryBody =
+          body && typeof body === 'object' && !Array.isArray(body) && body.user_id && this.session?.user?.id
+            ? { ...body, user_id: this.session.user.id }
+            : Array.isArray(body) && this.session?.user?.id
+              ? body.map((row) =>
+                  row && typeof row === 'object' && row.user_id ? { ...row, user_id: this.session.user.id } : row
+                )
+              : body;
+        return this._rest(path, { method, body: retryBody, headers, _retried: true });
+      }
+    }
     if (!res.ok) {
       const errorText = typeof res.text === 'function' ? await res.text() : `HTTP ${res.status}`;
       throw new Error(`Supabase REST ${method} ${path} failed (${res.status}): ${errorText}`);
@@ -681,11 +745,28 @@ export class SupabaseSyncService {
   }
 
   /**
+   * Returns true if a non-expired Google OAuth token is available for Drive appDataFolder sync.
+   * @returns {boolean}
+   */
+  hasDriveSyncToken() {
+    return Boolean(this.getGoogleAccessToken() && !this.needsDriveSyncReauth);
+  }
+
+  /**
    * Returns true if either a Supabase session or a Google OAuth token is active for cloud sync.
    * @returns {boolean}
    */
   hasCloudSyncAuth() {
     return Boolean(this.isAuthenticated() || this.getGoogleAccessToken());
+  }
+
+  /**
+   * Forces a Supabase access token refresh using session.refresh_token.
+   * @returns {Promise<boolean>}
+   */
+  async _refreshAccessToken() {
+    const result = await this.refreshSupabaseSessionIfNeeded({ force: true });
+    return Boolean(result?.refreshed && this.session?.access_token);
   }
 
   /**
@@ -755,6 +836,11 @@ export class SupabaseSyncService {
    */
   setSession(session) {
     this._saveSession(session);
+    this.googleAccessToken =
+      session?.provider_token ||
+      session?.googleAccessToken ||
+      this._loadManualGoogleToken() ||
+      null;
   }
 
   _loadManualGoogleToken() {
@@ -772,6 +858,7 @@ export class SupabaseSyncService {
    */
   setGoogleAccessToken(token) {
     const clean = typeof token === 'string' ? token.trim() : '';
+    this.googleAccessToken = clean || null;
     if (clean) {
       this.needsDriveSyncReauth = false;
     } else {
@@ -793,7 +880,8 @@ export class SupabaseSyncService {
     if (this.session) {
       this._saveSession({
         ...this.session,
-        provider_token: clean || null
+        provider_token: clean || null,
+        ...(clean ? { googleAccessToken: clean } : { googleAccessToken: null })
       });
     }
   }
@@ -806,6 +894,7 @@ export class SupabaseSyncService {
     return (
       this.session?.provider_token ||
       this.session?.googleAccessToken ||
+      this.googleAccessToken ||
       this._loadManualGoogleToken() ||
       null
     );
@@ -903,8 +992,13 @@ export class SupabaseSyncService {
     if (!this.session) {
       return null;
     }
+    this.googleAccessToken =
+      this.session?.provider_token ||
+      this.session?.googleAccessToken ||
+      this._loadManualGoogleToken() ||
+      null;
 
-    if (this.session.auth_mode === 'google_oauth' && !this.session.access_token) {
+    if (this.session.auth_mode === 'google_oauth') {
       const googleToken = this.getGoogleAccessToken();
       if (googleToken && this._isOnline() && this.fetchImpl) {
         try {
@@ -915,7 +1009,9 @@ export class SupabaseSyncService {
             const info = await res.json();
             const updatedUser = {
               ...(this.session.user || {}),
-              id: info.sub ? `google_${info.sub}` : (this.session.user?.id || 'google_user'),
+              id: this.session.access_token && this.session.user?.id
+                ? this.session.user.id
+                : (info.sub ? `google_${info.sub}` : (this.session.user?.id || 'google_user')),
               email: info.email || this.session.user?.email || '',
               user_metadata: {
                 ...(this.session.user?.user_metadata || {}),
@@ -929,18 +1025,15 @@ export class SupabaseSyncService {
             this._saveSession({ ...this.session, user: updatedUser });
           } else if (res.status === 401 || res.status === 403) {
             this.setGoogleAccessToken(null);
+            this.needsDriveSyncReauth = true;
           }
         } catch {
           // Offline fallback: keep persisted Google user profile
         }
       }
-      return this.session?.user ? this.session : null;
     }
 
-    if (!this.session?.access_token) {
-      return null;
-    }
-    if (this._isOnline() && this.fetchImpl) {
+    if (this.session?.access_token && this._isOnline() && this.fetchImpl) {
       try {
         const res = await this.fetchImpl(`${this.config.url}/auth/v1/user`, {
           headers: {
@@ -950,17 +1043,62 @@ export class SupabaseSyncService {
         });
         if (res.ok) {
           const user = await res.json();
-          this._saveSession({ ...this.session, user });
+          const prevMeta = this.session.user?.user_metadata || {};
+          const nextMeta = user?.user_metadata || {};
+          const mergedUser = {
+            ...this.session.user,
+            ...user,
+            email: user?.email || this.session.user?.email || '',
+            user_metadata: {
+              ...prevMeta,
+              ...nextMeta,
+              email: nextMeta.email || prevMeta.email || user?.email || this.session.user?.email || '',
+              name: nextMeta.name || prevMeta.name || '',
+              full_name: nextMeta.full_name || prevMeta.full_name || '',
+              avatar_url: nextMeta.avatar_url || prevMeta.avatar_url || '',
+              picture: nextMeta.picture || prevMeta.picture || ''
+            }
+          };
+          this._saveSession({ ...this.session, user: mergedUser });
+          this.connectRealtime();
+          void this.flushOfflineQueue();
           return this.session;
         }
         if (res.status === 401 || res.status === 403) {
-          this._saveSession(null);
-          return null;
+          const refreshed = await this._refreshAccessToken().catch(() => false);
+          if (refreshed && this.isAuthenticated()) {
+            this.connectRealtime();
+            void this.flushOfflineQueue();
+            return this.session;
+          }
+          if (this.session?.user?.email && this.session.auth_mode === 'google_oauth') {
+            this._saveSession({
+              ...this.session,
+              access_token: null,
+              refresh_token: null
+            });
+          } else {
+            this._saveSession(null);
+            return null;
+          }
         }
       } catch {
         // Offline fallback: keep persisted user session if user object exists
       }
     }
+
+    if (this.session?.user?.email && !this.isAuthenticated() && this._isOnline() && this.fetchImpl) {
+      await this._ensureSupabaseSessionForGoogleUser(
+        this.session.user.email,
+        this.session.user.user_metadata || {}
+      ).catch(() => null);
+    }
+
+    if (this.isAuthenticated()) {
+      this.connectRealtime();
+      void this.flushOfflineQueue();
+    }
+
     return this.session?.user ? this.session : null;
   }
 
@@ -1127,6 +1265,209 @@ export class SupabaseSyncService {
     }
   }
 
+  async _deriveGoogleBridgePassword(emailInput) {
+    const email = String(emailInput || '').trim().toLowerCase();
+    const material = `audiobook-player-google-bridge-v1::ycokzejqpenvlamvzhrm::${email}`;
+    if (globalThis.crypto?.subtle && typeof TextEncoder !== 'undefined') {
+      try {
+        const bytes = new TextEncoder().encode(material);
+        const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+        const hex = Array.from(new Uint8Array(digest))
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join('');
+        return `AbBridge!${hex.slice(0, 40)}#9`;
+      } catch {
+        // Fall through to deterministic JS mixer
+      }
+    }
+    let h1 = 0x811c9dc5;
+    let h2 = 0x9e3779b9;
+    for (let i = 0; i < material.length; i += 1) {
+      const code = material.charCodeAt(i);
+      h1 = Math.imul(h1 ^ code, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 ^ (code + i), 0x85ebca6b) >>> 0;
+    }
+    return `AbBridge!${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}#9`;
+  }
+
+  /**
+   * Automatically bridges a Google OAuth user into a real Supabase Auth session
+   * so Supabase REST tables and Realtime remain active across devices and after
+   * the 1-hour implicit Google access token expires.
+   * @param {string} emailInput
+   * @param {object} [profileMeta={}]
+   * @param {{ force?: boolean }} [options={}]
+   * @returns {Promise<object|null>}
+   */
+  async _ensureSupabaseSessionForGoogleUser(emailInput, profileMeta = {}, options = {}) {
+    const email = String(emailInput || '').trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return null;
+    }
+    if (!options.force && this.isAuthenticated() && (this.session?.user?.email || '').toLowerCase() === email) {
+      return this.session;
+    }
+    if (!this._isOnline() || !this.fetchImpl) {
+      return null;
+    }
+    if (!options.force && this._bridgeFailedEmails?.has(email)) {
+      return null;
+    }
+    if (this._bridgeInFlight?.has(email)) {
+      return this._bridgeInFlight.get(email);
+    }
+
+    const run = (async () => {
+      const existingSession = this.session;
+      const existingMeta = existingSession?.user?.user_metadata || {};
+      const displayName =
+        profileMeta.full_name ||
+        profileMeta.name ||
+        existingMeta.full_name ||
+        existingMeta.name ||
+        deriveDisplayNameFromEmail(email);
+      const avatarUrl =
+        profileMeta.avatar_url ||
+        profileMeta.picture ||
+        existingMeta.avatar_url ||
+        existingMeta.picture ||
+        (await computeGravatarUrl(email));
+
+      const bridgePassword = await this._deriveGoogleBridgePassword(email);
+
+      const finalizeBridgedSession = (authData) => {
+        if (!authData?.access_token || !authData?.user?.id) {
+          return null;
+        }
+        const supaMeta = authData.user?.user_metadata || {};
+        const googleToken =
+          this.getGoogleAccessToken() ||
+          existingSession?.provider_token ||
+          existingSession?.googleAccessToken ||
+          this.googleAccessToken ||
+          null;
+        const bridgedSession = {
+          ...(existingSession || {}),
+          access_token: authData.access_token,
+          refresh_token: authData.refresh_token || existingSession?.refresh_token || null,
+          provider_token: googleToken,
+          ...(googleToken ? { googleAccessToken: googleToken } : {}),
+          auth_mode: 'google_oauth',
+          expires_in: Number(authData.expires_in || 3600),
+          expires_at:
+            authData.expires_at ||
+            Math.floor(Date.now() / 1000) + Number(authData.expires_in || 3600),
+          token_type: authData.token_type || 'bearer',
+          user: {
+            ...authData.user,
+            email: authData.user?.email || email,
+            user_metadata: {
+              ...supaMeta,
+              ...existingMeta,
+              email,
+              full_name: displayName || supaMeta.full_name || supaMeta.name || '',
+              name: displayName || supaMeta.name || supaMeta.full_name || '',
+              avatar_url: avatarUrl || supaMeta.avatar_url || supaMeta.picture || '',
+              picture: avatarUrl || supaMeta.picture || supaMeta.avatar_url || ''
+            }
+          }
+        };
+        this._bridgeFailedEmails?.delete(email);
+        this._saveSession(bridgedSession);
+        this.connectRealtime();
+        void this.flushOfflineQueue();
+        return bridgedSession;
+      };
+
+      const tokenUrl = `${this.config.url}/auth/v1/token?grant_type=password`;
+      const authHeaders = {
+        apikey: this.config.publishableKey,
+        'Content-Type': 'application/json'
+      };
+
+      try {
+        const signInRes = await this.fetchImpl(tokenUrl, {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({ email, password: bridgePassword })
+        });
+        const signInText = typeof signInRes.text === 'function' ? await signInRes.text() : '';
+        const signInData = signInText ? JSON.parse(signInText) : {};
+
+        if (signInRes.ok && signInData?.access_token) {
+          return finalizeBridgedSession(signInData);
+        }
+
+        const signInMsg = parseAuthErrorMessage(signInData, '');
+        if (/email not confirmed/i.test(signInMsg)) {
+          this._bridgeFailedEmails?.add(email);
+          return null;
+        }
+
+        const looksLikeMissingOrInvalid =
+          signInRes.status === 400 &&
+          /invalid login credentials|invalid_credentials|invalid_grant/i.test(signInMsg);
+        if (!looksLikeMissingOrInvalid) {
+          return null;
+        }
+
+        const signupRes = await this.fetchImpl(`${this.config.url}/auth/v1/signup`, {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({
+            email,
+            password: bridgePassword,
+            data: {
+              full_name: displayName,
+              name: displayName,
+              avatar_url: avatarUrl,
+              picture: avatarUrl
+            }
+          })
+        });
+        const signupText = typeof signupRes.text === 'function' ? await signupRes.text() : '';
+        const signupData = signupText ? JSON.parse(signupText) : {};
+
+        if (signupRes.ok && signupData?.access_token) {
+          return finalizeBridgedSession(signupData);
+        }
+
+        if (signupRes.ok && (signupData?.id || signupData?.user?.id)) {
+          const postSignupRes = await this.fetchImpl(tokenUrl, {
+            method: 'POST',
+            headers: authHeaders,
+            body: JSON.stringify({ email, password: bridgePassword })
+          });
+          const postText = typeof postSignupRes.text === 'function' ? await postSignupRes.text() : '';
+          const postData = postText ? JSON.parse(postText) : {};
+          if (postSignupRes.ok && postData?.access_token) {
+            return finalizeBridgedSession(postData);
+          }
+          const postMsg = parseAuthErrorMessage(postData, '');
+          if (/email not confirmed/i.test(postMsg)) {
+            this._bridgeFailedEmails?.add(email);
+          }
+          return null;
+        }
+
+        const signupMsg = parseAuthErrorMessage(signupData, '');
+        if (/already registered|already exists|user_already_exists/i.test(signupMsg)) {
+          this._bridgeFailedEmails?.add(email);
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    })();
+
+    this._bridgeInFlight?.set(email, run);
+    try {
+      return await run;
+    } finally {
+      this._bridgeInFlight?.delete(email);
+    }
+  }
+
   /**
    * Fetches Google userinfo using a Google OAuth access token, persists Drive access,
    * and links/updates the active session with real Gmail email, name, and photo.
@@ -1155,6 +1496,9 @@ export class SupabaseSyncService {
 
     this.setGoogleAccessToken(cleanToken);
     const email = info.email || this.session?.user?.email || '';
+    if (email) {
+      this._bridgeFailedEmails?.delete(email.toLowerCase());
+    }
     const displayName =
       info.name ||
       this.session?.user?.user_metadata?.full_name ||
@@ -1168,6 +1512,7 @@ export class SupabaseSyncService {
       const updated = {
         ...this.session,
         provider_token: cleanToken,
+        googleAccessToken: cleanToken,
         user: {
           ...this.session.user,
           email: this.session.user.email || email,
@@ -1188,6 +1533,7 @@ export class SupabaseSyncService {
     const googleSession = {
       access_token: null,
       provider_token: cleanToken,
+      googleAccessToken: cleanToken,
       auth_mode: 'google_oauth',
       user: {
         id: info.sub ? `google_${info.sub}` : 'google_user',
@@ -1202,7 +1548,18 @@ export class SupabaseSyncService {
       }
     };
     this._saveSession(googleSession);
-    return { ok: true, session: googleSession, profile: this.getUserProfile() };
+
+    if (email) {
+      await this._ensureSupabaseSessionForGoogleUser(email, {
+        email,
+        name: displayName,
+        full_name: displayName,
+        avatar_url: avatarUrl,
+        picture: avatarUrl
+      }).catch(() => null);
+    }
+
+    return { ok: true, session: this.session || googleSession, profile: this.getUserProfile() };
   }
 
   /**
@@ -1881,6 +2238,9 @@ export class SupabaseSyncService {
     this._lastDrivePayload = null;
     this.needsDriveSyncReauth = false;
     this._lastLocalDeviceState = null;
+    this.googleAccessToken = null;
+    this._bridgeFailedEmails?.clear();
+    this._bridgeInFlight?.clear();
     this.setGoogleAccessToken(null);
     this._saveSession(null);
     this.disconnectRealtime();
@@ -1897,23 +2257,32 @@ export class SupabaseSyncService {
   async _driveFetch(url, init = {}) {
     const token = this.getGoogleAccessToken();
     if (!token || !this.fetchImpl || !this._isOnline()) {
-      return { res: null, forbidden: false, text: '' };
+      return { res: null, forbidden: false, unauthorized: false, text: '' };
     }
-    const res = await this.fetchImpl(url, {
-      ...init,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(init.headers || {})
-      }
-    });
-    if (res.status === 403) {
-      const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
-      if (!text || /insufficientPermissions|insufficient|PERMISSION_DENIED|scope/i.test(text)) {
+    try {
+      const res = await this.fetchImpl(url, {
+        ...init,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(init.headers || {})
+        }
+      });
+      if (res.status === 401) {
+        const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
         this.needsDriveSyncReauth = true;
+        return { res, forbidden: false, unauthorized: true, text };
       }
-      return { res, forbidden: true, text };
+      if (res.status === 403) {
+        const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
+        if (!text || /insufficientPermissions|insufficient|PERMISSION_DENIED|scope/i.test(text)) {
+          this.needsDriveSyncReauth = true;
+        }
+        return { res, forbidden: true, unauthorized: false, text };
+      }
+      return { res, forbidden: false, unauthorized: false, text: '' };
+    } catch {
+      return { res: null, forbidden: false, unauthorized: false, text: '' };
     }
-    return { res, forbidden: false, text: '' };
   }
 
   async _findDriveSyncFileMeta() {
@@ -1924,10 +2293,10 @@ export class SupabaseSyncService {
 
     if (this.driveSyncFileId) {
       try {
-        const { res, forbidden } = await this._driveFetch(
+        const { res, forbidden, unauthorized } = await this._driveFetch(
           `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(this.driveSyncFileId)}?fields=id,name,modifiedTime`
         );
-        if (forbidden) return null;
+        if (forbidden || unauthorized) return null;
         if (res?.ok) {
           const meta = await res.json();
           if (meta?.id) return meta;
@@ -1943,8 +2312,8 @@ export class SupabaseSyncService {
     const query = encodeURIComponent(`name='${DRIVE_SYNC_FILENAME}' and trashed=false`);
     const listUrl = `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${query}&fields=files(id,name,modifiedTime)&pageSize=1`;
     try {
-      const { res, forbidden } = await this._driveFetch(listUrl);
-      if (forbidden || !res?.ok) return null;
+      const { res, forbidden, unauthorized } = await this._driveFetch(listUrl);
+      if (forbidden || unauthorized || !res?.ok) return null;
       const data = await res.json();
       const file = Array.isArray(data?.files) ? data.files[0] : null;
       if (file?.id) {
@@ -1986,10 +2355,10 @@ export class SupabaseSyncService {
     }
 
     try {
-      const { res, forbidden } = await this._driveFetch(
+      const { res, forbidden, unauthorized } = await this._driveFetch(
         `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(meta.id)}?alt=media`
       );
-      if (forbidden || !res?.ok) {
+      if (forbidden || unauthorized || !res?.ok) {
         return {
           exists: true,
           changed: false,
@@ -2053,7 +2422,7 @@ export class SupabaseSyncService {
         ? `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(this.driveSyncFileId)}?uploadType=multipart&fields=id,modifiedTime`
         : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,modifiedTime';
 
-      const { res, forbidden } = await this._driveFetch(uploadUrl, {
+      const { res, forbidden, unauthorized } = await this._driveFetch(uploadUrl, {
         method: this.driveSyncFileId ? 'PATCH' : 'POST',
         headers: {
           'Content-Type': `multipart/related; boundary=${boundary}`
@@ -2061,7 +2430,7 @@ export class SupabaseSyncService {
         body: multipartBody
       });
 
-      if (forbidden || !res?.ok) {
+      if (forbidden || unauthorized || !res?.ok) {
         return null;
       }
 
@@ -2080,41 +2449,194 @@ export class SupabaseSyncService {
     return task;
   }
 
+  _computeLatestActivePlayback({ devices = [], progress = {}, driveFolder = null, library = [] } = {}) {
+    const byKey = new Map();
+    const byTitle = new Map();
+    const normalizeTitle = (t) => String(t || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    for (const book of Array.isArray(library) ? library : []) {
+      if (book?.bookKey) byKey.set(book.bookKey, book);
+      const nt = normalizeTitle(book?.title);
+      if (nt && !byTitle.has(nt)) byTitle.set(nt, book);
+    }
+
+    const candidates = [];
+
+    for (const dev of Array.isArray(devices) ? devices : []) {
+      if (!dev || typeof dev !== 'object') continue;
+      let bookKey = String(dev.currentBookKey || dev.activeBookKey || '').trim() || null;
+      let bookTitle = String(dev.activeBookTitle || '').trim();
+      const matched =
+        (bookKey && byKey.get(bookKey)) ||
+        (bookTitle && byTitle.get(normalizeTitle(bookTitle))) ||
+        null;
+      if (!bookKey && matched?.bookKey) bookKey = matched.bookKey;
+      if (!bookTitle && matched?.title) bookTitle = matched.title;
+      if (!bookKey && !bookTitle) continue;
+
+      let updatedAt = dev.lastSeenAt || dev.updatedAt || dev.lastPlayedAt || null;
+      let ts = toEpochMs(updatedAt);
+      let chapterIndex = Number(dev.currentChapterIndex ?? dev.chapterIndex ?? 0);
+      let positionSec = Number(dev.currentPositionSec ?? dev.positionSec ?? 0);
+
+      if (bookKey && progress && progress[bookKey]) {
+        const prog = progress[bookKey];
+        const progTs = toEpochMs(prog.clientUpdatedAt || prog.updatedAt || prog.lastPlayedAt);
+        if (progTs > ts && (!prog.deviceId || prog.deviceId === dev.deviceId)) {
+          chapterIndex = Number(prog.chapterIndex ?? chapterIndex);
+          positionSec = Number(prog.positionSec ?? positionSec);
+          updatedAt = prog.clientUpdatedAt || prog.updatedAt || prog.lastPlayedAt || updatedAt;
+          ts = progTs;
+        }
+      }
+
+      candidates.push({
+        source: 'device',
+        bookKey,
+        bookTitle,
+        chapterIndex: Number.isFinite(chapterIndex) ? chapterIndex : 0,
+        positionSec: Number.isFinite(positionSec) ? positionSec : 0,
+        isPlaying: Boolean(dev.isPlaying),
+        updatedAt,
+        ts,
+        deviceId: dev.deviceId || null,
+        deviceName: dev.deviceName || null
+      });
+    }
+
+    if (progress && typeof progress === 'object') {
+      for (const [key, prog] of Object.entries(progress)) {
+        if (!prog || typeof prog !== 'object') continue;
+        const bookKey = String(prog.bookKey || key || '').trim() || null;
+        const matched = bookKey ? byKey.get(bookKey) : null;
+        const bookTitle = String(prog.bookTitle || matched?.title || '').trim();
+        if (!bookKey && !bookTitle) continue;
+        const updatedAt = prog.clientUpdatedAt || prog.updatedAt || prog.lastPlayedAt || null;
+        const chapterIndex = Number(prog.chapterIndex ?? 0);
+        const positionSec = Number(prog.positionSec ?? 0);
+        candidates.push({
+          source: 'progress',
+          bookKey,
+          bookTitle,
+          chapterIndex: Number.isFinite(chapterIndex) ? chapterIndex : 0,
+          positionSec: Number.isFinite(positionSec) ? positionSec : 0,
+          isPlaying: false,
+          updatedAt,
+          ts: toEpochMs(updatedAt),
+          deviceId: prog.deviceId || null,
+          deviceName: prog.deviceName || null
+        });
+      }
+    }
+
+    if (driveFolder && typeof driveFolder === 'object' && driveFolder.lastActiveBookKey) {
+      const bookKey = String(driveFolder.lastActiveBookKey).trim();
+      if (bookKey) {
+        const matched = byKey.get(bookKey);
+        const prog = progress?.[bookKey];
+        const updatedAt = prog?.clientUpdatedAt || driveFolder.updatedAt || null;
+        candidates.push({
+          source: 'driveFolder',
+          bookKey,
+          bookTitle: String(matched?.title || '').trim(),
+          chapterIndex: Number.isFinite(Number(prog?.chapterIndex)) ? Number(prog.chapterIndex) : 0,
+          positionSec: Number.isFinite(Number(prog?.positionSec)) ? Number(prog.positionSec) : 0,
+          isPlaying: false,
+          updatedAt,
+          ts: toEpochMs(updatedAt),
+          deviceId: prog?.deviceId || null,
+          deviceName: prog?.deviceName || null
+        });
+      }
+    }
+
+    if (candidates.length === 0) return null;
+
+    const maxTs = Math.max(...candidates.map((c) => c.ts || 0), 0);
+    const RECENT_PLAYING_WINDOW_MS = 30 * 60 * 1000;
+    const recentPlaying = candidates.filter(
+      (c) => c.isPlaying && (c.ts === 0 || maxTs === 0 || maxTs - c.ts <= RECENT_PLAYING_WINDOW_MS)
+    );
+    const pool = recentPlaying.length > 0 ? recentPlaying : candidates;
+
+    pool.sort((a, b) => {
+      if ((b.ts || 0) !== (a.ts || 0)) return (b.ts || 0) - (a.ts || 0);
+      if (Boolean(b.isPlaying) !== Boolean(a.isPlaying)) return b.isPlaying ? 1 : -1;
+      if ((b.source === 'device') !== (a.source === 'device')) return b.source === 'device' ? 1 : -1;
+      return (b.positionSec || 0) - (a.positionSec || 0);
+    });
+
+    const win = pool[0];
+    return {
+      bookKey: win.bookKey || null,
+      bookTitle: win.bookTitle || '',
+      chapterIndex: win.chapterIndex,
+      positionSec: win.positionSec,
+      isPlaying: Boolean(win.isPlaying),
+      updatedAt: win.updatedAt || null,
+      deviceId: win.deviceId || null,
+      deviceName: win.deviceName || null
+    };
+  }
+
   /**
    * Checks Google Drive appDataFolder modifiedTime (lightweight metadata check first)
    * and Supabase if authenticated, returning merged cloud state.
    * @param {{ force?: boolean }} [options]
-   * @returns {Promise<{ changed: boolean, library: object[], progress: Record<string, object>, devices: object[], driveFolder: object|null }>}
+   * @returns {Promise<{ changed: boolean, library: object[], progress: Record<string, object>, devices: object[], driveFolder: object|null, latestActivePlayback: object|null }>}
    */
   async pullCloudSnapshot({ force = false } = {}) {
+    if (this._isOnline() && this.session?.user?.email && !this.isAuthenticated()) {
+      await this._ensureSupabaseSessionForGoogleUser(
+        this.session.user.email,
+        this.session.user.user_metadata || {}
+      ).catch(() => null);
+    }
+
     const localProgress = this.offlineQueue.getAllLocalProgress();
     if (!this._isOnline() || !this.hasCloudSyncAuth()) {
+      const devices = this._lastLocalDeviceState ? [this._lastLocalDeviceState] : [];
       return {
         changed: false,
         library: [],
         progress: localProgress,
-        devices: this._lastLocalDeviceState ? [this._lastLocalDeviceState] : [],
-        driveFolder: null
+        devices,
+        driveFolder: null,
+        latestActivePlayback: this._computeLatestActivePlayback({
+          devices,
+          progress: localProgress,
+          driveFolder: null,
+          library: []
+        })
       };
     }
 
     let driveResult = { exists: false, changed: false, payload: this._lastDrivePayload, modifiedTime: null };
-    if (this.getGoogleAccessToken()) {
+    if (this.hasDriveSyncToken()) {
       driveResult = await this._readDriveSyncPayload({ force });
     }
 
     if (!force && !driveResult.changed && !this.isAuthenticated()) {
       const cached = driveResult.payload || this._lastDrivePayload;
+      const library = cached ? Object.values(cached.library || {}) : [];
+      const progress = { ...(cached?.progress || {}), ...localProgress };
+      const devices = cached
+        ? Object.values(cached.devices || {})
+            .map((d) => normalizeDeviceRecord(d, this.deviceId))
+            .filter(Boolean)
+        : [];
+      const driveFolder = cached?.driveFolder || null;
       return {
         changed: false,
-        library: cached ? Object.values(cached.library || {}) : [],
-        progress: { ...(cached?.progress || {}), ...localProgress },
-        devices: cached
-          ? Object.values(cached.devices || {})
-              .map((d) => normalizeDeviceRecord(d, this.deviceId))
-              .filter(Boolean)
-          : [],
-        driveFolder: cached?.driveFolder || null
+        library,
+        progress,
+        devices,
+        driveFolder,
+        latestActivePlayback: this._computeLatestActivePlayback({
+          devices,
+          progress,
+          driveFolder,
+          library
+        })
       };
     }
 
@@ -2134,7 +2656,13 @@ export class SupabaseSyncService {
       library,
       progress,
       devices,
-      driveFolder
+      driveFolder,
+      latestActivePlayback: this._computeLatestActivePlayback({
+        devices,
+        progress,
+        driveFolder,
+        library
+      })
     };
   }
 
@@ -2182,7 +2710,7 @@ export class SupabaseSyncService {
           body: row
         });
         synced = true;
-      } else if (this.getGoogleAccessToken()) {
+      } else if (this.hasDriveSyncToken()) {
         const written = await this._writeDriveSyncPayload({
           progress: { [stamped.bookKey]: stamped }
         });
@@ -2229,7 +2757,7 @@ export class SupabaseSyncService {
       }
     }
 
-    if (this.getGoogleAccessToken()) {
+    if (preloadedDrivePayload !== undefined ? Boolean(preloadedDrivePayload) : this.hasDriveSyncToken()) {
       try {
         const drivePayload =
           preloadedDrivePayload !== undefined
@@ -2295,7 +2823,7 @@ export class SupabaseSyncService {
           }
         });
         synced = true;
-      } else if (this.getGoogleAccessToken()) {
+      } else if (this.hasDriveSyncToken()) {
         const written = await this._writeDriveSyncPayload({
           bookmarks: [savedLocal]
         });
@@ -2337,7 +2865,7 @@ export class SupabaseSyncService {
       }
     }
 
-    if (this.getGoogleAccessToken()) {
+    if (this.hasDriveSyncToken()) {
       try {
         const { payload } = await this._readDriveSyncPayload();
         const driveBookmarks = Array.isArray(payload?.bookmarks) ? payload.bookmarks : [];
@@ -2432,7 +2960,7 @@ export class SupabaseSyncService {
     }
 
     let driveResult = null;
-    if (this.getGoogleAccessToken()) {
+    if (this.hasDriveSyncToken()) {
       driveResult = await this._writeDriveSyncPayload({
         devices: {
           [this.deviceId]: normalizedLocal
@@ -2472,7 +3000,7 @@ export class SupabaseSyncService {
       }
     }
 
-    if (this.getGoogleAccessToken()) {
+    if (preloadedDrivePayload !== undefined ? Boolean(preloadedDrivePayload) : this.hasDriveSyncToken()) {
       try {
         const drivePayload =
           preloadedDrivePayload !== undefined
@@ -2551,7 +3079,7 @@ export class SupabaseSyncService {
     }
 
     let driveSaved = false;
-    if (this.getGoogleAccessToken()) {
+    if (this.hasDriveSyncToken()) {
       const written = await this._writeDriveSyncPayload({
         driveFolder: cleanConfig
       }).catch(() => null);
@@ -2586,7 +3114,7 @@ export class SupabaseSyncService {
     }
 
     let driveConfig = null;
-    if (this.getGoogleAccessToken()) {
+    if (preloadedDrivePayload !== undefined ? Boolean(preloadedDrivePayload) : this.hasDriveSyncToken()) {
       try {
         const drivePayload =
           preloadedDrivePayload !== undefined
@@ -2622,28 +3150,42 @@ export class SupabaseSyncService {
   }
 
   /**
+   * Normalizes a library item for cross-device cloud persistence (Supabase + Drive appDataFolder).
+   * @param {object} item
+   * @returns {object|null}
+   */
+  _normalizeLibraryItemForCloud(item) {
+    return normalizeCloudBook(item, { deviceId: this.deviceId, deviceName: this.deviceName });
+  }
+
+  /**
    * Upserts normalized library items to Supabase /rest/v1/audiobook_library_items
    * and/or Google Drive appDataFolder, preserving Drive tracks and origin device metadata.
    * @param {object[]} items
    * @returns {Promise<object[]|null>}
    */
   async syncLibraryItems(items = []) {
+    if (this._isOnline() && this.session?.user?.email && !this.isAuthenticated()) {
+      await this._ensureSupabaseSessionForGoogleUser(
+        this.session.user.email,
+        this.session.user.user_metadata || {}
+      ).catch(() => null);
+    }
+
     if (!this._isOnline() || !this.hasCloudSyncAuth() || !Array.isArray(items) || items.length === 0) {
       return null;
     }
 
-    const fallbackDevice = { deviceId: this.deviceId, deviceName: this.deviceName };
     const normalizedItems = items
-      .map((item) => normalizeCloudBook(item, fallbackDevice))
+      .map((item) => this._normalizeLibraryItemForCloud(item))
       .filter(Boolean);
     if (normalizedItems.length === 0) {
       return null;
     }
 
-    let supaResult = null;
-    if (this.isAuthenticated()) {
-      const rows = normalizedItems.map((item) => ({
-        user_id: this.session.user.id,
+    const buildRows = (userId) =>
+      normalizedItems.map((item) => ({
+        user_id: userId,
         book_key: item.bookKey,
         title: item.title || 'Untitled',
         author: item.author || '',
@@ -2654,12 +3196,13 @@ export class SupabaseSyncService {
         sources: Array.isArray(item.sources) ? item.sources : [],
         drive_file_id: item.driveFileId || null,
         drive_folder_id: item.driveFolderId || null,
-        total_duration_sec: Number(item.totalDurationSec ?? 0),
+        total_duration_sec: Number(item.totalDurationSec ?? item.durationSec ?? 0),
         chapters_json: Array.isArray(item.chapters) ? item.chapters : [],
         metadata_json: {
           tracks: Array.isArray(item.tracks) ? item.tracks : [],
           coverDriveFileId: item.coverDriveFileId || '',
           driveFolderId: item.driveFolderId || '',
+          ...(item.source ? { source: item.source } : {}),
           seriesOrder:
             item.seriesOrder != null && Number.isFinite(Number(item.seriesOrder))
               ? Number(item.seriesOrder)
@@ -2671,24 +3214,57 @@ export class SupabaseSyncService {
         }
       }));
 
-      supaResult = await this._rest('audiobook_library_items?on_conflict=user_id,book_key', {
-        method: 'POST',
-        headers: {
-          Prefer: 'resolution=merge-duplicates,return=representation'
-        },
-        body: rows
-      });
+    let supaResult = null;
+    if (this.isAuthenticated()) {
+      try {
+        supaResult = await this._rest('audiobook_library_items?on_conflict=user_id,book_key', {
+          method: 'POST',
+          headers: {
+            Prefer: 'resolution=merge-duplicates,return=representation'
+          },
+          body: buildRows(this.session.user.id)
+        });
+      } catch (err) {
+        const msg = String(err?.message || '');
+        if (/\(401\)|401|JWT/i.test(msg)) {
+          const refreshed = await this._refreshAccessToken().catch(() => false);
+          if (!refreshed && this.session?.user?.email) {
+            await this._ensureSupabaseSessionForGoogleUser(
+              this.session.user.email,
+              this.session.user.user_metadata || {},
+              { force: true }
+            ).catch(() => null);
+          }
+          if (this.isAuthenticated()) {
+            try {
+              supaResult = await this._rest('audiobook_library_items?on_conflict=user_id,book_key', {
+                method: 'POST',
+                headers: {
+                  Prefer: 'resolution=merge-duplicates,return=representation'
+                },
+                body: buildRows(this.session.user.id)
+              });
+            } catch {
+              supaResult = null;
+            }
+          }
+        }
+      }
     }
 
     let driveResult = null;
-    if (this.getGoogleAccessToken()) {
-      const libraryMap = {};
-      for (const item of normalizedItems) {
-        libraryMap[item.bookKey] = item;
+    if (this.hasDriveSyncToken()) {
+      try {
+        const libraryMap = {};
+        for (const item of normalizedItems) {
+          libraryMap[item.bookKey] = item;
+        }
+        driveResult = await this._writeDriveSyncPayload({
+          library: libraryMap
+        });
+      } catch {
+        driveResult = null;
       }
-      driveResult = await this._writeDriveSyncPayload({
-        library: libraryMap
-      }).catch(() => null);
     }
 
     if (!supaResult && !driveResult) return null;
@@ -2739,7 +3315,7 @@ export class SupabaseSyncService {
       }
     }
 
-    if (this.getGoogleAccessToken()) {
+    if (this.hasDriveSyncToken()) {
       if (options?.all) {
         await this._writeDriveSyncPayload({
           replaceLibrary: true,
@@ -2780,7 +3356,7 @@ export class SupabaseSyncService {
       }
     }
 
-    if (this.getGoogleAccessToken()) {
+    if (preloadedDrivePayload !== undefined ? Boolean(preloadedDrivePayload) : this.hasDriveSyncToken()) {
       try {
         const drivePayload =
           preloadedDrivePayload !== undefined
@@ -3092,7 +3668,7 @@ export class SupabaseSyncService {
             break;
           }
         }
-      } else if (this.getGoogleAccessToken() && (pendingProgress.length > 0 || pendingBookmarks.length > 0)) {
+      } else if (this.hasDriveSyncToken() && (pendingProgress.length > 0 || pendingBookmarks.length > 0)) {
         const progressDelta = {};
         for (const cp of pendingProgress) {
           progressDelta[cp.bookKey] = cp;

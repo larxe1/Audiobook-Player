@@ -17,7 +17,18 @@ body.theme-midnight,
   --ambient-color: rgba(30, 215, 96, 0.18);
   --range-track: rgba(148, 163, 184, 0.22);
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --android-safe-top: 0px;
+  --android-safe-bottom: 0px;
   color-scheme: dark;
+}
+
+@media (max-width: 767px) {
+  :root.is-android-native:not(.has-native-insets),
+  html.is-android-native:not(.has-native-insets),
+  body.is-android-native:not(.has-native-insets) {
+    --android-safe-top: 32px;
+    --android-safe-bottom: 16px;
+  }
 }
 
 body.theme-pitch,
@@ -378,6 +389,36 @@ input[type="range"]::-moz-range-thumb {
 
 .live-dot-pulse {
   animation: livePulse 1.8s ease-in-out infinite;
+}
+
+/* Mobile Safe Area & Scrollbar Utilities */
+.mobile-safe-top {
+  padding-top: calc(0.75rem + max(env(safe-area-inset-top, 0px), var(--android-safe-top, 0px))) !important;
+}
+
+.mobile-safe-sheet-top {
+  padding-top: calc(1.25rem + max(env(safe-area-inset-top, 0px), var(--android-safe-top, 0px))) !important;
+}
+
+.mobile-safe-bottom {
+  padding-bottom: calc(0.75rem + max(env(safe-area-inset-bottom, 0px), var(--android-safe-bottom, 0px))) !important;
+}
+
+.mobile-safe-miniplayer {
+  bottom: calc(0.75rem + max(env(safe-area-inset-bottom, 0px), var(--android-safe-bottom, 0px))) !important;
+}
+
+.mobile-safe-scroll-bottom {
+  padding-bottom: calc(6rem + max(env(safe-area-inset-bottom, 0px), var(--android-safe-bottom, 0px))) !important;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
 
 @media (prefers-reduced-motion: reduce) {

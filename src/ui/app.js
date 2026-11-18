@@ -505,6 +505,50 @@ class AudiobookApp {
     document.body.classList.add(theme === 'pitch' ? 'theme-pitch' : 'theme-midnight');
   }
 
+  _isNativeAndroidApp() {
+    if (typeof window === 'undefined') return false;
+    if (typeof this.syncService?._isCapacitorEnvironment === 'function') {
+      if (this.syncService._isCapacitorEnvironment()) return true;
+    }
+    const origin = window.location?.origin || '';
+    const protocol = window.location?.protocol || '';
+    const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+    return Boolean(
+      window.Capacitor ||
+        window.AudiobookOAuthNative ||
+        window.AudiobookUpdaterNative ||
+        window.AudiobookInsetsNative ||
+        protocol === 'capacitor:' ||
+        /^capacitor:\/\//i.test(origin) ||
+        (/Android/i.test(ua) && /^https?:\/\/localhost(?::\d+)?$/i.test(origin))
+    );
+  }
+
+  _applyPlatformViewportClasses() {
+    if (typeof document === 'undefined' || !document.documentElement?.classList) return;
+    const docEl = document.documentElement;
+    const isNativeAndroid = this._isNativeAndroidApp();
+    const hasNativeInsets = Boolean(
+      typeof window !== 'undefined' &&
+        (window.__ANDROID_NATIVE_INSETS__ || window.AudiobookInsetsNative?.hasNativeInsets?.())
+    );
+    if (hasNativeInsets && typeof window !== 'undefined' && !window.__ANDROID_NATIVE_INSETS__) {
+      window.__ANDROID_NATIVE_INSETS__ = true;
+      docEl.style?.setProperty?.('--android-safe-top', '0px');
+      docEl.style?.setProperty?.('--android-safe-bottom', '0px');
+    }
+    if (isNativeAndroid) {
+      docEl.classList.add('is-android-native');
+    } else {
+      docEl.classList.remove('is-android-native');
+    }
+    if (hasNativeInsets) {
+      docEl.classList.add('has-native-insets');
+    } else {
+      docEl.classList.remove('has-native-insets');
+    }
+  }
+
   _normalizeBookRecord(book) {
     if (!book || typeof book !== 'object') return book;
     const normalized = normalizeBookSeriesAndChapters(book) || book;
@@ -583,9 +627,23 @@ class AudiobookApp {
 
   _hasCloudSyncAuth() {
     if (typeof this.syncService?.hasCloudSyncAuth === 'function') {
-      return Boolean(this.syncService.hasCloudSyncAuth());
+      if (this.syncService.hasCloudSyncAuth()) return true;
     }
-    return Boolean(this.syncService?.isAuthenticated?.() || this.syncService?.getGoogleAccessToken?.());
+    return Boolean(
+      this.syncService?.isAuthenticated?.() ||
+        this.syncService?.hasDriveSyncToken?.() ||
+        this.syncService?.hasGoogleDriveToken?.() ||
+        this.syncService?.getGoogleAccessToken?.() ||
+        this.syncService?.session?.user?.email
+    );
+  }
+
+  _hasGoogleDriveToken() {
+    return Boolean(
+      this.syncService?.hasDriveSyncToken?.() ||
+        this.syncService?.hasGoogleDriveToken?.() ||
+        this.syncService?.getGoogleAccessToken?.()
+    );
   }
 
   _hasLocalAudioOnCurrentDevice(book) {
@@ -861,13 +919,13 @@ class AudiobookApp {
 
   _syncCurrentDevicePlaybackState(overrides = {}) {
     if (!this._hasCloudSyncAuth() || typeof this.syncService?.registerDevice !== 'function') {
-      return;
+      return Promise.resolve(null);
     }
     const activeBook = this.getActiveBook();
     const snap = this.state.snapshot || {};
     const isPlaying = overrides.isPlaying ?? Boolean(snap.playing);
     this._lastDeviceRegisterAt = Date.now();
-    void this.syncService
+    return this.syncService
       .registerDevice({
         activeBookKey: overrides.activeBookKey !== undefined ? overrides.activeBookKey : activeBook?.bookKey || null,
         activeBookTitle: overrides.activeBookTitle !== undefined ? overrides.activeBookTitle : activeBook?.title || '',
@@ -881,6 +939,248 @@ class AudiobookApp {
         isActivePlayer: overrides.isActivePlayer ?? isPlaying
       })
       .catch(() => null);
+  }
+
+  _findBookForPlaybackState(bookKey, bookTitle = '') {
+    const byKey = this._findBookByKeyOrLegacy(bookKey);
+    if (byKey) return byKey;
+    const normTitle = String(bookTitle || '').trim().toLowerCase();
+    if (!normTitle) return null;
+    return (
+      this.books.find((b) => String(b.title || '').trim().toLowerCase() === normTitle) ||
+      null
+    );
+  }
+
+  _shouldPushLocalCatalog(remoteBooks = []) {
+    if (this.books.length === 0) return false;
+    const remoteList = Array.isArray(remoteBooks) ? remoteBooks : [];
+    if (this.books.length > remoteList.length) return true;
+    const remoteByKey = new Map();
+    for (const rb of remoteList) {
+      const norm = this._normalizeBookRecord(rb);
+      if (norm?.bookKey) remoteByKey.set(norm.bookKey, norm);
+    }
+    return this.books.some((b) => {
+      const remote = remoteByKey.get(b.bookKey);
+      if (!remote) return true;
+      if (this._hasLocalAudioOnCurrentDevice(b)) return true;
+      const localUpdated = Date.parse(b.updatedAt || b.clientUpdatedAt || '') || 0;
+      const remoteUpdated = Date.parse(remote.updatedAt || remote.clientUpdatedAt || '') || 0;
+      if (localUpdated > remoteUpdated) return true;
+      if (!remote.coverUrl && b.coverUrl) return true;
+      return false;
+    });
+  }
+
+  async _pullCloudSnapshotUnified({ force = true } = {}) {
+    const sync = this.syncService;
+    if (!sync) return null;
+    const hasOwnPull = Object.hasOwn(sync, 'pullCloudSnapshot');
+    const hasOwnLegacyFetchers =
+      !hasOwnPull &&
+      (Object.hasOwn(sync, 'fetchLibraryItems') ||
+        Object.hasOwn(sync, 'fetchDevices') ||
+        Object.hasOwn(sync, 'fetchDriveFolderConfig'));
+
+    if (!hasOwnLegacyFetchers && typeof sync.pullCloudSnapshot === 'function') {
+      const snap = await sync.pullCloudSnapshot({ force }).catch(() => null);
+      if (snap) return snap;
+    }
+
+    const [driveFolder, library, progress, devices] = await Promise.all([
+      sync.fetchDriveFolderConfig?.().catch(() => null) ?? Promise.resolve(null),
+      sync.fetchLibraryItems?.().catch(() => []) ?? Promise.resolve([]),
+      sync.fetchAllProgress?.().catch(() => ({})) ?? Promise.resolve({}),
+      sync.fetchDevices?.().catch(() => []) ?? Promise.resolve([])
+    ]);
+    return { changed: true, driveFolder, library, progress, devices };
+  }
+
+  async _autoScanGoogleDriveIfEmpty() {
+    if (this.books.length > 0 || this._autoDriveScanAttempted) return false;
+    if (!this._hasGoogleDriveToken()) return false;
+    const token = String(this.syncService?.getGoogleAccessToken?.() || '').trim();
+    if (!token) return false;
+
+    this._autoDriveScanAttempted = true;
+    const folderId = this._getSavedDriveFolderId() || 'root';
+    try {
+      const driveBooks = await scanGoogleDriveFolder(token, folderId, undefined, {
+        timeoutMs: 15000,
+        concurrency: 4
+      });
+      if (!Array.isArray(driveBooks) || driveBooks.length === 0) return false;
+      const normalizedDriveBooks = driveBooks.map((b) =>
+        this._normalizeBookRecord({
+          ...b,
+          ...(folderId && folderId !== 'root' ? { driveFolderId: folderId } : {})
+        })
+      );
+      this.books = this._mergeSyncedBooks(this.books, normalizedDriveBooks);
+      this._persistBooks();
+      if (this._hasCloudSyncAuth()) {
+        await this._syncLibraryToCloud(this.books);
+        if (folderId && folderId !== 'root') {
+          await this.syncService.syncDriveFolderConfig?.({ folderId }).catch(() => null);
+        }
+        await this._syncCurrentDevicePlaybackState();
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async _hydrateActivePlaybackFromCloud(snapshot, { isStartup = false } = {}) {
+    if (!snapshot || this.books.length === 0) return false;
+    const myId = this.syncService?.deviceId || '';
+
+    const candidates = [];
+    const latest = snapshot.latestActivePlayback;
+    if (latest && (latest.bookKey || latest.bookTitle)) {
+      const ts = Date.parse(latest.updatedAt || latest.lastSeenAt || '') || 0;
+      candidates.push({
+        bookKey: latest.bookKey || null,
+        bookTitle: latest.bookTitle || '',
+        chapterIndex: Number(latest.chapterIndex || 0) || 0,
+        positionSec: Math.max(0, Number(latest.positionSec || 0)),
+        isPlaying: Boolean(latest.isPlaying),
+        updatedAt: latest.updatedAt || '',
+        updatedAtMs: ts,
+        deviceId: latest.deviceId || '',
+        deviceName: latest.deviceName || ''
+      });
+    }
+
+    const rawDevices = Array.isArray(snapshot.devices) ? snapshot.devices : [];
+    for (const raw of rawDevices) {
+      const d = this._normalizeDeviceRecord(raw);
+      if (!d || (!d.currentBookKey && !d.currentBookTitle)) continue;
+      if (myId && d.deviceId === myId && !isStartup) continue;
+      candidates.push({
+        bookKey: d.currentBookKey,
+        bookTitle: d.currentBookTitle || '',
+        chapterIndex: d.chapterIndex,
+        positionSec: Math.max(0, Number(d.positionSec || 0)),
+        isPlaying: d.isPlaying,
+        updatedAt: d.lastSeenAt || '',
+        updatedAtMs: d.lastSeenMs || 0,
+        deviceId: d.deviceId,
+        deviceName: d.deviceName
+      });
+    }
+
+    if (snapshot.driveFolder?.lastActiveBookKey) {
+      candidates.push({
+        bookKey: snapshot.driveFolder.lastActiveBookKey,
+        bookTitle: snapshot.driveFolder.lastActiveBookTitle || '',
+        chapterIndex: Number(snapshot.driveFolder.lastActiveChapterIndex || 0) || 0,
+        positionSec: Math.max(0, Number(snapshot.driveFolder.lastActivePositionSec || 0)),
+        isPlaying: false,
+        updatedAt: snapshot.driveFolder.updatedAt || '',
+        updatedAtMs: Date.parse(snapshot.driveFolder.updatedAt || '') || 0,
+        deviceId: 'drive-folder',
+        deviceName: ''
+      });
+    }
+
+    const progressMap = snapshot.progress && typeof snapshot.progress === 'object' ? snapshot.progress : {};
+    for (const [key, prog] of Object.entries(progressMap)) {
+      if (!prog || typeof prog !== 'object') continue;
+      const pos = Math.max(0, Number(prog.positionSec || 0));
+      if (pos <= 0 && !prog.clientUpdatedAt) continue;
+      candidates.push({
+        bookKey: prog.bookKey || key,
+        bookTitle: prog.bookTitle || prog.title || '',
+        chapterIndex: Number(prog.chapterIndex || 0) || 0,
+        positionSec: pos,
+        isPlaying: false,
+        updatedAt: prog.clientUpdatedAt || '',
+        updatedAtMs: Date.parse(prog.clientUpdatedAt || '') || 0,
+        deviceId: prog.deviceId || 'progress',
+        deviceName: prog.deviceName || ''
+      });
+    }
+
+    const remoteCandidates = candidates.filter((c) => !myId || !c.deviceId || c.deviceId !== myId);
+    const pool = remoteCandidates.length > 0 ? remoteCandidates : isStartup ? candidates : [];
+    if (pool.length === 0) return false;
+
+    pool.sort((a, b) => {
+      if (a.isPlaying !== b.isPlaying) return a.isPlaying ? -1 : 1;
+      if (b.updatedAtMs !== a.updatedAtMs) return b.updatedAtMs - a.updatedAtMs;
+      return b.positionSec - a.positionSec;
+    });
+
+    let chosen = null;
+    let matchedBook = null;
+    for (const cand of pool) {
+      const book = this._findBookForPlaybackState(cand.bookKey, cand.bookTitle);
+      if (book) {
+        chosen = cand;
+        matchedBook = book;
+        break;
+      }
+    }
+    if (!chosen || !matchedBook) return false;
+
+    const storedProg = progressMap[matchedBook.bookKey];
+    let targetPos = chosen.positionSec;
+    let targetChapter = chosen.chapterIndex;
+    if (storedProg) {
+      const progMs = Date.parse(storedProg.clientUpdatedAt || '') || 0;
+      const progPos = Math.max(0, Number(storedProg.positionSec || 0));
+      if (progMs > chosen.updatedAtMs || (targetPos === 0 && progPos > 0)) {
+        targetPos = progPos;
+        targetChapter = Number(storedProg.chapterIndex ?? targetChapter) || 0;
+      }
+    }
+
+    if (targetPos > 0 || targetChapter > 0) {
+      matchedBook.positionSec = targetPos;
+      matchedBook.chapterIndex = targetChapter;
+    }
+
+    const locallyPlaying = Boolean(this.audioEngine?.playing || this.state.snapshot?.playing);
+    if (locallyPlaying) return false;
+
+    const sig = `${chosen.deviceId || 'cloud'}:${matchedBook.bookKey}:${chosen.updatedAt || Math.round(targetPos)}:${targetChapter}:${chosen.isPlaying ? 1 : 0}`;
+    const isRemoteNewer = chosen.updatedAtMs > 0 && chosen.updatedAtMs > (this._lastLocalPlayAt || 0);
+    const shouldSelectBook =
+      !this.state.activeBookKey ||
+      (this.state.activeBookKey !== matchedBook.bookKey &&
+        this._lastHydratedRemoteSig !== sig &&
+        (isStartup || chosen.isPlaying || isRemoteNewer));
+
+    if (shouldSelectBook) {
+      this._lastHydratedRemoteSig = sig;
+      await this.selectBook(matchedBook.bookKey, false, { skipDeviceSync: true });
+      return true;
+    }
+
+    if (this.state.activeBookKey === matchedBook.bookKey) {
+      const currentPos = Number(this.state.snapshot?.positionSec || 0);
+      const currentChapter = Number(this.state.snapshot?.chapterIndex || 0);
+      if (
+        (Math.abs(currentPos - targetPos) >= 2 || currentChapter !== targetChapter) &&
+        (isStartup || chosen.isPlaying || isRemoteNewer)
+      ) {
+        this._lastHydratedRemoteSig = sig;
+        if (typeof this.audioEngine?.seekToSeconds === 'function' && targetPos >= 0) {
+          this.audioEngine.seekToSeconds(targetPos);
+        }
+        this.state.snapshot = {
+          ...this.state.snapshot,
+          positionSec: targetPos,
+          chapterIndex: targetChapter
+        };
+        this._syncMediaSessionMetadata();
+        return true;
+      }
+    }
+
+    return false;
   }
 
   _startBackgroundSync() {
@@ -923,18 +1223,7 @@ class AudiobookApp {
 
     this._syncInFlight = (async () => {
       try {
-        let snapshot = null;
-        if (typeof this.syncService?.pullCloudSnapshot === 'function') {
-          snapshot = await this.syncService.pullCloudSnapshot({ force }).catch(() => null);
-        } else {
-          const [driveFolder, library, progress, devices] = await Promise.all([
-            this.syncService.fetchDriveFolderConfig?.().catch(() => null),
-            this.syncService.fetchLibraryItems?.().catch(() => []),
-            this.syncService.fetchAllProgress?.().catch(() => ({})),
-            this.syncService.fetchDevices?.().catch(() => [])
-          ]);
-          snapshot = { changed: true, driveFolder, library, progress, devices };
-        }
+        const snapshot = await this._pullCloudSnapshotUnified({ force: force || true });
 
         const prevReauth = this.state.needsDriveSyncReauth;
         this.state.needsDriveSyncReauth = Boolean(this.syncService?.needsDriveSyncReauth);
@@ -951,12 +1240,19 @@ class AudiobookApp {
           uiChanged = true;
         }
 
-        const remoteBooks = Array.isArray(snapshot.library) ? snapshot.library : [];
-        if (remoteBooks.length > 0) {
+        const remoteBooks = Array.isArray(snapshot.library)
+          ? snapshot.library
+          : Array.isArray(snapshot.libraryItems)
+            ? snapshot.libraryItems
+            : [];
+        if (remoteBooks.length > 0 || this.books.length > 0) {
           const prevCount = this.books.length;
-          const prevActive = this.getActiveBook();
-          const merged = this._mergeSyncedBooks(this.books, remoteBooks);
-          const progressMap = snapshot.progress || (await this.syncService.fetchAllProgress?.().catch(() => ({}))) || {};
+          const merged =
+            remoteBooks.length > 0
+              ? this._mergeSyncedBooks(this.books, remoteBooks)
+              : this.books;
+          const progressMap =
+            snapshot.progress || (await this.syncService.fetchAllProgress?.().catch(() => ({}))) || {};
           this.books = merged.map((book) => {
             const norm = this._normalizeBookRecord(book);
             const stored = progressMap[norm.bookKey];
@@ -967,13 +1263,25 @@ class AudiobookApp {
               chapterIndex: conflict?.chapterIndex ?? norm.chapterIndex ?? 0
             };
           });
-          if (this.books.length !== prevCount || snapshot.changed) {
+          if (this.books.length !== prevCount || (remoteBooks.length > 0 && snapshot.changed)) {
             this._persistBooks();
             uiChanged = true;
           }
-          if (!prevActive && this.books.length > 0) {
-            await this.selectBook(this.books[0].bookKey, false);
+        }
+
+        if (this.books.length === 0 && this._hasGoogleDriveToken()) {
+          const scanned = await this._autoScanGoogleDriveIfEmpty();
+          if (scanned) {
+            uiChanged = true;
           }
+        }
+
+        if (this._shouldPushLocalCatalog(remoteBooks)) {
+          await this._syncLibraryToCloud(this.books);
+          await this._syncCurrentDevicePlaybackState({
+            isPlaying: Boolean(this.state.snapshot?.playing),
+            isActivePlayer: Boolean(this.state.snapshot?.playing)
+          });
         }
 
         if (Array.isArray(snapshot.devices)) {
@@ -986,6 +1294,14 @@ class AudiobookApp {
           ) {
             uiChanged = true;
           }
+        }
+
+        const hydrated = await this._hydrateActivePlaybackFromCloud(snapshot, { isStartup: false });
+        if (hydrated) {
+          uiChanged = true;
+        } else if (!this.state.activeBookKey && this.books.length > 0) {
+          await this.selectBook(this.books[0].bookKey, false, { skipDeviceSync: true });
+          uiChanged = true;
         }
 
         if (this.audioEngine?.playing && Date.now() - this._lastDeviceRegisterAt >= 14000) {
@@ -1012,19 +1328,22 @@ class AudiobookApp {
     let combined = baseLocalBooks;
 
     const hasCloudAuth = this._hasCloudSyncAuth();
+    let snapshot = null;
     let remoteBooks = [];
     let remoteDriveFolder = null;
     let remoteDevices = [];
+    let progressMap = null;
 
     if (hasCloudAuth) {
-      const [folderRes, booksRes, devicesRes] = await Promise.all([
-        this.syncService.fetchDriveFolderConfig?.().catch(() => null) ?? Promise.resolve(null),
-        this.syncService.fetchLibraryItems?.().catch(() => []) ?? Promise.resolve([]),
-        this.syncService.fetchDevices?.().catch(() => []) ?? Promise.resolve([])
-      ]);
-      remoteDriveFolder = folderRes;
-      remoteBooks = Array.isArray(booksRes) ? booksRes : [];
-      remoteDevices = Array.isArray(devicesRes) ? devicesRes : [];
+      snapshot = await this._pullCloudSnapshotUnified({ force: true });
+      remoteDriveFolder = snapshot?.driveFolder || null;
+      remoteBooks = Array.isArray(snapshot?.library)
+        ? snapshot.library
+        : Array.isArray(snapshot?.libraryItems)
+          ? snapshot.libraryItems
+          : [];
+      remoteDevices = Array.isArray(snapshot?.devices) ? snapshot.devices : [];
+      progressMap = snapshot?.progress || null;
       this.state.needsDriveSyncReauth = Boolean(this.syncService?.needsDriveSyncReauth);
 
       const savedFolderId = this._getSavedDriveFolderId();
@@ -1039,7 +1358,9 @@ class AudiobookApp {
       }
     }
 
-    const progressMap = await this.syncService.fetchAllProgress().catch(() => ({}));
+    if (!progressMap) {
+      progressMap = await this.syncService.fetchAllProgress().catch(() => ({}));
+    }
     this.books = combined.map((book) => {
       const normalized = this._normalizeBookRecord(book);
       const legacyKeys = this._legacyBookKeyMap?.get(normalized.bookKey);
@@ -1061,16 +1382,16 @@ class AudiobookApp {
       this._persistBooks();
     }
 
-    if (hasCloudAuth && this.books.length > 0) {
-      const remoteKeySet = new Set(
-        remoteBooks.map((rb) => this._normalizeBookRecord(rb)?.bookKey).filter(Boolean)
-      );
-      const hasMissingOrLocalOwned = this.books.some(
-        (b) => !remoteKeySet.has(b.bookKey) || this._hasLocalAudioOnCurrentDevice(b)
-      );
-      if (hasMissingOrLocalOwned) {
-        void this._syncLibraryToCloud(this.books);
-      }
+    if (hasCloudAuth && this.books.length === 0 && this._hasGoogleDriveToken()) {
+      await this._autoScanGoogleDriveIfEmpty();
+    }
+
+    if (hasCloudAuth && this._shouldPushLocalCatalog(remoteBooks)) {
+      await this._syncLibraryToCloud(this.books);
+      await this._syncCurrentDevicePlaybackState({
+        isPlaying: Boolean(this.state.snapshot?.playing),
+        isActivePlayer: Boolean(this.state.snapshot?.playing)
+      });
     }
 
     for (const book of this.books) {
@@ -1098,22 +1419,31 @@ class AudiobookApp {
     }
 
     if (this.books.length > 0) {
-      let savedActiveKey = null;
-      try {
-        savedActiveKey = localStorage.getItem(STORAGE_ACTIVE_BOOK_KEY);
-      } catch {
-        // ignore
-      }
-      const initialBook =
-        this.books.find(
-          (b) =>
-            b.bookKey === savedActiveKey ||
-            (savedActiveKey && this._legacyBookKeyMap?.get(b.bookKey)?.has(savedActiveKey))
-        ) ||
-        this.state.remotePlaybackPrompt?.book ||
-        this.books[0];
-      if (initialBook) {
-        await this.selectBook(initialBook.bookKey, false);
+      const hydrated = hasCloudAuth
+        ? await this._hydrateActivePlaybackFromCloud(
+            snapshot || { devices: remoteDevices, progress: progressMap, driveFolder: remoteDriveFolder },
+            { isStartup: true }
+          )
+        : false;
+
+      if (!hydrated) {
+        let savedActiveKey = null;
+        try {
+          savedActiveKey = localStorage.getItem(STORAGE_ACTIVE_BOOK_KEY);
+        } catch {
+          // ignore
+        }
+        const initialBook =
+          this.state.remotePlaybackPrompt?.book ||
+          this.books.find(
+            (b) =>
+              b.bookKey === savedActiveKey ||
+              (savedActiveKey && this._legacyBookKeyMap?.get(b.bookKey)?.has(savedActiveKey))
+          ) ||
+          this.books[0];
+        if (initialBook) {
+          await this.selectBook(initialBook.bookKey, false, { skipDeviceSync: true });
+        }
       }
       void this._runBackgroundMetadataEnrichment();
     } else {
@@ -1123,7 +1453,7 @@ class AudiobookApp {
 
     if (hasCloudAuth) {
       this._updateDevicesAndPrompt(remoteDevices);
-      this._syncCurrentDevicePlaybackState({
+      await this._syncCurrentDevicePlaybackState({
         isPlaying: Boolean(this.state.snapshot?.playing),
         isActivePlayer: Boolean(this.state.snapshot?.playing)
       });
@@ -1131,7 +1461,11 @@ class AudiobookApp {
   }
 
   async init() {
+    if (typeof window !== 'undefined') {
+      window.__audiobookApp = this;
+    }
     this._applyThemeBodyClass(this.state.theme);
+    this._applyPlatformViewportClasses();
     await this.offlineQueue.ready();
 
     // Handle OAuth callback if returning from Google login
@@ -1390,7 +1724,7 @@ class AudiobookApp {
 
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible' && (this.user || this.guestLocalMode) && this._hasCloudSyncAuth()) {
-          void this._runPeriodicCloudSync({ reason: 'visibility' });
+          void this._runPeriodicCloudSync({ force: true, reason: 'visibility' });
         }
       });
     }
@@ -1407,7 +1741,12 @@ class AudiobookApp {
       window.addEventListener('resize', handleViewportChange);
       window.addEventListener('focus', () => {
         if ((this.user || this.guestLocalMode) && this._hasCloudSyncAuth()) {
-          void this._runPeriodicCloudSync({ reason: 'focus' });
+          void this._runPeriodicCloudSync({ force: true, reason: 'focus' });
+        }
+      });
+      window.addEventListener('online', () => {
+        if ((this.user || this.guestLocalMode) && this._hasCloudSyncAuth()) {
+          void this._runPeriodicCloudSync({ force: true, reason: 'online' });
         }
       });
       window.addEventListener('pagehide', () => {
@@ -1540,7 +1879,7 @@ class AudiobookApp {
     this.render();
   }
 
-  async selectBook(bookKey, autoPlay = false) {
+  async selectBook(bookKey, autoPlay = false, options = {}) {
     const book = this.state.books.find((b) => b.bookKey === bookKey);
     if (!book) return;
     if (autoPlay && this._isRemoteLocalOnlyBook(book)) {
@@ -1578,7 +1917,8 @@ class AudiobookApp {
         positionSec: this.state.snapshot.positionSec
       });
       this._syncCurrentDevicePlaybackState({ isPlaying: true, isActivePlayer: true });
-    } else if (prevActiveKey && prevActiveKey !== book.bookKey && this._hasCloudSyncAuth()) {
+    } else if (!options?.skipDeviceSync && prevActiveKey !== book.bookKey && this._hasCloudSyncAuth()) {
+      this._lastLocalPlayAt = Date.now();
       this._syncCurrentDevicePlaybackState({ isPlaying: false, isActivePlayer: false });
     }
     this.render();
@@ -2425,18 +2765,19 @@ class AudiobookApp {
         );
         this.books = this._mergeSyncedBooks(this.books, normalizedDriveBooks);
         this._persistBooks();
-        if (this._hasCloudSyncAuth()) {
-          void this._syncLibraryToCloud(this.books);
-          if (cleanFolderId) {
-            void this.syncService.syncDriveFolderConfig?.({ folderId: cleanFolderId }).catch(() => null);
-          }
-        }
         this.state.driveModal.open = false;
         this.state.driveModal.loading = false;
         if (!this.state.activeBookKey) {
-          await this.selectBook(normalizedDriveBooks[0].bookKey, false);
+          await this.selectBook(normalizedDriveBooks[0].bookKey, false, { skipDeviceSync: true });
         } else {
           this.render();
+        }
+        if (this._hasCloudSyncAuth()) {
+          await this._syncLibraryToCloud(this.books);
+          if (cleanFolderId) {
+            await this.syncService.syncDriveFolderConfig?.({ folderId: cleanFolderId }).catch(() => null);
+          }
+          await this._syncCurrentDevicePlaybackState();
         }
         void this._runBackgroundMetadataEnrichment();
       } else {
@@ -2510,6 +2851,9 @@ class AudiobookApp {
           this.audioEngine.setDriveAccessToken(token);
         }
         await this._loadUserLibraryAndSync();
+        if (this.syncService.isAuthenticated()) {
+          this.syncService.connectRealtime?.();
+        }
         if (this._hasCloudSyncAuth()) {
           this._startBackgroundSync();
         }
@@ -2567,6 +2911,9 @@ class AudiobookApp {
           this.state.driveModal.error = '';
         }
         await this._loadUserLibraryAndSync();
+        if (this.syncService.isAuthenticated()) {
+          this.syncService.connectRealtime?.();
+        }
         if (this._hasCloudSyncAuth()) {
           this._startBackgroundSync();
         }
@@ -2653,16 +3000,30 @@ class AudiobookApp {
         manifest
       };
 
-      if (!silent && result?.updateAvailable) {
-        await this.handleInstallUpdate();
+      if (result?.updateAvailable) {
+        if (this.audioEngine?.playing) {
+          this.audioEngine.pause();
+        }
+        if (!silent) {
+          this.render();
+          if (typeof this.updaterService.enforceMandatoryUpdate === 'function') {
+            await this.updaterService.enforceMandatoryUpdate(result);
+            return;
+          }
+          await this.handleInstallUpdate();
+          return;
+        }
+        if (!prevDismissed) {
+          this.render();
+        }
+        if (typeof this.updaterService.enforceMandatoryUpdate === 'function') {
+          void this.updaterService.enforceMandatoryUpdate(result);
+        }
         return;
       }
       if (!silent && !result?.updateAvailable) {
         this.showStatusToast(`You're on the latest version (v${LOCAL_VERSION})`);
         return;
-      }
-      if (result?.updateAvailable && !prevDismissed) {
-        this.render();
       }
     } catch (err) {
       this.state.updateState.checking = false;
@@ -2734,6 +3095,17 @@ class AudiobookApp {
       };
     };
 
+    if (this.audioEngine?.playing) {
+      this.audioEngine.pause();
+    }
+    const gate =
+      typeof this.updaterService.mountMandatoryUpdateGate === 'function'
+        ? this.updaterService.mountMandatoryUpdateGate({
+            latestVersion: us.latestVersion || manifest?.version || LOCAL_VERSION,
+            latestBuild: manifest?.build || us.latestBuild || 1
+          })
+        : null;
+
     this.state.updateState = {
       ...us,
       installing: true,
@@ -2776,6 +3148,7 @@ class AudiobookApp {
             statusText = evt.message || 'Update failed.';
           }
 
+          gate?.updateStatus?.(statusText, pct, status === 'error');
           this.state.updateState = {
             ...this.state.updateState,
             installing,
@@ -2988,7 +3361,7 @@ class AudiobookApp {
     } = this.state;
 
     return `
-      <div id="profilePopover" class="popover-menu fixed right-3 sm:right-5 top-14 z-50 w-72 max-w-[calc(100vw-24px)] rounded-2xl p-3.5 text-sm">
+      <div id="profilePopover" class="popover-menu fixed right-3 sm:right-5 top-[calc(3.75rem+max(env(safe-area-inset-top,0px),var(--android-safe-top,0px)))] md:top-14 z-50 w-72 max-w-[calc(100vw-24px)] rounded-2xl p-3.5 text-sm">
         <div class="flex items-center gap-3 pb-3 border-b border-[var(--border-subtle)] min-w-0">
           <div class="w-10 h-10 rounded-full overflow-hidden bg-gradient-to-br from-[#1ed760] to-[#0f766e] flex items-center justify-center text-sm font-bold text-[#050506] shrink-0">
             ${
@@ -4062,10 +4435,10 @@ class AudiobookApp {
     };
 
     return `
-      <main class="relative w-full h-screen ambient-surface overflow-hidden flex flex-col">
+      <main class="relative w-full h-screen h-[100dvh] ambient-surface overflow-hidden flex flex-col">
         <!-- Mobile Top Header -->
-        <div class="px-4 pt-4 pb-2 flex items-center justify-between gap-2">
-          <div class="flex items-center gap-1.5 overflow-x-auto min-w-0">
+        <div class="px-4 pb-2 mobile-safe-top flex items-center justify-between gap-2">
+          <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar min-w-0">
             ${chip('all', 'All')}
             ${chip('local', 'Local')}
             ${chip('drive', 'Drive')}
@@ -4090,17 +4463,17 @@ class AudiobookApp {
           <div class="flex items-center gap-2 shrink-0">
             ${
               this._hasCloudSyncAuth() || (this.state.devices || []).length > 0
-                ? `<button data-action="open-devices-modal" aria-label="Devices" class="btn-press relative w-8 h-8 rounded-full surface-card flex items-center justify-center text-[var(--text-secondary)] hover:text-white">
+                ? `<button data-action="open-devices-modal" aria-label="Devices" class="btn-press relative w-9 h-9 rounded-full surface-card flex items-center justify-center text-[var(--text-secondary)] hover:text-white">
                     ${ICON_DEVICES(15)}
                     ${
                       this.state.remotePlaybackPrompt?.device?.isPlaying
-                        ? '<span class="absolute top-1 right-1 w-2 h-2 rounded-full bg-[#1ed760] live-dot-pulse"></span>'
+                        ? '<span class="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#1ed760] live-dot-pulse"></span>'
                         : ''
                     }
                   </button>`
                 : ''
             }
-            <button data-action="toggle-shade" aria-label="Notification Shade" class="btn-press w-8 h-8 rounded-full surface-card flex items-center justify-center text-[var(--text-secondary)] hover:text-white">
+            <button data-action="toggle-shade" aria-label="Notification Shade" class="btn-press w-9 h-9 rounded-full surface-card flex items-center justify-center text-[var(--text-secondary)] hover:text-white">
               ${ICON_CHEVRON(shadeVisible ? 'up' : 'down', 15)}
             </button>
             ${this._renderAvatarButton()}
@@ -4116,7 +4489,7 @@ class AudiobookApp {
         }
 
         <!-- Mobile Scrollable Content -->
-        <div id="mobileMainScroll" class="flex-1 overflow-y-auto px-4 pb-24 space-y-6 min-w-0 flex flex-col">
+        <div id="mobileMainScroll" class="flex-1 overflow-y-auto px-4 pb-24 mobile-safe-scroll-bottom space-y-6 min-w-0 flex flex-col">
           ${this._renderContinueFromDeviceCard()}
           ${
             this.books.length === 0
@@ -4199,7 +4572,7 @@ class AudiobookApp {
         ${
           activeBook
             ? `
-        <div class="absolute inset-x-3 bottom-3 z-20 rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
+        <div class="absolute inset-x-3 bottom-3 mobile-safe-miniplayer z-20 rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
           <div class="p-2.5 flex items-center gap-3 min-w-0">
             <button data-action="open-mobile-sheet" class="w-11 h-11 rounded-xl overflow-hidden shrink-0">
               ${this._renderCoverImg(activeBook)}
@@ -4218,7 +4591,7 @@ class AudiobookApp {
           </div>
         </div>`
             : `
-        <div class="absolute inset-x-3 bottom-3 z-20 rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
+        <div class="absolute inset-x-3 bottom-3 mobile-safe-miniplayer z-20 rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
           <div class="p-2.5 flex items-center gap-3 min-w-0">
             <div class="w-11 h-11 rounded-xl bg-white/5 border border-[var(--border-subtle)] flex items-center justify-center text-[var(--text-muted)] shrink-0">
               ${ICON_LIBRARY(18)}
@@ -4254,7 +4627,7 @@ class AudiobookApp {
         : '';
 
     return `
-      <div id="mobileSheetScroll" class="sheet-modal${noAnimCls} ambient-surface absolute inset-0 z-30 flex flex-col p-5 overflow-y-auto">
+      <div id="mobileSheetScroll" class="sheet-modal${noAnimCls} ambient-surface absolute inset-0 z-30 flex flex-col px-5 mobile-safe-sheet-top mobile-safe-bottom overflow-y-auto">
         <div class="flex items-center justify-between gap-2 pb-4">
           <button data-action="close-mobile-sheet" aria-label="Close" class="btn-press p-2 rounded-full hover:bg-white/10 text-white">
             ${ICON_CHEVRON('down', 20)}
@@ -5052,6 +5425,7 @@ class AudiobookApp {
 
   render() {
     if (!this.rootEl) return;
+    this._applyPlatformViewportClasses();
 
     const isLoggedIn = Boolean(this.user || this.guestLocalMode);
     const shell = this._ensureRootShell();
@@ -5322,6 +5696,7 @@ class AudiobookApp {
           }
           case 'skip': {
             this.audioEngine.skipSeconds(Number(el.dataset.delta || 0));
+            this._persistProgressCheckpoint(true);
             this._syncCurrentDevicePlaybackState();
             break;
           }

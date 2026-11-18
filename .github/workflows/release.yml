@@ -151,12 +151,20 @@ jobs:
           }
           fs.writeFileSync(gradlePath, gradle);
 
-          // 2. Patch MainActivity.java to register both AudiobookOAuthNative and AudiobookUpdaterNative
+          // 2. Patch MainActivity.java to register native bridges and configure dark system bars + safe insets
           const mainActivityPath = 'android/app/src/main/java/com/audiobook/player/MainActivity.java';
           const mainActivitySrc = `package com.audiobook.player;
 
           import android.content.Intent;
+          import android.graphics.Color;
           import android.os.Bundle;
+          import android.view.View;
+          import android.webkit.JavascriptInterface;
+          import androidx.core.graphics.Insets;
+          import androidx.core.view.ViewCompat;
+          import androidx.core.view.WindowCompat;
+          import androidx.core.view.WindowInsetsCompat;
+          import androidx.core.view.WindowInsetsControllerCompat;
           import com.getcapacitor.BridgeActivity;
 
           public class MainActivity extends BridgeActivity {
@@ -166,11 +174,37 @@ jobs:
               @Override
               public void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
+                  getWindow().setStatusBarColor(Color.parseColor("#060911"));
+                  getWindow().setNavigationBarColor(Color.parseColor("#060911"));
+                  WindowInsetsControllerCompat insetsController = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+                  if (insetsController != null) {
+                      insetsController.setAppearanceLightStatusBars(false);
+                      insetsController.setAppearanceLightNavigationBars(false);
+                  }
+                  View rootContent = findViewById(android.R.id.content);
+                  if (rootContent != null) {
+                      ViewCompat.setOnApplyWindowInsetsListener(rootContent, (v, windowInsets) -> {
+                          Insets insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+                          v.setPadding(insets.left, insets.top, insets.right, insets.bottom);
+                          return windowInsets;
+                      });
+                      ViewCompat.requestApplyInsets(rootContent);
+                  }
                   oauthBridge = new AudiobookOAuthBridge(this);
                   updaterBridge = new AudiobookUpdaterBridge(this);
                   if (getBridge() != null && getBridge().getWebView() != null) {
                       getBridge().getWebView().addJavascriptInterface(oauthBridge, "AudiobookOAuthNative");
                       getBridge().getWebView().addJavascriptInterface(updaterBridge, "AudiobookUpdaterNative");
+                      getBridge().getWebView().addJavascriptInterface(new Object() {
+                          @JavascriptInterface
+                          public boolean hasNativeInsets() {
+                              return true;
+                          }
+                      }, "AudiobookInsetsNative");
+                      getBridge().getWebView().evaluateJavascript(
+                          "window.__ANDROID_NATIVE_INSETS__ = true; if (document.documentElement) { document.documentElement.classList.add('has-native-insets'); document.documentElement.style.setProperty('--android-safe-top', '0px'); document.documentElement.style.setProperty('--android-safe-bottom', '0px'); }",
+                          null
+                      );
                   }
                   oauthBridge.handleRedirectIntent(getIntent());
               }
@@ -186,6 +220,28 @@ jobs:
           }
           `.replace(/^          /gm, '');
           fs.writeFileSync(mainActivityPath, mainActivitySrc);
+
+          // 2b. Patch styles.xml for dark status/navigation bars and Android 15 edge-to-edge opt-out
+          const stylesPath = 'android/app/src/main/res/values/styles.xml';
+          if (fs.existsSync(stylesPath)) {
+            let stylesXml = fs.readFileSync(stylesPath, 'utf8');
+            if (!stylesXml.includes('xmlns:tools=')) {
+              stylesXml = stylesXml.replace('<resources', '<resources xmlns:tools="http://schemas.android.com/tools"');
+            }
+            const styleItems = [
+              '        <item name="android:statusBarColor">#060911</item>',
+              '        <item name="android:navigationBarColor">#060911</item>',
+              '        <item name="android:windowOptOutEdgeToEdgeEnforcement" tools:targetApi="35">true</item>'
+            ].join('\n');
+            stylesXml = stylesXml.replace(
+              /(<style\b[^>]*name="(?:AppTheme|AppTheme\.NoActionBar)"[^>]*>[\s\S]*?)(<\/style>)/g,
+              (full, body, close) => {
+                if (body.includes('windowOptOutEdgeToEdgeEnforcement')) return full;
+                return `${body}\n${styleItems}\n    ${close}`;
+              }
+            );
+            fs.writeFileSync(stylesPath, stylesXml);
+          }
 
           // 3. Patch AndroidManifest.xml: preserve 7 permissions, enforce singleTask, add OAuth deep-link, Android Auto / MediaBrowserService, MediaButtonReceiver & FileProvider
           const manifestPath = 'android/app/src/main/AndroidManifest.xml';
