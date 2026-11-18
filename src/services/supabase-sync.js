@@ -628,6 +628,8 @@ export class SupabaseSyncService {
       null;
     this._bridgeInFlight = new Map();
     this._bridgeFailedEmails = new Set();
+    this._silentGoogleRefreshInFlight = null;
+    this._lastSilentGoogleRefreshFailAt = 0;
 
     this._onOnlineBound = () => {
       void this.flushOfflineQueue();
@@ -753,11 +755,15 @@ export class SupabaseSyncService {
   }
 
   /**
-   * Returns true if either a Supabase session or a Google OAuth token is active for cloud sync.
+   * Returns true if either a Supabase session or a Google OAuth token/session is active for cloud sync.
    * @returns {boolean}
    */
   hasCloudSyncAuth() {
-    return Boolean(this.isAuthenticated() || this.getGoogleAccessToken());
+    return Boolean(
+      this.isAuthenticated() ||
+        this.getGoogleAccessToken() ||
+        this.session?.auth_mode === 'google_oauth'
+    );
   }
 
   /**
@@ -861,6 +867,7 @@ export class SupabaseSyncService {
     this.googleAccessToken = clean || null;
     if (clean) {
       this.needsDriveSyncReauth = false;
+      this._lastSilentGoogleRefreshFailAt = 0;
     } else {
       this.driveSyncFileId = null;
       this.lastDriveSyncModifiedTime = null;
@@ -1092,6 +1099,23 @@ export class SupabaseSyncService {
         this.session.user.email,
         this.session.user.user_metadata || {}
       ).catch(() => null);
+    }
+
+    if (
+      this.session?.auth_mode === 'google_oauth' &&
+      !this.getGoogleAccessToken() &&
+      this._isTauriEnvironment()
+    ) {
+      const refreshed = await this._trySilentGoogleRefresh().catch(() => false);
+      if (!refreshed && !this.isAuthenticated()) {
+        this.needsDriveSyncReauth = true;
+      }
+    } else if (
+      this.session?.auth_mode === 'google_oauth' &&
+      !this.getGoogleAccessToken() &&
+      !this.isAuthenticated()
+    ) {
+      this.needsDriveSyncReauth = true;
     }
 
     if (this.isAuthenticated()) {
@@ -1634,6 +1658,16 @@ export class SupabaseSyncService {
         if (startRes?.status === 'success' && startRes?.accessToken) {
           return await this.completeGoogleOAuthToken(startRes.accessToken);
         }
+        if (startRes?.status === 'needs_interactive' && options.silent) {
+          if (options.autoInteractiveOnSilentFail !== false) {
+            return this.signInWithGooglePopup({ ...options, silent: false });
+          }
+          return {
+            ok: false,
+            reason: 'needs_interactive',
+            error: 'Interactive Google sign-in required.'
+          };
+        }
         const startedAt = Date.now();
         while (Date.now() - startedAt < 180000) {
           await new Promise((r) => setTimeout(r, 350));
@@ -1649,7 +1683,14 @@ export class SupabaseSyncService {
             };
           }
           if (pollRes?.status === 'needs_interactive' && options.silent) {
-            return this.signInWithGooglePopup({ ...options, silent: false });
+            if (options.autoInteractiveOnSilentFail !== false) {
+              return this.signInWithGooglePopup({ ...options, silent: false });
+            }
+            return {
+              ok: false,
+              reason: 'needs_interactive',
+              error: 'Interactive Google sign-in required.'
+            };
           }
         }
         return {
@@ -2241,6 +2282,8 @@ export class SupabaseSyncService {
     this.googleAccessToken = null;
     this._bridgeFailedEmails?.clear();
     this._bridgeInFlight?.clear();
+    this._silentGoogleRefreshInFlight = null;
+    this._lastSilentGoogleRefreshFailAt = 0;
     this.setGoogleAccessToken(null);
     this._saveSession(null);
     this.disconnectRealtime();
@@ -2254,20 +2297,77 @@ export class SupabaseSyncService {
     }
   }
 
+  /**
+   * Attempts a silent background Google OAuth refresh on Tauri without opening a visible popup.
+   * Deduplicates concurrent calls and applies a 60s cooldown after failed attempts.
+   * @returns {Promise<boolean>}
+   */
+  async _trySilentGoogleRefresh() {
+    if (
+      !this._isTauriEnvironment() ||
+      !this._isOnline() ||
+      !this.session?.user?.email ||
+      (this.session?.auth_mode !== 'google_oauth' && !this.getGoogleAccessToken())
+    ) {
+      return false;
+    }
+    if (this._silentGoogleRefreshInFlight) {
+      return this._silentGoogleRefreshInFlight;
+    }
+    if (
+      this._lastSilentGoogleRefreshFailAt &&
+      Date.now() - this._lastSilentGoogleRefreshFailAt < 60_000
+    ) {
+      return false;
+    }
+
+    const email = this.session.user.email;
+    this._silentGoogleRefreshInFlight = (async () => {
+      try {
+        const res = await this.signInWithGooglePopup({
+          silent: true,
+          forceRefresh: true,
+          autoInteractiveOnSilentFail: false,
+          hint: email
+        });
+        if (res?.ok && this.getGoogleAccessToken()) {
+          this._lastSilentGoogleRefreshFailAt = 0;
+          return true;
+        }
+        this._lastSilentGoogleRefreshFailAt = Date.now();
+        return false;
+      } catch {
+        this._lastSilentGoogleRefreshFailAt = Date.now();
+        return false;
+      } finally {
+        this._silentGoogleRefreshInFlight = null;
+      }
+    })();
+
+    return this._silentGoogleRefreshInFlight;
+  }
+
   async _driveFetch(url, init = {}) {
     const token = this.getGoogleAccessToken();
     if (!token || !this.fetchImpl || !this._isOnline()) {
       return { res: null, forbidden: false, unauthorized: false, text: '' };
     }
+    const { _retriedSilentRefresh = false, ...fetchInit } = init;
     try {
       const res = await this.fetchImpl(url, {
-        ...init,
+        ...fetchInit,
         headers: {
           Authorization: `Bearer ${token}`,
-          ...(init.headers || {})
+          ...(fetchInit.headers || {})
         }
       });
       if (res.status === 401) {
+        if (!_retriedSilentRefresh) {
+          const refreshed = await this._trySilentGoogleRefresh().catch(() => false);
+          if (refreshed && this.getGoogleAccessToken()) {
+            return this._driveFetch(url, { ...fetchInit, _retriedSilentRefresh: true });
+          }
+        }
         const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
         this.needsDriveSyncReauth = true;
         return { res, forbidden: false, unauthorized: true, text };

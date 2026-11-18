@@ -316,7 +316,6 @@ class AudiobookApp {
     this._overlayState = {};
     this._legacyBookKeyMap = new Map();
     this._backgroundSyncTimer = null;
-    this._startupUpdateTimer = null;
     this._syncInFlight = null;
     this._lastDeviceRegisterAt = 0;
     this._lastLocalPlayAt = 0;
@@ -952,10 +951,21 @@ class AudiobookApp {
     );
   }
 
-  _shouldPushLocalCatalog(remoteBooks = []) {
+  _shouldPushLocalCatalog(remoteBooks = [], remoteDriveFolder = null) {
     if (this.books.length === 0) return false;
     const remoteList = Array.isArray(remoteBooks) ? remoteBooks : [];
+    if (remoteList.length === 0 && this.books.length > 0) return true;
     if (this.books.length > remoteList.length) return true;
+    if (
+      this.state.activeBookKey &&
+      remoteDriveFolder &&
+      this.state.activeBookKey !== (remoteDriveFolder.lastActiveBookKey || null)
+    ) {
+      const remoteFolderMs = Date.parse(remoteDriveFolder.updatedAt || '') || 0;
+      if (!remoteDriveFolder.lastActiveBookKey || (this._lastLocalPlayAt || 0) >= remoteFolderMs) {
+        return true;
+      }
+    }
     const remoteByKey = new Map();
     for (const rb of remoteList) {
       const norm = this._normalizeBookRecord(rb);
@@ -1203,10 +1213,6 @@ class AudiobookApp {
   destroy() {
     this._destroyed = true;
     this._stopBackgroundSync();
-    if (this._startupUpdateTimer) {
-      clearTimeout(this._startupUpdateTimer);
-      this._startupUpdateTimer = null;
-    }
     if (this._statusToastTimer) {
       clearTimeout(this._statusToastTimer);
       this._statusToastTimer = null;
@@ -1276,7 +1282,7 @@ class AudiobookApp {
           }
         }
 
-        if (this._shouldPushLocalCatalog(remoteBooks)) {
+        if (this._shouldPushLocalCatalog(remoteBooks, snapshot?.driveFolder)) {
           await this._syncLibraryToCloud(this.books);
           await this._syncCurrentDevicePlaybackState({
             isPlaying: Boolean(this.state.snapshot?.playing),
@@ -1386,7 +1392,7 @@ class AudiobookApp {
       await this._autoScanGoogleDriveIfEmpty();
     }
 
-    if (hasCloudAuth && this._shouldPushLocalCatalog(remoteBooks)) {
+    if (hasCloudAuth && this._shouldPushLocalCatalog(remoteBooks, remoteDriveFolder)) {
       await this._syncLibraryToCloud(this.books);
       await this._syncCurrentDevicePlaybackState({
         isPlaying: Boolean(this.state.snapshot?.playing),
@@ -1466,6 +1472,9 @@ class AudiobookApp {
     }
     this._applyThemeBodyClass(this.state.theme);
     this._applyPlatformViewportClasses();
+    if (!this._destroyed) {
+      void this.handleCheckForUpdate({ silent: true });
+    }
     await this.offlineQueue.ready();
 
     // Handle OAuth callback if returning from Google login
@@ -1551,15 +1560,6 @@ class AudiobookApp {
     }
     if (this._hasCloudSyncAuth()) {
       this._startBackgroundSync();
-    }
-    if (typeof setTimeout === 'function' && !this._destroyed) {
-      this._startupUpdateTimer = setTimeout(() => {
-        this._startupUpdateTimer = null;
-        if (!this._destroyed) {
-          void this.handleCheckForUpdate({ silent: true });
-        }
-      }, 2000);
-      this._startupUpdateTimer?.unref?.();
     }
     await this.mediaBridge.refreshAudioOutputs().catch(() => null);
     this._bindGlobalInputs();
@@ -3517,12 +3517,12 @@ class AudiobookApp {
       ? `
       <div class="sync-reauth-banner px-4 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 min-w-0">
         <div class="min-w-0 flex-1">
-          <div class="text-xs font-semibold text-white truncate">Cloud library sync needs Google Drive AppData access</div>
-          <div class="text-[11px] text-[var(--text-secondary)] truncate">Grant sync permission once to share your library, Drive folder, and playback across devices.</div>
+          <div class="text-xs font-semibold text-white truncate">Google session expired — reconnect to sync your library &amp; playback across devices</div>
+          <div class="text-[11px] text-[var(--text-secondary)] truncate">Reconnect once to sync your audiobooks, Drive folder, and playback across devices.</div>
         </div>
         <div class="flex items-center gap-2 shrink-0">
           <button type="button" data-action="reauth-drive-sync" class="btn-press px-3.5 py-1.5 rounded-full bg-[#60a5fa] text-[#050506] text-xs font-bold">
-            Enable Cloud Library Sync
+            Reconnect Google Sync
           </button>
         </div>
       </div>`
@@ -3725,6 +3725,9 @@ class AudiobookApp {
   }
 
   _renderEmptyLibraryCard() {
+    const needsReauth = Boolean(
+      this.user && (this.state.needsDriveSyncReauth || this.syncService?.needsDriveSyncReauth)
+    );
     return `
       <div class="flex-1 min-h-[360px] flex items-center justify-center p-4">
         <div class="w-full max-w-md surface-card rounded-3xl p-7 text-center space-y-5 border border-[var(--border-subtle)]">
@@ -3732,11 +3735,22 @@ class AudiobookApp {
             ${ICON_LIBRARY(26)}
           </div>
           <div class="space-y-1">
-            <h2 class="text-lg font-bold text-white">Your library is empty</h2>
-            <p class="text-xs text-[var(--text-secondary)]">Import audiobooks from your device or Google Drive.</p>
+            <h2 class="text-lg font-bold text-white">${needsReauth ? 'Google Sync needs reconnection' : 'Your library is empty'}</h2>
+            <p class="text-xs text-[var(--text-secondary)]">${
+              needsReauth
+                ? 'Google session expired — reconnect to sync your library & playback across devices.'
+                : 'Import audiobooks from your device or Google Drive.'
+            }</p>
           </div>
           <div class="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center justify-center gap-2.5 pt-1">
-            <button data-action="trigger-local-folder" class="btn-press px-4 py-2.5 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold">
+            ${
+              needsReauth
+                ? `<button data-action="reauth-drive-sync" class="btn-press px-4 py-2.5 rounded-full bg-[#60a5fa] text-[#050506] text-xs font-bold">
+              Reconnect Google to Sync Library
+            </button>`
+                : ''
+            }
+            <button data-action="trigger-local-folder" class="btn-press px-4 py-2.5 rounded-full ${needsReauth ? 'surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white font-semibold' : 'bg-[#1ed760] text-[#050506] font-bold'} text-xs">
               ${this._isAndroidOrMobileViewport() ? 'Add Local Folder / Files' : 'Add Local Folder'}
             </button>
             <button data-action="trigger-local-files" class="btn-press px-4 py-2.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white text-xs font-semibold">

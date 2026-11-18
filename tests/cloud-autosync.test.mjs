@@ -586,3 +586,119 @@ test('pullCloudSnapshot computes latestActivePlayback prioritizing recent isPlay
 
   sync.destroy();
 });
+
+test('Tauri _driveFetch 401 triggers _trySilentGoogleRefresh and retries appDataFolder without interactive popup', async () => {
+  const oauthInvokes = [];
+  let pollMode = 'success';
+  const fakeTauriWindow = {
+    location: { origin: 'https://tauri.localhost', protocol: 'https:' },
+    __TAURI_INTERNALS__: {
+      invoke: async (cmd, args) => {
+        oauthInvokes.push({ cmd, args });
+        if (cmd === 'desktop_start_google_oauth') {
+          return { status: 'pending', accessToken: null };
+        }
+        if (cmd === 'desktop_poll_google_oauth') {
+          if (pollMode === 'success') {
+            return { status: 'success', accessToken: 'ya29.refreshed-tauri-token' };
+          }
+          return { status: 'needs_interactive', accessToken: null };
+        }
+        return null;
+      }
+    }
+  };
+
+  const driveAuthHeaders = [];
+  const fetchImpl = async (url, init = {}) => {
+    if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            sub: 'google-sub-99',
+            email: 'reader.one@gmail.com',
+            name: 'Reader One'
+          };
+        }
+      };
+    }
+    if (url.includes('googleapis.com/drive/v3/files')) {
+      const auth = init?.headers?.Authorization || '';
+      driveAuthHeaders.push(auth);
+      if (auth === 'Bearer ya29.expired-tauri-token') {
+        return {
+          ok: false,
+          status: 401,
+          async text() {
+            return JSON.stringify({ error: { code: 401, message: 'Invalid Credentials' } });
+          }
+        };
+      }
+      if (auth === 'Bearer ya29.refreshed-tauri-token') {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { files: [{ id: 'drv-sync-1', name: 'audiobook-player-sync-v1.json', modifiedTime: '2026-11-18T17:00:00.000Z' }] };
+          }
+        };
+      }
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeTauriWindow,
+    navigatorObj: { onLine: true, userAgent: 'Windows NT 10.0' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl
+  });
+
+  sync.setSession({
+    access_token: null,
+    auth_mode: 'google_oauth',
+    provider_token: 'ya29.expired-tauri-token',
+    user: { id: 'google_99', email: 'reader.one@gmail.com' }
+  });
+
+  // Case 1: 401 on Drive appDataFolder triggers silent Tauri OAuth refresh and retries seamlessly
+  const firstRes = await sync._driveFetch('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder');
+  assert.equal(firstRes.unauthorized, false);
+  assert.equal(firstRes.res?.ok, true);
+  assert.equal(sync.getGoogleAccessToken(), 'ya29.refreshed-tauri-token');
+  assert.equal(sync.needsDriveSyncReauth, false);
+  assert.deepEqual(driveAuthHeaders, [
+    'Bearer ya29.expired-tauri-token',
+    'Bearer ya29.refreshed-tauri-token'
+  ]);
+  const startCalls = oauthInvokes.filter((c) => c.cmd === 'desktop_start_google_oauth');
+  assert.equal(startCalls.length, 1);
+  assert.equal(startCalls[0].args.silent, true);
+  assert.equal(startCalls[0].args.forceRefresh, true);
+  assert.equal(startCalls[0].args.loginHint, 'reader.one@gmail.com');
+
+  // Case 2: When silent refresh returns needs_interactive, NEVER escalate to interactive popup and apply 60s cooldown
+  pollMode = 'needs_interactive';
+  sync.setGoogleAccessToken('ya29.expired-tauri-token');
+  const secondRes = await sync._driveFetch('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder');
+  assert.equal(secondRes.unauthorized, true);
+  assert.equal(sync.needsDriveSyncReauth, true);
+  const startCallsAfter = oauthInvokes.filter((c) => c.cmd === 'desktop_start_google_oauth');
+  assert.equal(startCallsAfter.length, 2, 'Must NOT open a second interactive popup on needs_interactive');
+  assert.equal(startCallsAfter[1].args.silent, true);
+
+  // Cooldown prevents looping on immediate retry
+  const cooledDown = await sync._trySilentGoogleRefresh();
+  assert.equal(cooledDown, false);
+  assert.equal(
+    oauthInvokes.filter((c) => c.cmd === 'desktop_start_google_oauth').length,
+    2,
+    '60s cooldown must skip repeated silent refresh attempts'
+  );
+
+  sync.destroy();
+});

@@ -106,6 +106,7 @@ jobs:
           cp index.html version.json oauth-callback.html dist/
           if [ -f sw.js ]; then cp sw.js dist/; fi
           cp -r public src dist/
+          (cd dist && zip -r ../web-bundle.zip .)
           node -e "const fs=require('fs');const c=JSON.parse(fs.readFileSync('capacitor.config.json','utf8'));c.webDir='dist';fs.writeFileSync('capacitor.config.json',JSON.stringify(c,null,2));"
           npm install --no-save @capacitor/core @capacitor/cli @capacitor/android
           npx cap add android
@@ -151,7 +152,7 @@ jobs:
           }
           fs.writeFileSync(gradlePath, gradle);
 
-          // 2. Patch MainActivity.java to register native bridges and configure dark system bars + safe insets
+          // 2. Patch MainActivity.java to register native bridges, configure dark system bars + safe insets, and boot newer Web OTA bundles
           const mainActivityPath = 'android/app/src/main/java/com/audiobook/player/MainActivity.java';
           const mainActivitySrc = `package com.audiobook.player;
 
@@ -166,6 +167,13 @@ jobs:
           import androidx.core.view.WindowInsetsCompat;
           import androidx.core.view.WindowInsetsControllerCompat;
           import com.getcapacitor.BridgeActivity;
+          import java.io.BufferedReader;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.nio.charset.StandardCharsets;
+          import org.json.JSONObject;
 
           public class MainActivity extends BridgeActivity {
               private AudiobookOAuthBridge oauthBridge;
@@ -174,6 +182,7 @@ jobs:
               @Override
               public void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
+                  WindowCompat.setDecorFitsSystemWindows(getWindow(), true);
                   getWindow().setStatusBarColor(Color.parseColor("#060911"));
                   getWindow().setNavigationBarColor(Color.parseColor("#060911"));
                   WindowInsetsControllerCompat insetsController = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
@@ -186,7 +195,7 @@ jobs:
                       ViewCompat.setOnApplyWindowInsetsListener(rootContent, (v, windowInsets) -> {
                           Insets insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
                           v.setPadding(insets.left, insets.top, insets.right, insets.bottom);
-                          return windowInsets;
+                          return WindowInsetsCompat.CONSUMED;
                       });
                       ViewCompat.requestApplyInsets(rootContent);
                   }
@@ -206,7 +215,56 @@ jobs:
                           null
                       );
                   }
+                  try {
+                      File otaDir = new File(getFilesDir(), "ota-web");
+                      File otaIndex = new File(otaDir, "index.html");
+                      File otaVersion = new File(otaDir, "version.json");
+                      if (otaIndex.isFile() && otaVersion.isFile()) {
+                          int otaBuild = 0;
+                          try (InputStream otaStream = new FileInputStream(otaVersion)) {
+                              otaBuild = readBuildFromStream(otaStream);
+                          }
+                          int bundledBuild = 0;
+                          try (InputStream bundledStream = getAssets().open("public/version.json")) {
+                              bundledBuild = readBuildFromStream(bundledStream);
+                          } catch (Exception ignored) {
+                              bundledBuild = 0;
+                          }
+                          if (otaBuild > bundledBuild && getBridge() != null) {
+                              getBridge().setServerBasePath(otaDir.getAbsolutePath());
+                          } else if (bundledBuild >= otaBuild) {
+                              deleteRecursive(otaDir);
+                          }
+                      }
+                  } catch (Exception ignored) {
+                  }
                   oauthBridge.handleRedirectIntent(getIntent());
+              }
+
+              private static int readBuildFromStream(InputStream stream) {
+                  if (stream == null) return 0;
+                  try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+                      StringBuilder sb = new StringBuilder();
+                      String line;
+                      while ((line = reader.readLine()) != null) {
+                          sb.append(line);
+                      }
+                      JSONObject json = new JSONObject(sb.toString());
+                      return json.optInt("build", 0);
+                  } catch (Exception ignored) {
+                      return 0;
+                  }
+              }
+
+              private static void deleteRecursive(File target) {
+                  if (target == null || !target.exists()) return;
+                  File[] children = target.listFiles();
+                  if (children != null) {
+                      for (File child : children) {
+                          deleteRecursive(child);
+                      }
+                  }
+                  target.delete();
               }
 
               @Override
@@ -411,6 +469,13 @@ jobs:
           name: Audiobook-Player-apk
           path: Audiobook-Player.apk
 
+      - name: Upload Web OTA bundle workflow artifact
+        if: steps.changes.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Audiobook-Player-web-bundle
+          path: web-bundle.zip
+
   build-windows-release:
     name: Build Windows Desktop EXE
     runs-on: windows-latest
@@ -490,7 +555,13 @@ jobs:
           name: Audiobook-Player-exe
           path: release-assets
 
-      - name: Publish GitHub Release with APK and EXE
+      - name: Download Web OTA bundle artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Audiobook-Player-web-bundle
+          path: release-assets
+
+      - name: Publish GitHub Release with APK, Web OTA Bundle, and EXE
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.build-android-release.outputs.version }}
@@ -499,4 +570,5 @@ jobs:
           files: |
             release-assets/Audiobook-Player.apk
             release-assets/Audiobook-Player.exe
+            release-assets/web-bundle.zip
           make_latest: true

@@ -1,6 +1,7 @@
 package com.audiobook.player;
 
 import android.content.Intent;
+import android.content.pm.PackageInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.provider.Settings;
@@ -17,11 +18,13 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 import org.json.JSONException;
 import org.json.JSONObject;
 
 /**
- * Native Android APK downloader and package installer bridge for Capacitor.
+ * Native Android APK and Web OTA updater bridge for Capacitor.
  * Exposed to the WebView as `window.AudiobookUpdaterNative`.
  */
 public class AudiobookUpdaterBridge {
@@ -31,7 +34,9 @@ public class AudiobookUpdaterBridge {
     private static final String ALLOWED_PREFIX_OBJECTS =
         "https://objects.githubusercontent.com/";
     private static final String APK_FILENAME = "Audiobook-Player-update.apk";
+    private static final String WEB_OTA_FILENAME = "web-bundle-update.zip";
     private static final long MIN_APK_BYTES = 500_000L;
+    private static final long MIN_WEB_OTA_BYTES = 10_000L;
     private static final int MAX_REDIRECTS = 8;
 
     private final BridgeActivity activity;
@@ -39,6 +44,150 @@ public class AudiobookUpdaterBridge {
 
     public AudiobookUpdaterBridge(BridgeActivity activity) {
         this.activity = activity;
+    }
+
+    @JavascriptInterface
+    @SuppressWarnings("deprecation")
+    public int getNativeBuild() {
+        try {
+            PackageInfo info = activity
+                .getPackageManager()
+                .getPackageInfo(activity.getPackageName(), 0);
+            if (info == null) {
+                return 0;
+            }
+            if (Build.VERSION.SDK_INT >= 28) {
+                return (int) info.getLongVersionCode();
+            }
+            return info.versionCode;
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
+    @JavascriptInterface
+    public void startWebOtaUpdate(final String zipUrl) {
+        final String trimmedUrl = zipUrl != null ? zipUrl.trim() : "";
+        if (!isAllowedInitialUrl(trimmedUrl)) {
+            dispatchProgress("error", -1, "Untrusted Web OTA download URL.");
+            return;
+        }
+
+        if (!downloadInProgress.compareAndSet(false, true)) {
+            dispatchProgress("downloading", 0, "Update download is already in progress.");
+            return;
+        }
+
+        new Thread(
+            () -> {
+                File zipFile = null;
+                File stagingDir = null;
+                try {
+                    dispatchProgress("downloading", 0, "Downloading fast in-app update...");
+                    File cacheRoot = activity.getCacheDir();
+                    if (cacheRoot == null) {
+                        cacheRoot = activity.getExternalCacheDir();
+                    }
+                    if (cacheRoot == null) {
+                        throw new IOException("No cache directory available for Web OTA download.");
+                    }
+                    if (!cacheRoot.exists()) {
+                        cacheRoot.mkdirs();
+                    }
+
+                    zipFile = new File(cacheRoot, WEB_OTA_FILENAME);
+                    if (zipFile.exists()) {
+                        zipFile.delete();
+                    }
+
+                    downloadWithRedirects(trimmedUrl, zipFile);
+
+                    if (!zipFile.exists() || zipFile.length() <= MIN_WEB_OTA_BYTES) {
+                        long len = zipFile.exists() ? zipFile.length() : 0L;
+                        throw new IOException(
+                            "Downloaded Web OTA bundle is invalid or too small (" + len + " bytes)."
+                        );
+                    }
+
+                    if (!hasZipPkHeader(zipFile)) {
+                        throw new IOException(
+                            "Downloaded Web OTA bundle is not a valid ZIP archive (missing PK header)."
+                        );
+                    }
+
+                    File filesRoot = activity.getFilesDir();
+                    if (filesRoot == null) {
+                        throw new IOException("No internal files directory available for Web OTA.");
+                    }
+
+                    stagingDir = new File(filesRoot, "ota-web-staging");
+                    deleteRecursive(stagingDir);
+                    if (!stagingDir.mkdirs() && !stagingDir.isDirectory()) {
+                        throw new IOException("Failed to create Web OTA staging directory.");
+                    }
+
+                    final String stagingCanonical = stagingDir.getCanonicalPath();
+                    unzipToStaging(zipFile, stagingDir, stagingCanonical);
+
+                    File stagedIndex = new File(stagingDir, "index.html");
+                    File stagedVersion = new File(stagingDir, "version.json");
+                    if (!stagedIndex.isFile() || !stagedVersion.isFile()) {
+                        throw new IOException("Web OTA bundle missing index.html or version.json.");
+                    }
+
+                    File otaDir = new File(filesRoot, "ota-web");
+                    File oldDir = new File(filesRoot, "ota-web-old");
+                    deleteRecursive(oldDir);
+                    if (otaDir.exists() && !otaDir.renameTo(oldDir)) {
+                        deleteRecursive(otaDir);
+                    }
+                    if (!stagingDir.renameTo(otaDir)) {
+                        if (oldDir.exists() && !otaDir.exists()) {
+                            oldDir.renameTo(otaDir);
+                        }
+                        throw new IOException("Failed to swap Web OTA update into place.");
+                    }
+                    deleteRecursive(oldDir);
+
+                    if (zipFile.exists()) {
+                        zipFile.delete();
+                    }
+
+                    dispatchProgress("reloading", 100, "Applying update...");
+                    final String otaPath = otaDir.getAbsolutePath();
+                    activity.runOnUiThread(
+                        () -> {
+                            try {
+                                if (activity.getBridge() != null) {
+                                    activity.getBridge().setServerBasePath(otaPath);
+                                }
+                            } catch (Exception e) {
+                                dispatchProgress(
+                                    "error",
+                                    -1,
+                                    "Failed to apply Web OTA bundle: " + e.getMessage()
+                                );
+                            }
+                        }
+                    );
+                } catch (Exception e) {
+                    if (zipFile != null && zipFile.exists()) {
+                        zipFile.delete();
+                    }
+                    if (stagingDir != null && stagingDir.exists()) {
+                        deleteRecursive(stagingDir);
+                    }
+                    String msg = e.getMessage();
+                    if (msg == null || msg.trim().isEmpty()) {
+                        msg = "Web OTA update failed.";
+                    }
+                    dispatchProgress("error", -1, msg);
+                } finally {
+                    downloadInProgress.set(false);
+                }
+            },
+            "AudiobookWebOtaUpdater"
+        ).start();
     }
 
     @JavascriptInterface
@@ -271,6 +420,65 @@ public class AudiobookUpdaterBridge {
             int read = fis.read(header);
             return read == 2 && header[0] == 0x50 && header[1] == 0x4B;
         }
+    }
+
+    private static void unzipToStaging(File zipFile, File stagingDir, String stagingCanonical)
+        throws IOException {
+        try (
+            ZipInputStream zis = new ZipInputStream(
+                new BufferedInputStream(new FileInputStream(zipFile))
+            )
+        ) {
+            ZipEntry entry;
+            byte[] buffer = new byte[16384];
+            while ((entry = zis.getNextEntry()) != null) {
+                String entryName = entry.getName();
+                if (entryName == null || entryName.trim().isEmpty()) {
+                    zis.closeEntry();
+                    continue;
+                }
+                File dest = new File(stagingDir, entryName);
+                String destCanonical = dest.getCanonicalPath();
+                if (entry.isDirectory() && destCanonical.equals(stagingCanonical)) {
+                    zis.closeEntry();
+                    continue;
+                }
+                if (!destCanonical.startsWith(stagingCanonical + File.separator)) {
+                    throw new IOException("Blocked unsafe ZIP entry path: " + entryName);
+                }
+                if (entry.isDirectory()) {
+                    if (!dest.exists() && !dest.mkdirs()) {
+                        throw new IOException("Failed to create directory: " + entryName);
+                    }
+                } else {
+                    File parent = dest.getParentFile();
+                    if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                        throw new IOException("Failed to create parent directory for: " + entryName);
+                    }
+                    try (FileOutputStream fos = new FileOutputStream(dest, false)) {
+                        int count;
+                        while ((count = zis.read(buffer)) != -1) {
+                            fos.write(buffer, 0, count);
+                        }
+                        fos.flush();
+                    }
+                }
+                zis.closeEntry();
+            }
+        }
+    }
+
+    private static void deleteRecursive(File target) {
+        if (target == null || !target.exists()) {
+            return;
+        }
+        File[] children = target.listFiles();
+        if (children != null) {
+            for (File child : children) {
+                deleteRecursive(child);
+            }
+        }
+        target.delete();
     }
 
     private void dispatchProgress(String status, int progress, String message) {

@@ -1,6 +1,6 @@
-export const LOCAL_VERSION = '1.0.13';
-export const LOCAL_BUILD = 14;
-const LOCAL_BUILD_VERSION = '1.0.13';
+export const LOCAL_VERSION = '1.0.14';
+export const LOCAL_BUILD = 15;
+const LOCAL_BUILD_VERSION = '1.0.14';
 
 /**
  * Detect the runtime platform for update delivery.
@@ -45,6 +45,8 @@ export const DEFAULT_APK_DOWNLOAD_URL =
   'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk';
 export const DEFAULT_EXE_DOWNLOAD_URL =
   'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe';
+export const DEFAULT_WEB_BUNDLE_URL =
+  'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip';
 export const DEFAULT_OTA_BUNDLE_URL = 'https://larxe1.github.io/Audiobook-Player/';
 export const GITHUB_PAGES_APK_URL = 'https://larxe1.github.io/Audiobook-Player/Audiobook-Player.apk';
 export const GITHUB_RELEASES_TAG_API_PREFIX =
@@ -151,7 +153,7 @@ function isRepoReleaseDownloadUrl(url) {
 /**
  * Normalize either a direct version.json manifest or a GitHub Releases API payload.
  * @param {Record<string, any>} payload
- * @param {{ manifestUrl?: string, apkDownloadUrl?: string, exeDownloadUrl?: string, otaBundleUrl?: string }} [defaults]
+ * @param {{ manifestUrl?: string, apkDownloadUrl?: string, exeDownloadUrl?: string, otaBundleUrl?: string, webBundleUrl?: string }} [defaults]
  */
 function normalizeManifest(payload, defaults = {}) {
   if (!payload || typeof payload !== 'object') {
@@ -162,12 +164,22 @@ function normalizeManifest(payload, defaults = {}) {
   const defaultApkUrl = defaults.apkDownloadUrl || DEFAULT_APK_DOWNLOAD_URL;
   const defaultExeUrl = defaults.exeDownloadUrl || DEFAULT_EXE_DOWNLOAD_URL;
   const defaultOtaUrl = defaults.otaBundleUrl || DEFAULT_OTA_BUNDLE_URL;
+  const defaultWebBundleUrl = defaults.webBundleUrl || DEFAULT_WEB_BUNDLE_URL;
+  const parsedMinNativeBuild = Number(payload.minNativeBuild);
+  const minNativeBuild =
+    Number.isFinite(parsedMinNativeBuild) && parsedMinNativeBuild > 0 ? parsedMinNativeBuild : 0;
 
   // GitHub Releases API shape
   if (typeof payload.tag_name === 'string') {
     const assets = Array.isArray(payload.assets) ? payload.assets : [];
     const apkAsset = assets.find((a) => String(a?.name || '').toLowerCase().endsWith('.apk'));
     const exeAsset = assets.find((a) => String(a?.name || '').toLowerCase().endsWith('.exe'));
+    const webBundleAsset =
+      assets.find((a) => String(a?.name || '').toLowerCase() === 'web-bundle.zip') ||
+      assets.find((a) => {
+        const name = String(a?.name || '').toLowerCase();
+        return name.endsWith('.zip') && name.includes('web-bundle');
+      });
     const otaAsset = assets.find((a) => {
       const name = String(a?.name || '').toLowerCase();
       return name.endsWith('.zip') || name.endsWith('.tar.gz');
@@ -176,11 +188,13 @@ function normalizeManifest(payload, defaults = {}) {
     return {
       version: payload.tag_name.replace(/^v/i, ''),
       build: Number(payload.id) || 1,
+      minNativeBuild,
       channel: payload.prerelease ? 'beta' : 'stable',
       publishedAt: payload.published_at || '',
       manifestUrl: defaultManifestUrl,
       apkDownloadUrl: apkAsset?.browser_download_url || defaultApkUrl,
       exeDownloadUrl: exeAsset?.browser_download_url || defaultExeUrl,
+      webBundleUrl: webBundleAsset?.browser_download_url || defaultWebBundleUrl,
       otaBundleUrl: otaAsset?.browser_download_url || defaultOtaUrl,
       releaseNotes: payload.body || payload.name || ''
     };
@@ -190,11 +204,13 @@ function normalizeManifest(payload, defaults = {}) {
     return {
       version: payload.version.replace(/^v/i, ''),
       build: Number(payload.build) || 1,
+      minNativeBuild,
       channel: payload.channel || 'stable',
       publishedAt: payload.publishedAt || '',
       manifestUrl: payload.manifestUrl || defaultManifestUrl,
       apkDownloadUrl: payload.apkDownloadUrl ?? defaultApkUrl,
       exeDownloadUrl: payload.exeDownloadUrl ?? defaultExeUrl,
+      webBundleUrl: payload.webBundleUrl ?? defaultWebBundleUrl,
       otaBundleUrl: payload.otaBundleUrl ?? defaultOtaUrl,
       releaseNotes: payload.releaseNotes || ''
     };
@@ -212,6 +228,7 @@ export class SelfUpdaterService {
    * @param {string} [options.remoteVersionUrl]
    * @param {string} [options.apkDownloadUrl]
    * @param {string} [options.exeDownloadUrl]
+   * @param {string} [options.webBundleUrl]
    * @param {string} [options.otaBundleUrl]
    * @param {string} [options.localVersionUrl]
    * @param {Storage | null} [options.storage]
@@ -246,6 +263,7 @@ export class SelfUpdaterService {
     this.remoteVersionUrl = this.manifestUrl;
     this.apkDownloadUrl = options.apkDownloadUrl || DEFAULT_APK_DOWNLOAD_URL;
     this.exeDownloadUrl = options.exeDownloadUrl || DEFAULT_EXE_DOWNLOAD_URL;
+    this.webBundleUrl = options.webBundleUrl || DEFAULT_WEB_BUNDLE_URL;
     this.otaBundleUrl = options.otaBundleUrl || DEFAULT_OTA_BUNDLE_URL;
     this.localVersionUrl = options.localVersionUrl || './version.json';
     this.lastManifest = null;
@@ -344,6 +362,7 @@ export class SelfUpdaterService {
         manifestUrl: this.manifestUrl,
         apkDownloadUrl: this.apkDownloadUrl,
         exeDownloadUrl: this.exeDownloadUrl,
+        webBundleUrl: this.webBundleUrl,
         otaBundleUrl: this.otaBundleUrl
       });
     } catch {
@@ -425,8 +444,10 @@ export class SelfUpdaterService {
         currentBuild: resolvedBuild,
         latestVersion: this.currentVersion,
         latestBuild: resolvedBuild,
+        minNativeBuild: 0,
         apkDownloadUrl: '',
         exeDownloadUrl: '',
+        webBundleUrl: '',
         otaBundleUrl: '',
         releaseNotes: '',
         source: 'offline'
@@ -445,8 +466,10 @@ export class SelfUpdaterService {
       currentBuild: resolvedBuild,
       latestVersion: manifest.version,
       latestBuild: manifest.build,
+      minNativeBuild: Number(manifest.minNativeBuild) || 0,
       apkDownloadUrl: manifest.apkDownloadUrl || '',
       exeDownloadUrl: manifest.exeDownloadUrl || '',
+      webBundleUrl: manifest.webBundleUrl || '',
       otaBundleUrl: manifest.otaBundleUrl || '',
       releaseNotes: manifest.releaseNotes || '',
       source
@@ -454,13 +477,39 @@ export class SelfUpdaterService {
   }
 
   /**
-   * Verify that the release package (.apk or .exe) for `manifest.version` is actually built and
-   * published before starting download, preventing downloading an older `releases/latest` asset
+   * Determine whether live Android Web Bundle OTA (`web-bundle.zip`) can be used on this device.
+   * @param {Record<string, any>} [activeManifest]
+   * @param {any} [win]
+   * @returns {boolean}
+   */
+  _canUseAndroidWebOta(activeManifest = {}, win = this._getEnv().win) {
+    if (typeof win?.AudiobookUpdaterNative?.startWebOtaUpdate !== 'function') {
+      return false;
+    }
+    if (typeof win?.AudiobookUpdaterNative?.getNativeBuild !== 'function') {
+      return false;
+    }
+    const minNativeBuild = Number(activeManifest?.minNativeBuild) || 0;
+    if (!minNativeBuild) {
+      return true;
+    }
+    let nativeBuild = 0;
+    try {
+      nativeBuild = Number(win.AudiobookUpdaterNative.getNativeBuild()) || 0;
+    } catch {
+      nativeBuild = 0;
+    }
+    return nativeBuild >= minNativeBuild;
+  }
+
+  /**
+   * Verify that the release package (.apk, web-bundle.zip, or .exe) for `manifest.version` is actually
+   * built and published before starting download, preventing downloading an older `releases/latest` asset
    * while GitHub Actions CI is still compiling the new release.
    * @param {'windows-tauri' | 'android-apk' | string} platform
    * @param {Record<string, any>} [manifest]
    * @param {typeof fetch} [fetchImpl]
-   * @returns {Promise<{ ready: boolean, url: string, reason?: string, source?: string }>}
+   * @returns {Promise<{ ready: boolean, url: string, deliveryMode?: 'exe' | 'web-ota' | 'apk', reason?: string, source?: string }>}
    */
   async resolveReadyPackageUrl(
     platform,
@@ -473,26 +522,37 @@ export class SelfUpdaterService {
       .replace(/^v/i, '');
     const remoteBuild = Number(activeManifest.build ?? activeManifest.latestBuild) || 1;
     const isWindows = platform === 'windows-tauri';
-    const expectedExt = isWindows ? '.exe' : '.apk';
+    const { win } = this._getEnv();
+    const useWebOta = !isWindows && this._canUseAndroidWebOta(activeManifest, win);
+    const deliveryMode = isWindows ? 'exe' : useWebOta ? 'web-ota' : 'apk';
+    const expectedExt = isWindows ? '.exe' : useWebOta ? '.zip' : '.apk';
+    const expectedAssetFilename = isWindows
+      ? 'Audiobook-Player.exe'
+      : useWebOta
+        ? 'web-bundle.zip'
+        : 'Audiobook-Player.apk';
     const rawUrl = isWindows
       ? activeManifest.exeDownloadUrl || this.exeDownloadUrl || ''
-      : activeManifest.apkDownloadUrl || this.apkDownloadUrl || '';
+      : useWebOta
+        ? activeManifest.webBundleUrl || this.webBundleUrl || DEFAULT_WEB_BUNDLE_URL
+        : activeManifest.apkDownloadUrl || this.apkDownloadUrl || '';
 
     if (!rawUrl) {
-      return { ready: false, url: '', reason: 'missing-url' };
+      return { ready: false, url: '', deliveryMode, reason: 'missing-url' };
     }
 
     if (!isRepoReleaseDownloadUrl(rawUrl) || !remoteVersion || typeof fetchImpl !== 'function') {
       return {
         ready: true,
         url: appendCacheBustParam(rawUrl, remoteVersion || this.currentVersion, remoteBuild),
+        deliveryMode,
         source: 'manifest'
       };
     }
 
     const tagName = `v${remoteVersion}`;
     const tagApiUrl = `${GITHUB_RELEASES_TAG_API_PREFIX}${encodeURIComponent(tagName)}`;
-    const versionedDownloadUrl = `${GITHUB_RELEASES_TAG_DOWNLOAD_PREFIX}${encodeURIComponent(tagName)}/Audiobook-Player${expectedExt}`;
+    const versionedDownloadUrl = `${GITHUB_RELEASES_TAG_DOWNLOAD_PREFIX}${encodeURIComponent(tagName)}/${expectedAssetFilename}`;
 
     try {
       const res = await fetchImpl(tagApiUrl, {
@@ -503,21 +563,29 @@ export class SelfUpdaterService {
       if (res && res.ok) {
         const releaseData = await res.json();
         const assets = Array.isArray(releaseData?.assets) ? releaseData.assets : [];
-        const matchedAsset = assets.find((a) =>
-          String(a?.name || '')
-            .toLowerCase()
-            .endsWith(expectedExt)
-        );
+        const matchedAsset = useWebOta
+          ? assets.find((a) => String(a?.name || '').toLowerCase() === 'web-bundle.zip') ||
+            assets.find((a) => {
+              const name = String(a?.name || '').toLowerCase();
+              return name.endsWith('.zip') && name.includes('web-bundle');
+            })
+          : assets.find((a) =>
+              String(a?.name || '')
+                .toLowerCase()
+                .endsWith(expectedExt)
+            );
         if (matchedAsset?.browser_download_url) {
           return {
             ready: true,
             url: appendCacheBustParam(matchedAsset.browser_download_url, remoteVersion, remoteBuild),
+            deliveryMode,
             source: 'github-release-api'
           };
         }
         return {
           ready: false,
           url: appendCacheBustParam(versionedDownloadUrl, remoteVersion, remoteBuild),
+          deliveryMode,
           reason: 'ci-building'
         };
       }
@@ -526,6 +594,7 @@ export class SelfUpdaterService {
         return {
           ready: false,
           url: appendCacheBustParam(versionedDownloadUrl, remoteVersion, remoteBuild),
+          deliveryMode,
           reason: 'ci-building'
         };
       }
@@ -539,6 +608,7 @@ export class SelfUpdaterService {
         return {
           ready: true,
           url: appendCacheBustParam(versionedDownloadUrl, remoteVersion, remoteBuild),
+          deliveryMode,
           source: 'github-release-head'
         };
       }
@@ -546,6 +616,7 @@ export class SelfUpdaterService {
         return {
           ready: false,
           url: appendCacheBustParam(versionedDownloadUrl, remoteVersion, remoteBuild),
+          deliveryMode,
           reason: 'ci-building'
         };
       }
@@ -556,6 +627,7 @@ export class SelfUpdaterService {
     return {
       ready: true,
       url: appendCacheBustParam(versionedDownloadUrl, remoteVersion, remoteBuild),
+      deliveryMode,
       source: 'github-release-fallback'
     };
   }
@@ -931,8 +1003,11 @@ export class SelfUpdaterService {
 
       // platform === 'android-apk'
       let autoRetriedAfterPermission = false;
-      let latestApkUrl = appendCacheBustParam(
-        manifestBase.apkDownloadUrl || this.apkDownloadUrl,
+      let latestDeliveryMode = this._canUseAndroidWebOta(manifestBase, win) ? 'web-ota' : 'apk';
+      let latestPackageUrl = appendCacheBustParam(
+        latestDeliveryMode === 'web-ota'
+          ? manifestBase.webBundleUrl || this.webBundleUrl
+          : manifestBase.apkDownloadUrl || this.apkDownloadUrl,
         remoteVersion,
         remoteBuild
       );
@@ -945,25 +1020,65 @@ export class SelfUpdaterService {
         }
       };
 
-      const triggerApkInstall = async (apkUrl) => {
-        gate?.updateStatus('Downloading Android APK update...', 25);
+      const triggerAndroidInstall = async (packageUrl, deliveryMode = latestDeliveryMode) => {
+        const isWebOta = deliveryMode === 'web-ota';
+        gate?.updateStatus(
+          isWebOta ? 'Downloading fast in-app update...' : 'Downloading Android APK update...',
+          25
+        );
         gate?.setActionButton({
-          visible: true,
-          label: 'Install Update Now',
+          visible: !isWebOta,
+          label: isWebOta ? 'Retry Update' : 'Install Update Now',
           disabled: true,
           onClick: () => {
-            void triggerApkInstall(latestApkUrl);
+            void triggerAndroidInstall(latestPackageUrl, latestDeliveryMode);
           }
         });
 
-        const readyManifest = { ...manifestBase, apkDownloadUrl: apkUrl };
+        const readyManifest = isWebOta
+          ? { ...manifestBase, webBundleUrl: packageUrl, deliveryMode: 'web-ota' }
+          : { ...manifestBase, apkDownloadUrl: packageUrl, deliveryMode: 'apk' };
+
         const res = await this.installNativeUpdate('android-apk', readyManifest, {
           windowObj: win,
           navigatorObj: nav,
+          deliveryMode,
           openUrl: options.openUrl,
           onProgress: (evt = {}) => {
             const status = evt.status || '';
             const pct = Number.isFinite(Number(evt.progress)) ? Number(evt.progress) : null;
+            if (isWebOta) {
+              if (status === 'downloading') {
+                gate?.updateStatus(
+                  evt.message ||
+                    (pct !== null
+                      ? `Downloading fast in-app update... ${pct}%`
+                      : 'Downloading fast in-app update...'),
+                  pct ?? 35
+                );
+                gate?.setActionButton({ visible: false });
+              } else if (status === 'reloading' || status === 'installing') {
+                cleanupPermissionListener();
+                gate?.updateStatus(evt.message || 'Applying update and reloading...', 100);
+                gate?.setActionButton({ visible: false });
+              } else if (status === 'error') {
+                gate?.updateStatus(
+                  evt.message || 'In-app update failed. Tap below to retry.',
+                  100,
+                  true
+                );
+                gate?.setActionButton({
+                  visible: true,
+                  label: 'Retry Update',
+                  disabled: false,
+                  onClick: () => {
+                    void triggerAndroidInstall(latestPackageUrl, 'web-ota');
+                  }
+                });
+              }
+              return;
+            }
+
             if (status === 'downloading') {
               gate?.updateStatus(
                 evt.message || (pct !== null ? `Downloading update... ${pct}%` : 'Downloading update...'),
@@ -974,13 +1089,13 @@ export class SelfUpdaterService {
                 label: 'Install Update Now',
                 disabled: true,
                 onClick: () => {
-                  void triggerApkInstall(latestApkUrl);
+                  void triggerAndroidInstall(latestPackageUrl, 'apk');
                 }
               });
             } else if (status === 'installing') {
               cleanupPermissionListener();
               gate?.updateStatus(
-                "Android installer ready — tap 'Update' when prompted by Android, or tap 'Install Update Now' below",
+                "Android installer ready — tap 'Update' when prompted by Android, or tap 'Install Update Now' below. If Android reports a package conflict, uninstall the older APK first and reinstall from GitHub Releases.",
                 100
               );
               gate?.setActionButton({
@@ -988,13 +1103,13 @@ export class SelfUpdaterService {
                 label: 'Install Update Now',
                 disabled: false,
                 onClick: () => {
-                  void triggerApkInstall(latestApkUrl);
+                  void triggerAndroidInstall(latestPackageUrl, 'apk');
                 }
               });
             } else if (status === 'permission_required') {
               gate?.updateStatus(
                 evt.message ||
-                  "Allow 'Install unknown apps' for Audiobook Player, then tap 'Install Update Now' below.",
+                  "Allow 'Install unknown apps' for Audiobook Player, then return here or tap 'Install Update Now' below.",
                 50,
                 true
               );
@@ -1003,7 +1118,7 @@ export class SelfUpdaterService {
                 label: 'Install Update Now',
                 disabled: false,
                 onClick: () => {
-                  void triggerApkInstall(latestApkUrl);
+                  void triggerAndroidInstall(latestPackageUrl, 'apk');
                 }
               });
               if (!autoRetriedAfterPermission && typeof win?.addEventListener === 'function') {
@@ -1012,7 +1127,7 @@ export class SelfUpdaterService {
                   if (doc?.hidden || doc?.visibilityState === 'hidden') return;
                   autoRetriedAfterPermission = true;
                   cleanupPermissionListener();
-                  void triggerApkInstall(latestApkUrl);
+                  void triggerAndroidInstall(latestPackageUrl, 'apk');
                 };
                 win.addEventListener('focus', onReturnFromSettings);
                 doc?.addEventListener?.('visibilitychange', onReturnFromSettings);
@@ -1028,7 +1143,7 @@ export class SelfUpdaterService {
                 label: 'Install Update Now',
                 disabled: false,
                 onClick: () => {
-                  void triggerApkInstall(latestApkUrl);
+                  void triggerAndroidInstall(latestPackageUrl, 'apk');
                 }
               });
             }
@@ -1045,17 +1160,22 @@ export class SelfUpdaterService {
             label: 'Install Update Now',
             disabled: false,
             onClick: () => {
-              void triggerApkInstall(latestApkUrl);
+              void triggerAndroidInstall(latestPackageUrl, latestDeliveryMode);
             }
           });
         } else if (!res?.ok) {
-          gate?.updateStatus(res?.error || 'Unable to start Android APK update.', 100, true);
+          gate?.updateStatus(
+            res?.error ||
+              (isWebOta ? 'Unable to start fast in-app update.' : 'Unable to start Android APK update.'),
+            100,
+            true
+          );
           gate?.setActionButton({
             visible: true,
-            label: 'Install Update Now',
+            label: isWebOta ? 'Retry Update' : 'Install Update Now',
             disabled: false,
             onClick: () => {
-              void triggerApkInstall(latestApkUrl);
+              void triggerAndroidInstall(latestPackageUrl, latestDeliveryMode);
             }
           });
         }
@@ -1068,22 +1188,28 @@ export class SelfUpdaterService {
         gate?.updateStatus('Checking update package...', 10);
 
         const pkg = await this.resolveReadyPackageUrl('android-apk', manifestBase, fetchFn);
+        if (pkg.deliveryMode) {
+          latestDeliveryMode = pkg.deliveryMode;
+        }
         if (pkg.url) {
-          latestApkUrl = pkg.url;
+          latestPackageUrl = pkg.url;
         }
 
         if (!pkg.ready) {
+          const isWebOta = latestDeliveryMode === 'web-ota';
           gate?.updateStatus(
-            'Server is finalizing the Android APK package... Auto-downloading as soon as ready',
+            isWebOta
+              ? 'Server is finalizing the fast in-app update package... Auto-downloading as soon as ready'
+              : 'Server is finalizing the Android APK package... Auto-downloading as soon as ready',
             15
           );
           gate?.setActionButton({
             visible: true,
-            label: 'Install Update Now',
+            label: isWebOta ? 'Update Now' : 'Install Update Now',
             disabled: false,
             onClick: () => {
               clearPollTimer();
-              void triggerApkInstall(latestApkUrl);
+              void triggerAndroidInstall(latestPackageUrl, latestDeliveryMode);
             }
           });
           if (options.enablePolling !== false) {
@@ -1092,11 +1218,25 @@ export class SelfUpdaterService {
             }, this._pollIntervalMs);
             this._pollTimer?.unref?.();
           }
-          return { enforced: true, platform: 'android-apk', waitingForCi: true, apkUrl: latestApkUrl };
+          return {
+            enforced: true,
+            platform: 'android-apk',
+            deliveryMode: latestDeliveryMode,
+            waitingForCi: true,
+            apkUrl: latestPackageUrl,
+            packageUrl: latestPackageUrl
+          };
         }
 
-        const installResult = await triggerApkInstall(latestApkUrl);
-        return { enforced: true, platform: 'android-apk', apkUrl: latestApkUrl, result: installResult };
+        const installResult = await triggerAndroidInstall(latestPackageUrl, latestDeliveryMode);
+        return {
+          enforced: true,
+          platform: 'android-apk',
+          deliveryMode: latestDeliveryMode,
+          apkUrl: latestPackageUrl,
+          packageUrl: latestPackageUrl,
+          result: installResult
+        };
       };
 
       return await checkAndInstallAndroid();
@@ -1400,16 +1540,12 @@ export class SelfUpdaterService {
     }
 
     if (targetPlatform === 'android-apk') {
-      const url = activeManifest.apkDownloadUrl || this.apkDownloadUrl || '';
-      if (!url) {
-        return {
-          ok: false,
-          started: false,
-          platform: 'android-apk',
-          url: '',
-          error: 'No Android APK URL available.'
-        };
-      }
+      const useWebOta =
+        callbacks.deliveryMode === 'web-ota' ||
+        activeManifest.deliveryMode === 'web-ota' ||
+        (callbacks.deliveryMode !== 'apk' &&
+          activeManifest.deliveryMode !== 'apk' &&
+          this._canUseAndroidWebOta(activeManifest, win));
 
       if (win && typeof callbacks.onProgress === 'function') {
         win.__onAndroidUpdateProgress = (payload) => {
@@ -1422,6 +1558,54 @@ export class SelfUpdaterService {
             }
           }
           callbacks.onProgress(parsed);
+        };
+      }
+
+      if (useWebOta && typeof win?.AudiobookUpdaterNative?.startWebOtaUpdate === 'function') {
+        const webUrl = activeManifest.webBundleUrl || this.webBundleUrl || DEFAULT_WEB_BUNDLE_URL;
+        if (!webUrl) {
+          return {
+            ok: false,
+            started: false,
+            platform: 'android-apk',
+            deliveryMode: 'web-ota',
+            url: '',
+            error: 'No Android Web OTA bundle URL available.'
+          };
+        }
+        try {
+          win.AudiobookUpdaterNative.startWebOtaUpdate(webUrl);
+          return {
+            ok: true,
+            started: true,
+            platform: 'android-apk',
+            deliveryMode: 'web-ota',
+            url: webUrl
+          };
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error || 'Web OTA update failed.');
+          callbacks.onProgress?.({ status: 'error', message });
+          return {
+            ok: false,
+            started: false,
+            platform: 'android-apk',
+            deliveryMode: 'web-ota',
+            url: webUrl,
+            error: message
+          };
+        }
+      }
+
+      const url = activeManifest.apkDownloadUrl || this.apkDownloadUrl || '';
+      if (!url) {
+        return {
+          ok: false,
+          started: false,
+          platform: 'android-apk',
+          deliveryMode: 'apk',
+          url: '',
+          error: 'No Android APK URL available.'
         };
       }
 
@@ -1443,6 +1627,7 @@ export class SelfUpdaterService {
             ok: true,
             started: true,
             platform: 'android-apk',
+            deliveryMode: 'apk',
             url
           };
         } catch (error) {
@@ -1452,6 +1637,7 @@ export class SelfUpdaterService {
             ok: false,
             started: false,
             platform: 'android-apk',
+            deliveryMode: 'apk',
             url,
             error: message
           };
@@ -1464,6 +1650,7 @@ export class SelfUpdaterService {
         started: fallback.triggered,
         fallback: true,
         platform: 'android-apk',
+        deliveryMode: 'apk',
         url: fallback.url
       };
     }

@@ -472,3 +472,162 @@ test('startAutoUpdateMonitor checks on startup and visibilitychange and mounts g
   assert.ok(elementsById.get('mandatory-update-gate'));
   service.destroy();
 });
+
+test('resolveReadyPackageUrl selects web-bundle.zip when minNativeBuild <= getNativeBuild() and falls back to APK when minNativeBuild > getNativeBuild()', async () => {
+  let nativeBuild = 15;
+  const webOtaCalls = [];
+  const apkCalls = [];
+
+  const windowObj = {
+    location: { origin: 'https://localhost', protocol: 'https:' },
+    Capacitor: { isNativePlatform: () => true },
+    AudiobookUpdaterNative: {
+      getNativeBuild: () => nativeBuild,
+      startWebOtaUpdate: (url) => webOtaCalls.push(url),
+      startApkUpdate: (url) => apkCalls.push(url)
+    }
+  };
+
+  const service = new SelfUpdaterService({
+    windowObj,
+    navigatorObj: { userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    storage: null
+  });
+
+  const releaseFetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      assets: [
+        {
+          name: 'Audiobook-Player.apk',
+          browser_download_url: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.14/Audiobook-Player.apk'
+        },
+        {
+          name: 'web-bundle.zip',
+          browser_download_url: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.14/web-bundle.zip'
+        }
+      ]
+    })
+  });
+
+  // 1. minNativeBuild <= getNativeBuild() -> selects web-bundle.zip (web-ota)
+  const webOtaPkg = await service.resolveReadyPackageUrl(
+    'android-apk',
+    {
+      version: '1.0.14',
+      build: 16,
+      minNativeBuild: 15,
+      webBundleUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip',
+      apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk'
+    },
+    releaseFetch
+  );
+  assert.equal(webOtaPkg.ready, true);
+  assert.equal(webOtaPkg.deliveryMode, 'web-ota');
+  assert.equal(
+    webOtaPkg.url,
+    'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.14/web-bundle.zip?v=1.0.14-16'
+  );
+
+  // 2. minNativeBuild > getNativeBuild() -> falls back to Audiobook-Player.apk (apk)
+  nativeBuild = 14;
+  const apkPkg = await service.resolveReadyPackageUrl(
+    'android-apk',
+    {
+      version: '1.0.14',
+      build: 16,
+      minNativeBuild: 15,
+      webBundleUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip',
+      apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk'
+    },
+    releaseFetch
+  );
+  assert.equal(apkPkg.ready, true);
+  assert.equal(apkPkg.deliveryMode, 'apk');
+  assert.equal(
+    apkPkg.url,
+    'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.14/Audiobook-Player.apk?v=1.0.14-16'
+  );
+  assert.equal(webOtaCalls.length, 0);
+  assert.equal(apkCalls.length, 0);
+});
+
+test('enforceMandatoryUpdate executes fast Web OTA update via startWebOtaUpdate without APK installer when native build satisfies minNativeBuild', async () => {
+  const { documentObj, windowObj, elementsById } = createMockDom();
+  const webOtaCalls = [];
+  const apkCalls = [];
+
+  windowObj.location.origin = 'https://localhost';
+  windowObj.location.protocol = 'https:';
+  windowObj.Capacitor = { isNativePlatform: () => true };
+  windowObj.AudiobookUpdaterNative = {
+    getNativeBuild: () => 15,
+    startWebOtaUpdate: (url) => webOtaCalls.push(url),
+    startApkUpdate: (url) => apkCalls.push(url)
+  };
+
+  const service = new SelfUpdaterService({
+    currentVersion: '1.0.14',
+    currentBuild: 15,
+    remoteVersionUrl: 'https://example.com/version.json',
+    windowObj,
+    documentObj,
+    navigatorObj: { userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    storage: null,
+    fetchImpl: async (url) => {
+      if (url.includes('version.json')) {
+        return {
+          ok: true,
+          json: async () => ({
+            version: '1.0.14',
+            build: 16,
+            minNativeBuild: 15,
+            webBundleUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip',
+            apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk'
+          })
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          assets: [
+            {
+              name: 'web-bundle.zip',
+              browser_download_url: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.14/web-bundle.zip'
+            },
+            {
+              name: 'Audiobook-Player.apk',
+              browser_download_url: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.14/Audiobook-Player.apk'
+            }
+          ]
+        })
+      };
+    }
+  });
+
+  const checkRes = await service.checkForUpdate();
+  assert.equal(checkRes.updateAvailable, true);
+  assert.equal(checkRes.minNativeBuild, 15);
+  assert.equal(
+    checkRes.webBundleUrl,
+    'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip'
+  );
+
+  const enforced = await service.enforceMandatoryUpdate(checkRes);
+  assert.equal(enforced.enforced, true);
+  assert.equal(enforced.platform, 'android-apk');
+  assert.equal(enforced.deliveryMode, 'web-ota');
+  assert.deepEqual(webOtaCalls, [
+    'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.14/web-bundle.zip?v=1.0.14-16'
+  ]);
+  assert.equal(apkCalls.length, 0);
+  assert.match(elementsById.get('mandatory-update-status').textContent, /Downloading fast in-app update/i);
+
+  windowObj.__onAndroidUpdateProgress({ status: 'reloading', progress: 100 });
+  assert.match(elementsById.get('mandatory-update-status').textContent, /Applying update and reloading/i);
+  assert.equal(elementsById.get('mandatory-update-action-btn').style.display, 'none');
+
+  service.destroy();
+});

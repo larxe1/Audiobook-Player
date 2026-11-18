@@ -1,11 +1,13 @@
 {
-  "version": "1.0.13",
-  "build": 14,
+  "version": "1.0.14",
+  "build": 15,
+  "minNativeBuild": 15,
   "channel": "stable",
-  "publishedAt": "2026-11-18T09:02:00Z",
+  "publishedAt": "2026-11-18T09:35:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
+  "webBundleUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Add Android safe-area top bar insets, automatic cross-device Google/Supabase library and active playback sync, and mandatory blocking pre-update gate for Windows, Android APK, and Web/PWA"
+  "releaseNotes": "Fix Android Capacitor 8 edge-to-edge safe-area insets, add fast Android Web Bundle OTA delivery, silent cross-device Google OAuth refresh and reconnect banners, and immediate startup update checks"
 }
