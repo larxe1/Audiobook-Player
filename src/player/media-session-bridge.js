@@ -24,6 +24,91 @@ function buildFallbackArtworkDataUrl(book) {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
+const WIRED_PRIORITY_KEYWORDS = [
+  'wired',
+  '3.5mm',
+  'aux',
+  'usb audio',
+  'realtek hd audio 2nd output'
+];
+
+const BLUETOOTH_KEYWORDS = [
+  'bluetooth',
+  'airpods',
+  'buds',
+  'sony',
+  'bose',
+  'hands-free'
+];
+
+const WIRED_DEVICE_KEYWORDS = [
+  'headphone',
+  'wired',
+  'headset',
+  '3.5mm',
+  'aux',
+  'usb audio',
+  'earphone',
+  'realtek hd audio 2nd output'
+];
+
+function stripDevicePrefix(rawLabel = '') {
+  return String(rawLabel || '')
+    .trim()
+    .replace(/^(default|communications)\s*-\s*/i, '')
+    .trim();
+}
+
+function cleanBluetoothName(strippedLabel = '') {
+  let cleaned = strippedLabel
+    .replace(/\((?:hands-free(?:\s+ag\s+audio)?|stereo|avrcp[^)]*)\)/gi, '')
+    .replace(/^(?:headphones?|headset)\s*\((.+)\)$/i, '$1')
+    .replace(/\bhands-free(?:\s+ag\s+audio)?\b/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/^[\s\-–—]+|[\s\-–—]+$/g, '')
+    .trim();
+
+  if (!cleaned || /^bluetooth(\s+audio)?$/i.test(cleaned)) {
+    return 'Bluetooth';
+  }
+  return cleaned;
+}
+
+export function classifyAudioOutputDevice(device) {
+  const rawLabel = String(device?.label || '').trim();
+  const stripped = stripDevicePrefix(rawLabel);
+  const lower = stripped.toLowerCase();
+
+  if (WIRED_PRIORITY_KEYWORDS.some((kw) => lower.includes(kw))) {
+    return { label: 'Wired', category: 'wired', rawLabel };
+  }
+
+  if (BLUETOOTH_KEYWORDS.some((kw) => lower.includes(kw))) {
+    return {
+      label: cleanBluetoothName(stripped),
+      category: 'bluetooth',
+      rawLabel
+    };
+  }
+
+  if (WIRED_DEVICE_KEYWORDS.some((kw) => lower.includes(kw))) {
+    return { label: 'Wired', category: 'wired', rawLabel };
+  }
+
+  if (
+    !stripped ||
+    /^(default|speakers?|system(\s+audio)?|internal(\s+speakers?)?|built-in(\s+output)?)$/i.test(stripped)
+  ) {
+    return { label: 'System Audio', category: 'system', rawLabel };
+  }
+
+  if (/speakers?/i.test(stripped) && /realtek|high definition audio/i.test(stripped)) {
+    return { label: 'System Audio', category: 'system', rawLabel };
+  }
+
+  return { label: stripped, category: 'system', rawLabel };
+}
+
 export class MediaSessionBridge {
   constructor(options = {}) {
     this.onPlay = options.onPlay || (() => {});
@@ -35,8 +120,12 @@ export class MediaSessionBridge {
     this.onSeekTo = options.onSeekTo || (() => {});
     this.onAutoPause = options.onAutoPause || (() => {});
     this.onAndroidAutoChange = options.onAndroidAutoChange || (() => {});
+    this.onAudioOutputChange = options.onAudioOutputChange || (() => {});
 
     this.knownAudioOutputs = new Set();
+    this.audioOutputs = [];
+    this.selectedOutputDeviceId = 'default';
+    this.activeOutput = { deviceId: 'default', label: 'System Audio', category: 'system', rawLabel: '' };
     this.androidAutoConnected = false;
     this._boundDeviceChange = null;
     this._boundVisibility = null;
@@ -72,16 +161,134 @@ export class MediaSessionBridge {
     }
   }
 
+  _syncOutputDevices(devices = [], notifyAutoPause = false) {
+    const rawOutputs = (Array.isArray(devices) ? devices : []).filter(
+      (d) => d && d.kind === 'audiooutput'
+    );
+    const currentIds = new Set(rawOutputs.map((d) => d.deviceId));
+
+    if (notifyAutoPause && this.knownAudioOutputs.size > 0) {
+      let disconnected = false;
+      for (const prevId of this.knownAudioOutputs) {
+        if (!currentIds.has(prevId)) {
+          disconnected = true;
+          break;
+        }
+      }
+      if (disconnected) {
+        this.onPause();
+        this.onAutoPause('bluetooth_disconnect');
+      }
+    }
+
+    this.knownAudioOutputs = currentIds;
+
+    const defaultRaw = rawOutputs.find((d) => d.deviceId === 'default') || rawOutputs[0] || null;
+    const defaultStripped = defaultRaw ? stripDevicePrefix(defaultRaw.label).toLowerCase() : '';
+
+    const seenLabels = new Set();
+    const cleanOutputs = [];
+
+    for (const dev of rawOutputs) {
+      if (dev.deviceId === 'communications') continue;
+      const stripped = stripDevicePrefix(dev.label).toLowerCase();
+      if (dev.deviceId !== 'default' && defaultStripped && stripped === defaultStripped) {
+        continue;
+      }
+      const dedupeKey = stripped || dev.deviceId;
+      if (seenLabels.has(dedupeKey) && dev.deviceId !== 'default') continue;
+      seenLabels.add(dedupeKey);
+
+      const classified = classifyAudioOutputDevice(dev);
+      cleanOutputs.push({
+        deviceId: dev.deviceId,
+        label: classified.label,
+        category: classified.category,
+        rawLabel: classified.rawLabel,
+        isDefault: dev.deviceId === 'default'
+      });
+    }
+
+    this.audioOutputs = cleanOutputs;
+
+    const selectedRaw =
+      this.selectedOutputDeviceId && this.selectedOutputDeviceId !== 'default'
+        ? rawOutputs.find((d) => d.deviceId === this.selectedOutputDeviceId)
+        : null;
+
+    const effectiveRaw = selectedRaw || defaultRaw;
+    if (!selectedRaw) {
+      this.selectedOutputDeviceId = effectiveRaw?.deviceId || 'default';
+    }
+
+    if (effectiveRaw) {
+      const classified = classifyAudioOutputDevice(effectiveRaw);
+      this.activeOutput = {
+        deviceId: effectiveRaw.deviceId,
+        label: classified.label,
+        category: classified.category,
+        rawLabel: classified.rawLabel
+      };
+    } else {
+      this.activeOutput = {
+        deviceId: 'default',
+        label: 'System Audio',
+        category: 'system',
+        rawLabel: ''
+      };
+    }
+
+    this.onAudioOutputChange(this.getAudioOutputState());
+    return this.getAudioOutputState();
+  }
+
+  async refreshAudioOutputs() {
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.enumerateDevices !== 'function'
+    ) {
+      return this.getAudioOutputState();
+    }
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return this._syncOutputDevices(devices, false);
+    } catch {
+      return this.getAudioOutputState();
+    }
+  }
+
+  getAudioOutputState() {
+    return {
+      activeDeviceId: this.activeOutput.deviceId,
+      activeLabel: this.activeOutput.label,
+      activeCategory: this.activeOutput.category,
+      devices: this.audioOutputs.slice()
+    };
+  }
+
+  selectAudioOutput(deviceId) {
+    if (!deviceId) return this.getAudioOutputState();
+    this.selectedOutputDeviceId = deviceId;
+    const match = this.audioOutputs.find((d) => d.deviceId === deviceId);
+    if (match) {
+      this.activeOutput = {
+        deviceId: match.deviceId,
+        label: match.label,
+        category: match.category,
+        rawLabel: match.rawLabel
+      };
+    }
+    this.onAudioOutputChange(this.getAudioOutputState());
+    return this.getAudioOutputState();
+  }
+
   _bindDeviceListeners() {
     if (typeof navigator !== 'undefined' && navigator.mediaDevices) {
       if (typeof navigator.mediaDevices.enumerateDevices === 'function') {
         navigator.mediaDevices
           .enumerateDevices()
-          .then((devices) => {
-            devices
-              .filter((d) => d.kind === 'audiooutput')
-              .forEach((d) => this.knownAudioOutputs.add(d.deviceId));
-          })
+          .then((devices) => this._syncOutputDevices(devices, false))
           .catch(() => {});
       }
 
@@ -89,23 +296,7 @@ export class MediaSessionBridge {
         try {
           if (typeof navigator.mediaDevices.enumerateDevices !== 'function') return;
           const devices = await navigator.mediaDevices.enumerateDevices();
-          const currentOutputs = new Set(
-            devices.filter((d) => d.kind === 'audiooutput').map((d) => d.deviceId)
-          );
-
-          // If a previously connected Bluetooth/external output disappeared, auto-pause
-          let disconnected = false;
-          for (const prevId of this.knownAudioOutputs) {
-            if (!currentOutputs.has(prevId)) {
-              disconnected = true;
-              break;
-            }
-          }
-          this.knownAudioOutputs = currentOutputs;
-          if (disconnected) {
-            this.onPause();
-            this.onAutoPause('bluetooth_disconnect');
-          }
+          this._syncOutputDevices(devices, true);
         } catch {
           // Ignore permission errors in restricted contexts
         }

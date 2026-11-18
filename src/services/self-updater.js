@@ -4,6 +4,8 @@ export const DEFAULT_MANIFEST_URL =
   'https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json';
 export const DEFAULT_APK_DOWNLOAD_URL =
   'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk';
+export const DEFAULT_EXE_DOWNLOAD_URL =
+  'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe';
 export const DEFAULT_OTA_BUNDLE_URL = 'https://larxe1.github.io/Audiobook-Player/';
 
 const STORAGE_UPDATE_URL_KEY = 'audiobook_remote_version_url';
@@ -48,7 +50,7 @@ export function compareSemver(vA, vB) {
 /**
  * Normalize either a direct version.json manifest or a GitHub Releases API payload.
  * @param {Record<string, any>} payload
- * @param {{ manifestUrl?: string, apkDownloadUrl?: string, otaBundleUrl?: string }} [defaults]
+ * @param {{ manifestUrl?: string, apkDownloadUrl?: string, exeDownloadUrl?: string, otaBundleUrl?: string }} [defaults]
  */
 function normalizeManifest(payload, defaults = {}) {
   if (!payload || typeof payload !== 'object') {
@@ -57,6 +59,7 @@ function normalizeManifest(payload, defaults = {}) {
 
   const defaultManifestUrl = defaults.manifestUrl || DEFAULT_MANIFEST_URL;
   const defaultApkUrl = defaults.apkDownloadUrl || DEFAULT_APK_DOWNLOAD_URL;
+  const defaultExeUrl = defaults.exeDownloadUrl || DEFAULT_EXE_DOWNLOAD_URL;
   const defaultOtaUrl = defaults.otaBundleUrl || DEFAULT_OTA_BUNDLE_URL;
 
   // GitHub Releases API shape
@@ -76,7 +79,7 @@ function normalizeManifest(payload, defaults = {}) {
       publishedAt: payload.published_at || '',
       manifestUrl: defaultManifestUrl,
       apkDownloadUrl: apkAsset?.browser_download_url || defaultApkUrl,
-      exeDownloadUrl: exeAsset?.browser_download_url || '',
+      exeDownloadUrl: exeAsset?.browser_download_url || defaultExeUrl,
       otaBundleUrl: otaAsset?.browser_download_url || defaultOtaUrl,
       releaseNotes: payload.body || payload.name || ''
     };
@@ -90,7 +93,7 @@ function normalizeManifest(payload, defaults = {}) {
       publishedAt: payload.publishedAt || '',
       manifestUrl: payload.manifestUrl || defaultManifestUrl,
       apkDownloadUrl: payload.apkDownloadUrl ?? defaultApkUrl,
-      exeDownloadUrl: payload.exeDownloadUrl || '',
+      exeDownloadUrl: payload.exeDownloadUrl ?? defaultExeUrl,
       otaBundleUrl: payload.otaBundleUrl ?? defaultOtaUrl,
       releaseNotes: payload.releaseNotes || ''
     };
@@ -106,6 +109,7 @@ export class SelfUpdaterService {
    * @param {string} [options.manifestUrl]
    * @param {string} [options.remoteVersionUrl]
    * @param {string} [options.apkDownloadUrl]
+   * @param {string} [options.exeDownloadUrl]
    * @param {string} [options.otaBundleUrl]
    * @param {string} [options.localVersionUrl]
    * @param {Storage} [options.storage]
@@ -120,6 +124,7 @@ export class SelfUpdaterService {
       DEFAULT_MANIFEST_URL;
     this.remoteVersionUrl = this.manifestUrl;
     this.apkDownloadUrl = options.apkDownloadUrl || DEFAULT_APK_DOWNLOAD_URL;
+    this.exeDownloadUrl = options.exeDownloadUrl || DEFAULT_EXE_DOWNLOAD_URL;
     this.otaBundleUrl = options.otaBundleUrl || DEFAULT_OTA_BUNDLE_URL;
     this.localVersionUrl = options.localVersionUrl || './version.json';
     this.lastManifest = null;
@@ -156,6 +161,7 @@ export class SelfUpdaterService {
       return normalizeManifest(data, {
         manifestUrl: this.manifestUrl,
         apkDownloadUrl: this.apkDownloadUrl,
+        exeDownloadUrl: this.exeDownloadUrl,
         otaBundleUrl: this.otaBundleUrl
       });
     } catch {
@@ -267,7 +273,9 @@ export class SelfUpdaterService {
     const targetPlatform = isWindows ? 'windows' : 'android';
 
     const url = isWindows
-      ? manifest?.exeDownloadUrl || manifest?.otaBundleUrl || ''
+      ? manifest
+        ? manifest.exeDownloadUrl || manifest.otaBundleUrl || ''
+        : this.exeDownloadUrl || this.otaBundleUrl || ''
       : manifest
         ? manifest.apkDownloadUrl || manifest.otaBundleUrl || ''
         : this.apkDownloadUrl || this.otaBundleUrl || '';

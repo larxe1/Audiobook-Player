@@ -41,6 +41,9 @@ body.theme-pitch,
 
 html,
 body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
   background-color: var(--bg-canvas);
   color: var(--text-primary);
   font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -48,6 +51,10 @@ body {
   -moz-osx-font-smoothing: grayscale;
   overflow-x: hidden;
   transition: background-color 300ms var(--ease-spring), color 300ms var(--ease-spring);
+}
+
+.watchCoverBackdrop {
+  transition: background 380ms var(--ease-spring);
 }
 
 /* Core Surface Tiers */

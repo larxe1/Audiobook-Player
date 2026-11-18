@@ -17,6 +17,11 @@ client_secret*.json
 # Build, Dependencies & Tooling
 node_modules/
 dist/
+ui-dist/
+src-tauri/target/
+*.exe
+*.msi
+*.nsis
 .superpowers/
 *.keystore
 *.jks

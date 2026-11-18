@@ -1,12 +1,10 @@
 /**
  * Audiobook Player — Main Interactive Application Controller
  * Supports:
- * - Midnight Black (default) & Pitch Black themes + Side-by-Side Theme Comparison
- * - Windows Desktop 3-Column Spotify Web Layout
- * - Android Mobile View + Pull-Down Notification Shade MediaStyle Mini-Player + Slide-Up Now Playing Sheet
- * - Samsung Galaxy Watch (Wear OS) 270x270 Circular Controller with faded cover backdrop + 24x24 mini cover icon
- * - Conditional Android Auto Car Mode (hidden unless Android Auto is connected)
- * - Gmail Profile Avatar + Compact Profile & Settings Popover
+ * - Automatic viewport layout switching (Desktop 3-column, Mobile full-bleed, Wear OS Watch)
+ * - Midnight Black (default) & Pitch Black themes (via Profile menu)
+ * - Real adaptive audio output detection via navigator.mediaDevices.enumerateDevices()
+ * - Gmail Profile Avatar + Clean Minimalist Profile & Settings Popover
  * - Live Cover Image Search Modal + Local Cover Upload
  * - Real Local Folder Scanning (#localFolderInput) + Google Drive Scanning + Deduplication
  */
@@ -42,13 +40,9 @@ import {
   ICON_DOWNLOAD_CIRCLE,
   ICON_SLEEP,
   ICON_SPEAKER,
-  ICON_WATCH,
-  ICON_CAR,
   ICON_SPARKLES,
-  ICON_DEVICES,
   ICON_PANEL_RIGHT,
   ICON_UPLOAD,
-  ICON_REFRESH,
   FLUENT_3D_FOLDER,
   FLUENT_3D_CLOUD
 } from './icons.js';
@@ -58,14 +52,18 @@ const STORAGE_LIBRARY_KEY = 'audiobook_player_library_v1';
 const STORAGE_ACTIVE_BOOK_KEY = 'audiobook_player_active_book_v1';
 const STORAGE_DEMO_USER_KEY = 'audiobook_player_demo_user_v1';
 
-const OUTPUT_DEVICES = [
-  'Galaxy Buds2 Pro',
-  'Galaxy Watch6',
-  'Phone Speaker',
-  'Windows PC'
-];
-
 const PLAYBACK_RATES = [1.0, 1.25, 1.5, 1.75, 2.0];
+
+function formatPlaybackRate(rate = 1.0) {
+  const num = Number(rate) || 1.0;
+  return `${num.toFixed(num % 1 === 0 ? 1 : 2)}x`;
+}
+
+function safeHexColor(hex, fallback = '#1ed760') {
+  return typeof hex === 'string' && /^#[0-9a-f]{6}$/i.test(hex.trim())
+    ? hex.trim()
+    : fallback;
+}
 
 function escapeHtml(str = '') {
   return String(str)
@@ -304,20 +302,27 @@ class AudiobookApp {
       onSeekTo: (sec) => this.audioEngine.seekToSeconds(sec),
       onAutoPause: () => this._persistProgressCheckpoint(true),
       onAndroidAutoChange: (connected) => {
+        if (!this.state) return;
         this.state.androidAutoConnected = connected;
-        if (connected) {
-          this.state.previewMode = 'auto';
-        } else if (this.state.previewMode === 'auto') {
-          this.state.previewMode = this._detectDefaultPreviewMode();
-        }
+        this.state.layoutMode = this._detectViewportLayout();
+        this.render();
+      },
+      onAudioOutputChange: (outputState) => {
+        if (!this.state) return;
+        this.state.activeOutputDevice = outputState.activeLabel || 'System Audio';
+        this.state.activeOutputDeviceId = outputState.activeDeviceId || 'default';
+        this.state.audioOutputs = outputState.devices || [];
         this.render();
       }
     });
 
+    const initialAudioOutput = this.mediaBridge.getAudioOutputState();
+    const initialAndroidAuto = this.mediaBridge.isAndroidAutoConnected();
+
     this.state = {
       theme: this._loadTheme(),
-      compareMode: false,
-      previewMode: this._detectDefaultPreviewMode(),
+      androidAutoConnected: initialAndroidAuto,
+      layoutMode: this._detectViewportLayout(initialAndroidAuto),
       desktopView: 'home', // 'home' | 'detail'
       mobileSheetOpen: false,
       mobileTab: 'home', // 'home' | 'library'
@@ -327,8 +332,9 @@ class AudiobookApp {
       rightPanelOpen: true,
       filterSource: 'all', // 'all' | 'local' | 'drive' | 'downloaded'
       searchQuery: '',
-      activeOutputDevice: OUTPUT_DEVICES[0],
-      androidAutoConnected: this.mediaBridge.isAndroidAutoConnected(),
+      activeOutputDevice: initialAudioOutput.activeLabel || 'System Audio',
+      activeOutputDeviceId: initialAudioOutput.activeDeviceId || 'default',
+      audioOutputs: initialAudioOutput.devices || [],
       books: this._loadBooks(),
       activeBookKey: null,
       detailBookKey: null,
@@ -362,8 +368,20 @@ class AudiobookApp {
     this._lastCheckpointAt = 0;
   }
 
-  _detectDefaultPreviewMode() {
-    if (typeof window !== 'undefined' && window.innerWidth < 768) {
+  _detectViewportLayout(androidAutoOverride = null) {
+    if (typeof window === 'undefined') return 'desktop';
+    const search = window.location?.search || '';
+    const isAuto =
+      androidAutoOverride !== null
+        ? Boolean(androidAutoOverride)
+        : Boolean(this.state?.androidAutoConnected ?? this.mediaBridge?.isAndroidAutoConnected());
+    if (isAuto || search.includes('androidAuto=1')) {
+      return 'auto';
+    }
+    if (search.includes('watch=1') || window.innerWidth <= 340) {
+      return 'watch';
+    }
+    if (window.innerWidth < 768 && window.innerWidth > 340) {
       return 'android';
     }
     return 'desktop';
@@ -534,6 +552,7 @@ class AudiobookApp {
     });
 
     this.syncService.connectRealtime();
+    await this.mediaBridge.refreshAudioOutputs().catch(() => null);
     this._bindGlobalInputs();
     this.render();
   }
@@ -583,6 +602,28 @@ class AudiobookApp {
           this.render();
         }
       });
+    }
+
+    if (typeof window !== 'undefined') {
+      const handleViewportChange = () => {
+        const nextLayout = this._detectViewportLayout();
+        if (nextLayout !== this.state.layoutMode) {
+          this.state.layoutMode = nextLayout;
+          this.state.profileOpen = false;
+          this.render();
+        }
+      };
+      window.addEventListener('resize', handleViewportChange);
+      if (typeof window.matchMedia === 'function') {
+        const mqMobile = window.matchMedia('(max-width: 767px)');
+        const mqWatch = window.matchMedia('(max-width: 340px)');
+        if (typeof mqMobile.addEventListener === 'function') {
+          mqMobile.addEventListener('change', handleViewportChange);
+        }
+        if (typeof mqWatch.addEventListener === 'function') {
+          mqWatch.addEventListener('change', handleViewportChange);
+        }
+      }
     }
   }
 
@@ -835,10 +876,44 @@ class AudiobookApp {
     this.render();
   }
 
-  cycleOutputDevice() {
-    const idx = OUTPUT_DEVICES.indexOf(this.state.activeOutputDevice);
-    this.state.activeOutputDevice = OUTPUT_DEVICES[(idx + 1) % OUTPUT_DEVICES.length];
+  async selectOutputDevice(deviceId) {
+    const state = this.mediaBridge.selectAudioOutput(deviceId);
+    this.state.activeOutputDevice = state.activeLabel || 'System Audio';
+    this.state.activeOutputDeviceId = state.activeDeviceId || 'default';
+    this.state.audioOutputs = state.devices || [];
+
+    if (this.audioEngine?.audio && typeof this.audioEngine.audio.setSinkId === 'function') {
+      try {
+        await this.audioEngine.audio.setSinkId(deviceId);
+      } catch {
+        // Ignore sink selection errors in restricted contexts
+      }
+    }
+
+    const book = this.getActiveBook();
+    if (book) {
+      this.syncService.broadcastPlaybackState({
+        isPlaying: this.state.snapshot.playing,
+        bookKey: book.bookKey,
+        chapterIndex: this.state.snapshot.chapterIndex,
+        positionSec: this.state.snapshot.positionSec,
+        deviceName: this.state.activeOutputDevice
+      });
+    }
     this.render();
+  }
+
+  cycleOutputDevice() {
+    const outputs = this.state.audioOutputs || [];
+    if (outputs.length <= 1) {
+      void this.mediaBridge.refreshAudioOutputs();
+      return;
+    }
+    const idx = outputs.findIndex((d) => d.deviceId === this.state.activeOutputDeviceId);
+    const next = outputs[(idx + 1) % outputs.length];
+    if (next) {
+      void this.selectOutputDevice(next.deviceId);
+    }
   }
 
   async addBookmark(bookKey = null) {
@@ -1029,52 +1104,7 @@ class AudiobookApp {
     return `<img src="${src}" alt="${alt}" class="${classes}" ${extra} />`;
   }
 
-  _renderTopPreviewBar() {
-    const { theme, compareMode, previewMode, androidAutoConnected } = this.state;
-    const modeBtn = (id, label) => {
-      const active = !compareMode && previewMode === id;
-      return `<button data-action="set-preview" data-mode="${id}" class="btn-press px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap ${
-        active
-          ? 'bg-[#1ed760] text-[#050506]'
-          : 'text-[var(--text-secondary)] hover:text-white hover:bg-white/5'
-      }">${label}</button>`;
-    };
-
-    const themeBtn = (id, label, isActive) =>
-      `<button data-action="set-theme" data-theme="${id}" class="btn-press px-2.5 py-1 rounded-full text-xs font-medium whitespace-nowrap ${
-        isActive
-          ? 'bg-white/15 text-white border border-white/15'
-          : 'text-[var(--text-secondary)] hover:text-white'
-      }">${label}</button>`;
-
-    return `
-      <header class="sticky top-0 z-30 border-b border-[var(--border-subtle)] bg-[var(--bg-canvas)]/90 backdrop-blur-xl px-3 sm:px-5 py-2 flex items-center justify-between gap-2 overflow-x-auto">
-        <div class="flex items-center gap-2 shrink-0">
-          <span class="w-2.5 h-2.5 rounded-full bg-[#1ed760] inline-block shrink-0"></span>
-          <span class="text-xs sm:text-sm font-semibold tracking-tight text-[var(--text-primary)] whitespace-nowrap">Audiobook Player</span>
-        </div>
-
-        <div class="flex items-center gap-1 rounded-full surface-panel p-1 shrink-0">
-          ${modeBtn('desktop', 'Desktop')}
-          ${modeBtn('android', 'Android')}
-          ${modeBtn('shade', 'Shade')}
-          ${modeBtn('watch', 'Watch')}
-          ${androidAutoConnected ? modeBtn('auto', 'Auto') : ''}
-        </div>
-
-        <div class="flex items-center gap-1.5 shrink-0">
-          <div class="flex items-center gap-0.5 rounded-full surface-panel p-0.5">
-            ${themeBtn('midnight', 'Midnight', !compareMode && theme === 'midnight')}
-            ${themeBtn('pitch', 'Pitch', !compareMode && theme === 'pitch')}
-            ${themeBtn('compare', 'Compare', compareMode)}
-          </div>
-          ${this._renderAvatarButton('top')}
-        </div>
-      </header>
-    `;
-  }
-
-  _renderAvatarButton(placement = 'header') {
+  _renderAvatarButton() {
     const user = this.getUserAccount();
     const initials = (user.name || 'A')
       .split(/\s+/)
@@ -1085,7 +1115,7 @@ class AudiobookApp {
 
     return `
       <div class="relative shrink-0">
-        <button id="${placement === 'top' ? 'profileAvatarBtn' : ''}" data-action="toggle-profile" aria-label="Account" class="btn-press w-8 h-8 rounded-full overflow-hidden border border-white/15 bg-gradient-to-br from-[#1ed760] to-[#0f766e] flex items-center justify-center text-xs font-bold text-[#050506] shrink-0">
+        <button id="profileAvatarBtn" data-action="toggle-profile" aria-label="Account" class="btn-press w-8 h-8 rounded-full overflow-hidden border border-white/15 bg-gradient-to-br from-[#1ed760] to-[#0f766e] flex items-center justify-center text-xs font-bold text-[#050506] shrink-0">
           ${
             user.avatarUrl
               ? `<img src="${escapeHtml(user.avatarUrl)}" alt="${escapeHtml(user.name)}" class="w-full h-full object-cover" />`
@@ -1100,7 +1130,13 @@ class AudiobookApp {
     if (!this.state.profileOpen) return '';
     const user = this.getUserAccount();
     const activeBook = this.getActiveBook();
-    const { theme, compareMode, activeOutputDevice, androidAutoConnected, enrichingBookKey } = this.state;
+    const {
+      theme,
+      activeOutputDevice,
+      activeOutputDeviceId,
+      audioOutputs,
+      enrichingBookKey
+    } = this.state;
 
     return `
       <div id="profilePopover" class="popover-menu fixed right-3 sm:right-5 top-14 z-50 w-72 max-w-[calc(100vw-24px)] rounded-2xl p-3.5 text-sm">
@@ -1116,48 +1152,50 @@ class AudiobookApp {
             <div class="font-semibold text-[var(--text-primary)] truncate">${escapeHtml(user.name)}</div>
             <div class="text-xs text-[var(--text-secondary)] truncate">${escapeHtml(user.email)}</div>
           </div>
-          <span class="shrink-0">${FLUENT_3D_CLOUD(18)}</span>
         </div>
 
         <div class="py-2.5 border-b border-[var(--border-subtle)] space-y-1.5">
-          <div class="flex items-center justify-between text-xs text-[var(--text-secondary)] px-1">
-            <span class="flex items-center gap-1.5">${ICON_DEVICES(14)} Active Device</span>
-            <span class="text-[#1ed760] font-medium truncate max-w-[120px]">${escapeHtml(activeOutputDevice)}</span>
+          <div class="flex items-center justify-between text-xs px-2.5">
+            <span class="text-[var(--text-secondary)]">Audio Output</span>
+            <span class="text-[#1ed760] font-medium truncate max-w-[145px]">${escapeHtml(activeOutputDevice)}</span>
           </div>
-          <div class="grid grid-cols-2 gap-1">
-            ${OUTPUT_DEVICES.map(
-              (dev) => `
-              <button data-action="select-device" data-device="${escapeHtml(dev)}" class="btn-press px-2 py-1.5 rounded-lg text-[11px] font-medium truncate text-left ${
-                activeOutputDevice === dev
-                  ? 'bg-[#1ed760]/15 text-[#1ed760] border border-[#1ed760]/40'
-                  : 'surface-card text-[var(--text-secondary)] hover:text-white'
-              }">${escapeHtml(dev)}</button>`
-            ).join('')}
-          </div>
+          ${
+            audioOutputs.length > 1
+              ? `<div class="space-y-1 pt-0.5">
+                  ${audioOutputs
+                    .map(
+                      (dev) => `
+                    <button data-action="select-output-device" data-device-id="${escapeHtml(dev.deviceId)}" title="${escapeHtml(dev.rawLabel || dev.label)}" class="btn-press w-full px-2.5 py-1.5 rounded-xl text-[11px] font-medium truncate text-left ${
+                      activeOutputDeviceId === dev.deviceId
+                        ? 'bg-[#1ed760]/15 text-[#1ed760] border border-[#1ed760]/40'
+                        : 'surface-card text-[var(--text-secondary)] hover:text-white'
+                    }">${escapeHtml(dev.label)}</button>`
+                    )
+                    .join('')}
+                </div>`
+              : ''
+          }
         </div>
 
-        <div class="py-2 border-b border-[var(--border-subtle)] space-y-1">
-          <button data-action="open-cover-search" data-book="${escapeHtml(activeBook?.bookKey || '')}" class="btn-press w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            ${ICON_COVER_IMAGE(16, 'text-[#1ed760] shrink-0')}
+        <div class="py-2 border-b border-[var(--border-subtle)] space-y-0.5">
+          <button data-action="open-cover-search" data-book="${escapeHtml(activeBook?.bookKey || '')}" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span class="truncate">Search Cover Images</span>
           </button>
-          <button data-action="auto-match-tags" data-book="${escapeHtml(activeBook?.bookKey || '')}" class="btn-press w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            ${ICON_SPARKLES(16, 'text-[#60a5fa] shrink-0')}
+          <button data-action="auto-match-tags" data-book="${escapeHtml(activeBook?.bookKey || '')}" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span class="truncate">${enrichingBookKey ? 'Matching...' : 'Auto-Match Tags'}</span>
           </button>
-          <button data-action="trigger-local-folder" class="btn-press w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            ${FLUENT_3D_FOLDER(16, 'shrink-0')}
+          <button data-action="trigger-local-folder" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span class="truncate">Add Local Folder</span>
           </button>
-          <button data-action="connect-drive" class="btn-press w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            ${FLUENT_3D_CLOUD(16, 'shrink-0')}
+          <button data-action="connect-drive" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span class="truncate">${user.authenticated ? 'Scan Google Drive' : 'Connect Google Drive'}</span>
           </button>
-          <button data-action="check-update" class="btn-press w-full flex items-center justify-between gap-2.5 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            <span class="flex items-center gap-2.5 min-w-0">
-              ${ICON_REFRESH(15, `text-[#1ed760] shrink-0 ${this.state.updateState.checking ? 'animate-spin' : ''}`)}
-              <span class="truncate">Update (v${escapeHtml(LOCAL_VERSION)})</span>
-            </span>
+          <button data-action="toggle-theme" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+            <span>Theme</span>
+            <span class="text-[11px] font-semibold text-[#1ed760] shrink-0">${theme === 'pitch' ? 'Pitch' : 'Midnight'}</span>
+          </button>
+          <button data-action="check-update" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+            <span class="truncate">Update (v${escapeHtml(LOCAL_VERSION)})</span>
             <span class="text-[11px] shrink-0 ${this.state.updateState.updateAvailable ? 'text-[#1ed760] font-semibold' : 'text-[var(--text-muted)]'}">
               ${
                 this.state.updateState.checking
@@ -1172,95 +1210,14 @@ class AudiobookApp {
           </button>
         </div>
 
-        <div class="pt-2.5 space-y-2">
-          <div class="flex items-center justify-between gap-2 px-1">
-            <span class="text-xs text-[var(--text-secondary)]">Theme</span>
-            <div class="flex items-center gap-1 rounded-full surface-card p-0.5">
-              <button data-action="set-theme" data-theme="midnight" class="px-2 py-0.5 rounded-full text-[11px] font-medium ${!compareMode && theme === 'midnight' ? 'bg-[#1ed760] text-[#050506]' : 'text-[var(--text-secondary)]'}">Midnight</button>
-              <button data-action="set-theme" data-theme="pitch" class="px-2 py-0.5 rounded-full text-[11px] font-medium ${!compareMode && theme === 'pitch' ? 'bg-[#1ed760] text-[#050506]' : 'text-[var(--text-secondary)]'}">Pitch</button>
-              <button data-action="set-theme" data-theme="compare" class="px-2 py-0.5 rounded-full text-[11px] font-medium ${compareMode ? 'bg-[#1ed760] text-[#050506]' : 'text-[var(--text-secondary)]'}">Compare</button>
-            </div>
-          </div>
-
-          <div class="flex items-center justify-between gap-2 px-1">
-            <span class="text-xs text-[var(--text-secondary)] flex items-center gap-1.5">${ICON_CAR(14)} Android Auto</span>
-            <button data-action="toggle-android-auto" class="btn-press px-2.5 py-0.5 rounded-full text-[11px] font-medium ${
-              androidAutoConnected
-                ? 'bg-[#1ed760] text-[#050506]'
-                : 'surface-card text-[var(--text-secondary)]'
-            }">${androidAutoConnected ? 'Connected' : 'Off'}</button>
-          </div>
-
-          ${
-            user.authenticated
-              ? `<button data-action="sign-out" class="btn-press w-full py-1.5 rounded-xl surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Sign Out</button>`
-              : ''
-          }
-        </div>
-      </div>
-    `;
-  }
-
-  _renderThemeCompareView() {
-    const activeBook = this.getActiveBook();
-    const renderPane = (themeClass, label, swatches) => `
-      <div class="${themeClass} rounded-3xl p-5 border border-[var(--border-subtle)] bg-[var(--bg-canvas)] text-[var(--text-primary)] space-y-4 overflow-hidden min-w-0">
-        <div class="flex items-center justify-between gap-2">
-          <div class="min-w-0">
-            <h2 class="text-base font-bold truncate">${label}</h2>
-            <div class="flex items-center gap-1.5 mt-1.5">
-              ${swatches
-                .map(
-                  (hex) =>
-                    `<span class="inline-flex items-center gap-1 text-[10px] font-mono text-[var(--text-secondary)]"><span class="w-3 h-3 rounded-full border border-white/20" style="background:${hex}"></span>${hex}</span>`
-                )
-                .join('')}
-            </div>
-          </div>
-          <button data-action="set-theme" data-theme="${themeClass === 'theme-midnight' ? 'midnight' : 'pitch'}" class="btn-press px-3 py-1.5 rounded-full text-xs font-semibold bg-[#1ed760] text-[#050506] shrink-0">Use</button>
-        </div>
-
-        <div class="surface-panel rounded-2xl p-4 space-y-3">
-          <div class="grid grid-cols-2 gap-2.5">
-            ${this.state.books
-              .slice(0, 2)
-              .map(
-                (book) => `
-              <div class="surface-card rounded-xl p-2 flex items-center gap-2.5 overflow-hidden min-w-0">
-                <div class="w-11 h-11 rounded-lg overflow-hidden shrink-0">${this._renderCoverImg(book)}</div>
-                <div class="min-w-0 flex-1">
-                  <div class="text-xs font-semibold clamp-2 leading-tight">${escapeHtml(book.title)}</div>
-                  <div class="flex items-center gap-1 mt-1">${this._renderSourceBadges(book, 12)}${this._renderDownloadedIcon(book, 12)}</div>
-                </div>
+        ${
+          user.authenticated
+            ? `<div class="pt-2">
+                <button data-action="sign-out" class="btn-press w-full py-1.5 rounded-xl surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Sign Out</button>
               </div>`
-              )
-              .join('')}
-          </div>
-
-          ${
-            activeBook
-              ? `
-          <div class="ambient-surface rounded-xl p-3 flex items-center gap-3 overflow-hidden min-w-0 border border-[var(--border-subtle)]">
-            <div class="w-12 h-12 rounded-lg overflow-hidden shrink-0">${this._renderCoverImg(activeBook)}</div>
-            <div class="min-w-0 flex-1">
-              <div class="text-sm font-semibold truncate">${escapeHtml(activeBook.title)}</div>
-              <div class="text-xs text-[var(--text-secondary)] truncate">${escapeHtml(activeBook.author)}</div>
-            </div>
-            <button data-action="toggle-play" class="play-fab w-9 h-9 shrink-0">${ICON_PLAY(16)}</button>
-          </div>`
-              : ''
-          }
-        </div>
+            : ''
+        }
       </div>
-    `;
-
-    return `
-      <main class="max-w-6xl mx-auto p-4 sm:p-6">
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
-          ${renderPane('theme-midnight', 'Midnight Black', ['#060911', '#0d1322', '#131b2e'])}
-          ${renderPane('theme-pitch', 'Pitch Black', ['#050506', '#101012', '#161619'])}
-        </div>
-      </main>
     `;
   }
 
@@ -1322,15 +1279,18 @@ class AudiobookApp {
     const radius = 128;
     const circumference = 2 * Math.PI * radius;
     const dashOffset = circumference * (1 - pct);
+    const accent = safeHexColor(book.accentHex, '#1ed760');
+    const secondary = safeHexColor(book.accentSecondaryHex, '#0b1020');
 
     return `
-      <main class="min-h-[calc(100vh-56px)] flex flex-col items-center justify-center p-6">
-        <div class="relative w-[270px] h-[270px] rounded-full overflow-hidden surface-shell shadow-[0_24px_60px_rgba(0,0,0,0.75)] flex flex-col items-center justify-between p-5 select-none">
-          <!-- Full-watch faded cover-art gradient backdrop -->
-          <div class="absolute inset-0 pointer-events-none">
-            <img src="${escapeHtml(book.coverUrl)}" alt="" class="w-full h-full object-cover opacity-35 scale-110 blur-[2px]" />
-            <div class="absolute inset-0" style="background:radial-gradient(circle, rgba(6,9,17,0.32) 0%, rgba(6,9,17,0.92) 78%)"></div>
-          </div>
+      <main class="w-full min-h-screen flex flex-col items-center justify-center p-1 sm:p-4 bg-[var(--bg-canvas)]">
+        <div class="relative w-[270px] h-[270px] rounded-full overflow-hidden surface-shell shadow-[0_24px_60px_rgba(0,0,0,0.75)] flex flex-col items-center justify-between text-center mx-auto p-5 select-none">
+          <!-- Pure radial/linear gradient backdrop (zero text inside backdrop) -->
+          <div
+            data-testid="watchCoverBackdrop"
+            class="watchCoverBackdrop absolute inset-0 pointer-events-none"
+            style="background: radial-gradient(circle at 50% 35%, ${accent}38 0%, ${secondary}cc 58%, rgba(6, 9, 17, 0.96) 100%), linear-gradient(160deg, ${accent}24 0%, rgba(6, 9, 17, 0.98) 85%);"
+          ></div>
 
           <!-- Bezel SVG progress ring -->
           <svg class="absolute inset-0 w-[270px] h-[270px] -rotate-90 pointer-events-none" viewBox="0 0 270 270" aria-hidden="true">
@@ -1338,16 +1298,16 @@ class AudiobookApp {
             <circle data-ab-watch-ring data-circumference="${circumference.toFixed(2)}" cx="135" cy="135" r="${radius}" fill="none" stroke="#1ed760" stroke-width="5" stroke-linecap="round" stroke-dasharray="${circumference.toFixed(2)}" stroke-dashoffset="${dashOffset.toFixed(2)}"/>
           </svg>
 
-          <!-- Top compact title pill with 24x24px mini cover thumbnail -->
-          <div class="relative z-10 mt-2 max-w-[196px] flex items-center gap-2 px-2.5 py-1 rounded-full bg-black/55 backdrop-blur-md border border-white/10 min-w-0">
-            <div class="w-6 h-6 rounded-full overflow-hidden shrink-0">
-              ${this._renderCoverImg(book)}
+          <!-- Top compact title pill with 24x24px mini cover icon -->
+          <div class="relative z-10 mt-2 mx-auto max-w-[196px] flex items-center justify-center gap-2 px-2.5 py-1 rounded-full bg-black/55 backdrop-blur-md border border-white/10 min-w-0">
+            <div class="w-6 h-6 rounded-full overflow-hidden shrink-0" style="background: linear-gradient(135deg, ${accent}, ${secondary});">
+              ${this._renderCoverImg(book, 'w-full h-full object-cover block')}
             </div>
             <span class="text-xs font-semibold text-white truncate min-w-0">${escapeHtml(book.title)}</span>
           </div>
 
           <!-- Center transport controls -->
-          <div class="relative z-10 flex items-center justify-center gap-4">
+          <div class="relative z-10 flex items-center justify-center gap-4 my-auto mx-auto">
             <button data-action="skip" data-delta="-15" aria-label="Rewind 15 seconds" class="btn-press w-11 h-11 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white">
               ${ICON_SKIP_BACK_15(21)}
             </button>
@@ -1359,10 +1319,10 @@ class AudiobookApp {
             </button>
           </div>
 
-          <!-- Bottom speed cycler & 1-tap Bookmark -->
-          <div class="relative z-10 mb-1 flex items-center justify-center gap-3">
+          <!-- Bottom speed cycler, clock & 1-tap Bookmark -->
+          <div class="relative z-10 mb-1 flex items-center justify-center gap-3 mx-auto">
             <button data-action="cycle-speed" class="btn-press px-3 py-1 rounded-full bg-white/10 hover:bg-white/20 text-xs font-semibold text-white tabular-nums">
-              ${Number(snap.playbackRate || 1).toFixed(snap.playbackRate % 1 === 0 ? 1 : 2).replace(/0$/, '')}x
+              ${formatPlaybackRate(snap.playbackRate)}
             </button>
             <span data-ab-elapsed class="text-[11px] text-[var(--text-secondary)] tabular-nums">${formatClock(pos)}</span>
             <button data-action="bookmark" aria-label="Bookmark" class="btn-press w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-[#1ed760]">
@@ -1382,7 +1342,7 @@ class AudiobookApp {
     const chapter = book.chapters?.[snap.chapterIndex];
 
     return `
-      <main class="min-h-[calc(100vh-56px)] flex items-center justify-center p-4 sm:p-8">
+      <main class="min-h-screen flex items-center justify-center p-4 sm:p-8">
         <div class="w-full max-w-3xl surface-panel ambient-surface rounded-3xl p-6 sm:p-8 space-y-6 overflow-hidden shadow-2xl">
           <div class="flex items-center gap-5 min-w-0">
             <div class="w-28 h-28 sm:w-32 sm:h-32 rounded-2xl overflow-hidden shrink-0 shadow-xl">
@@ -1423,9 +1383,9 @@ class AudiobookApp {
     `;
   }
 
-  _renderAndroidMobileView(activeBook, snap, forceShadeOpen = false) {
+  _renderAndroidMobileView(activeBook, snap) {
     const filtered = this.getFilteredBooks();
-    const shadeVisible = forceShadeOpen || this.state.shadeOpen;
+    const shadeVisible = this.state.shadeOpen;
     const duration = Math.max(1, snap.durationSec || activeBook?.totalDurationSec || 1);
     const pos = Math.max(0, Math.min(duration, snap.positionSec || 0));
     const pct = Math.min(100, Math.max(0, (pos / duration) * 100));
@@ -1440,136 +1400,134 @@ class AudiobookApp {
     };
 
     return `
-      <main class="min-h-[calc(100vh-56px)] flex items-start justify-center p-2 sm:p-6">
-        <div class="relative w-full max-w-[412px] min-h-[760px] rounded-[34px] surface-shell ambient-surface overflow-hidden flex flex-col shadow-[0_28px_70px_rgba(0,0,0,0.65)]">
-          <!-- Mobile Top Header -->
-          <div class="px-4 pt-4 pb-2 flex items-center justify-between gap-2">
-            <div class="flex items-center gap-1.5 overflow-x-auto min-w-0">
-              ${chip('all', 'All')}
-              ${chip('local', 'Local')}
-              ${chip('drive', 'Drive')}
-              ${chip('downloaded', 'Saved')}
-            </div>
-            <div class="flex items-center gap-2 shrink-0">
-              <button data-action="toggle-shade" aria-label="Notification Shade" class="btn-press w-8 h-8 rounded-full surface-card flex items-center justify-center text-[var(--text-secondary)] hover:text-white">
-                ${ICON_CHEVRON(shadeVisible ? 'up' : 'down', 15)}
-              </button>
-              ${this._renderAvatarButton('mobile')}
-            </div>
+      <main class="relative w-full h-screen ambient-surface overflow-hidden flex flex-col">
+        <!-- Mobile Top Header -->
+        <div class="px-4 pt-4 pb-2 flex items-center justify-between gap-2">
+          <div class="flex items-center gap-1.5 overflow-x-auto min-w-0">
+            ${chip('all', 'All')}
+            ${chip('local', 'Local')}
+            ${chip('drive', 'Drive')}
+            ${chip('downloaded', 'Saved')}
+          </div>
+          <div class="flex items-center gap-2 shrink-0">
+            <button data-action="toggle-shade" aria-label="Notification Shade" class="btn-press w-8 h-8 rounded-full surface-card flex items-center justify-center text-[var(--text-secondary)] hover:text-white">
+              ${ICON_CHEVRON(shadeVisible ? 'up' : 'down', 15)}
+            </button>
+            ${this._renderAvatarButton()}
+          </div>
+        </div>
+
+        ${
+          shadeVisible
+            ? `<div class="px-3 pb-3 pt-1">${this._renderNotificationShade(activeBook, snap)}</div>`
+            : ''
+        }
+
+        <!-- Mobile Scrollable Content -->
+        <div class="flex-1 overflow-y-auto px-4 pb-24 space-y-6 min-w-0">
+          <!-- 2-Column Quick-Resume Grid -->
+          <div class="grid grid-cols-2 gap-2.5">
+            ${filtered
+              .slice(0, 4)
+              .map(
+                (book) => `
+              <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="btn-press surface-card rounded-xl p-1.5 flex items-center gap-2.5 text-left overflow-hidden min-w-0 ${
+                  activeBook?.bookKey === book.bookKey ? 'ring-1 ring-[#1ed760]/60' : ''
+                }">
+                <div class="w-12 h-12 rounded-lg overflow-hidden shrink-0">
+                  ${this._renderCoverImg(book)}
+                </div>
+                <div class="min-w-0 flex-1">
+                  <div class="text-xs font-semibold text-[var(--text-primary)] clamp-2 leading-tight">${escapeHtml(book.title)}</div>
+                </div>
+              </button>`
+              )
+              .join('')}
           </div>
 
-          ${
-            shadeVisible
-              ? `<div class="px-3 pb-3 pt-1">${this._renderNotificationShade(activeBook, snap)}</div>`
-              : ''
-          }
-
-          <!-- Mobile Scrollable Content -->
-          <div class="flex-1 overflow-y-auto px-4 pb-24 space-y-6 min-w-0">
-            <!-- 2-Column Quick-Resume Grid -->
-            <div class="grid grid-cols-2 gap-2.5">
+          <!-- Jump back in (zero subtitle!) -->
+          <section class="space-y-3">
+            <h2 class="text-lg font-bold tracking-tight text-[var(--text-primary)]">Jump back in</h2>
+            <div class="flex gap-3 overflow-x-auto pb-1">
               ${filtered
-                .slice(0, 4)
                 .map(
                   (book) => `
-                <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="btn-press surface-card rounded-xl p-1.5 flex items-center gap-2.5 text-left overflow-hidden min-w-0 ${
-                    activeBook?.bookKey === book.bookKey ? 'ring-1 ring-[#1ed760]/60' : ''
-                  }">
-                  <div class="w-12 h-12 rounded-lg overflow-hidden shrink-0">
+                <div class="w-36 shrink-0 surface-card rounded-2xl p-2.5 space-y-2 overflow-hidden min-w-0">
+                  <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="w-full aspect-square rounded-xl overflow-hidden block relative group">
                     ${this._renderCoverImg(book)}
+                  </button>
+                  <div class="min-w-0 space-y-1">
+                    <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="text-left text-xs font-semibold text-[var(--text-primary)] clamp-2 leading-snug w-full">${escapeHtml(book.title)}</button>
+                    <div class="flex items-center justify-between gap-1 min-w-0">
+                      <span class="text-[11px] text-[var(--text-secondary)] truncate min-w-0">${escapeHtml(book.author)}</span>
+                      <div class="flex items-center gap-1 shrink-0">${this._renderSourceBadges(book, 12)}</div>
+                    </div>
+                    <div class="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">
+                      ${this._renderDownloadedIcon(book, 14)}
+                      <span data-ab-timeleft data-book-key="${escapeHtml(book.bookKey)}" class="truncate">${formatRemaining(book.totalDurationSec, book.positionSec)}</span>
+                    </div>
                   </div>
-                  <div class="min-w-0 flex-1">
-                    <div class="text-xs font-semibold text-[var(--text-primary)] clamp-2 leading-tight">${escapeHtml(book.title)}</div>
-                  </div>
-                </button>`
+                </div>`
                 )
                 .join('')}
             </div>
+          </section>
 
-            <!-- Jump back in (zero subtitle!) -->
-            <section class="space-y-3">
-              <h2 class="text-lg font-bold tracking-tight text-[var(--text-primary)]">Jump back in</h2>
-              <div class="flex gap-3 overflow-x-auto pb-1">
-                ${filtered
-                  .map(
-                    (book) => `
-                  <div class="w-36 shrink-0 surface-card rounded-2xl p-2.5 space-y-2 overflow-hidden min-w-0">
-                    <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="w-full aspect-square rounded-xl overflow-hidden block relative group">
-                      ${this._renderCoverImg(book)}
-                    </button>
-                    <div class="min-w-0 space-y-1">
-                      <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="text-left text-xs font-semibold text-[var(--text-primary)] clamp-2 leading-snug w-full">${escapeHtml(book.title)}</button>
-                      <div class="flex items-center justify-between gap-1 min-w-0">
-                        <span class="text-[11px] text-[var(--text-secondary)] truncate min-w-0">${escapeHtml(book.author)}</span>
-                        <div class="flex items-center gap-1 shrink-0">${this._renderSourceBadges(book, 12)}</div>
-                      </div>
-                      <div class="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">
-                        ${this._renderDownloadedIcon(book, 14)}
-                        <span data-ab-timeleft data-book-key="${escapeHtml(book.bookKey)}" class="truncate">${formatRemaining(book.totalDurationSec, book.positionSec)}</span>
-                      </div>
+          <!-- Library (zero subtitle!) -->
+          <section class="space-y-2.5">
+            <h2 class="text-lg font-bold tracking-tight text-[var(--text-primary)]">Library</h2>
+            <div class="space-y-2">
+              ${filtered
+                .map(
+                  (book) => `
+                <div class="surface-card rounded-2xl p-2.5 flex items-center gap-3 overflow-hidden min-w-0">
+                  <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="w-14 h-14 rounded-xl overflow-hidden shrink-0">
+                    ${this._renderCoverImg(book)}
+                  </button>
+                  <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="min-w-0 flex-1 text-left">
+                    <div class="text-sm font-semibold text-[var(--text-primary)] truncate">${escapeHtml(book.title)}</div>
+                    <div class="text-xs text-[var(--text-secondary)] truncate">${escapeHtml(book.author)}</div>
+                    <div class="flex items-center gap-1.5 mt-1 text-[11px] text-[var(--text-muted)]">
+                      ${this._renderDownloadedIcon(book, 14)}
+                      <span data-ab-timeleft data-book-key="${escapeHtml(book.bookKey)}" class="truncate">${formatRemaining(book.totalDurationSec, book.positionSec)}</span>
                     </div>
-                  </div>`
-                  )
-                  .join('')}
-              </div>
-            </section>
-
-            <!-- Library (zero subtitle!) -->
-            <section class="space-y-2.5">
-              <h2 class="text-lg font-bold tracking-tight text-[var(--text-primary)]">Library</h2>
-              <div class="space-y-2">
-                ${filtered
-                  .map(
-                    (book) => `
-                  <div class="surface-card rounded-2xl p-2.5 flex items-center gap-3 overflow-hidden min-w-0">
-                    <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="w-14 h-14 rounded-xl overflow-hidden shrink-0">
-                      ${this._renderCoverImg(book)}
-                    </button>
-                    <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="min-w-0 flex-1 text-left">
-                      <div class="text-sm font-semibold text-[var(--text-primary)] truncate">${escapeHtml(book.title)}</div>
-                      <div class="text-xs text-[var(--text-secondary)] truncate">${escapeHtml(book.author)}</div>
-                      <div class="flex items-center gap-1.5 mt-1 text-[11px] text-[var(--text-muted)]">
-                        ${this._renderDownloadedIcon(book, 14)}
-                        <span data-ab-timeleft data-book-key="${escapeHtml(book.bookKey)}" class="truncate">${formatRemaining(book.totalDurationSec, book.positionSec)}</span>
-                      </div>
-                    </button>
-                    <div class="flex items-center gap-1.5 shrink-0">
-                      ${this._renderSourceBadges(book, 15)}
-                    </div>
-                  </div>`
-                  )
-                  .join('')}
-              </div>
-            </section>
-          </div>
-
-          <!-- Floating Mini-Player Bar -->
-          ${
-            activeBook
-              ? `
-          <div class="absolute inset-x-3 bottom-3 z-20 rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
-            <div class="p-2.5 flex items-center gap-3 min-w-0">
-              <button data-action="open-mobile-sheet" class="w-11 h-11 rounded-xl overflow-hidden shrink-0">
-                ${this._renderCoverImg(activeBook)}
-              </button>
-              <button data-action="open-mobile-sheet" class="min-w-0 flex-1 text-left">
-                <div class="text-xs font-semibold text-white truncate">${escapeHtml(activeBook.title)}</div>
-                <div class="text-[11px] text-[var(--text-secondary)] truncate">${escapeHtml(activeBook.chapters?.[snap.chapterIndex]?.title || activeBook.author)}</div>
-              </button>
-              <button data-action="bookmark" aria-label="Bookmark" class="btn-press p-2 text-[#1ed760] shrink-0">${ICON_BOOKMARK(17)}</button>
-              <button data-action="toggle-play" aria-label="Play or Pause" class="play-fab w-9 h-9 shrink-0">
-                ${snap.playing ? ICON_PAUSE(16) : ICON_PLAY(16)}
-              </button>
+                  </button>
+                  <div class="flex items-center gap-1.5 shrink-0">
+                    ${this._renderSourceBadges(book, 15)}
+                  </div>
+                </div>`
+                )
+                .join('')}
             </div>
-            <div class="h-0.5 w-full bg-white/10">
-              <div data-ab-progress-fill class="h-full bg-[#1ed760]" style="width:${pct.toFixed(2)}%"></div>
-            </div>
-          </div>`
-              : ''
-          }
-
-          ${this.state.mobileSheetOpen ? this._renderMobileFullSheet(activeBook, snap) : ''}
+          </section>
         </div>
+
+        <!-- Floating Mini-Player Bar -->
+        ${
+          activeBook
+            ? `
+        <div class="absolute inset-x-3 bottom-3 z-20 rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
+          <div class="p-2.5 flex items-center gap-3 min-w-0">
+            <button data-action="open-mobile-sheet" class="w-11 h-11 rounded-xl overflow-hidden shrink-0">
+              ${this._renderCoverImg(activeBook)}
+            </button>
+            <button data-action="open-mobile-sheet" class="min-w-0 flex-1 text-left">
+              <div class="text-xs font-semibold text-white truncate">${escapeHtml(activeBook.title)}</div>
+              <div class="text-[11px] text-[var(--text-secondary)] truncate">${escapeHtml(activeBook.chapters?.[snap.chapterIndex]?.title || activeBook.author)}</div>
+            </button>
+            <button data-action="bookmark" aria-label="Bookmark" class="btn-press p-2 text-[#1ed760] shrink-0">${ICON_BOOKMARK(17)}</button>
+            <button data-action="toggle-play" aria-label="Play or Pause" class="play-fab w-9 h-9 shrink-0">
+              ${snap.playing ? ICON_PAUSE(16) : ICON_PLAY(16)}
+            </button>
+          </div>
+          <div class="h-0.5 w-full bg-white/10">
+            <div data-ab-progress-fill class="h-full bg-[#1ed760]" style="width:${pct.toFixed(2)}%"></div>
+          </div>
+        </div>`
+            : ''
+        }
+
+        ${this.state.mobileSheetOpen ? this._renderMobileFullSheet(activeBook, snap) : ''}
       </main>
     `;
   }
@@ -1626,7 +1584,7 @@ class AudiobookApp {
         </div>
 
         <div class="mt-6 flex items-center justify-between gap-2 pt-3 border-t border-[var(--border-subtle)]">
-          <button data-action="cycle-speed" class="btn-press px-3 py-1.5 rounded-full surface-card text-xs font-semibold text-white tabular-nums">${snap.playbackRate}x</button>
+          <button data-action="cycle-speed" class="btn-press px-3 py-1.5 rounded-full surface-card text-xs font-semibold text-white tabular-nums">${formatPlaybackRate(snap.playbackRate)}</button>
           <button data-action="cycle-sleep" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full surface-card text-xs font-medium text-[var(--text-secondary)]">
             ${ICON_SLEEP(14)}
             <span>${snap.sleepTimerMode ? (snap.sleepTimerMode === 'chapter' ? 'Ch' : `${snap.sleepTimerMode}m`) : 'Sleep'}</span>
@@ -1665,7 +1623,7 @@ class AudiobookApp {
     const activeBookmarks = activeBook ? this.state.bookmarksByBook[activeBook.bookKey] || [] : [];
 
     return `
-      <div class="h-[calc(100vh-53px)] flex flex-col overflow-hidden">
+      <div class="h-screen flex flex-col overflow-hidden">
         <div class="flex-1 flex gap-2 p-2 min-h-0 overflow-hidden">
           <!-- Left Collapsible Library Sidebar -->
           <aside class="${sidebarCollapsed ? 'w-[72px]' : 'w-64 lg:w-72'} shrink-0 surface-panel rounded-2xl flex flex-col overflow-hidden transition-all duration-300">
@@ -1753,6 +1711,7 @@ class AudiobookApp {
                 <button data-action="toggle-right-panel" aria-label="Toggle Now Playing Panel" class="btn-press p-2 rounded-full surface-card ${rightPanelOpen ? 'text-[#1ed760]' : 'text-[var(--text-secondary)]'}">
                   ${ICON_PANEL_RIGHT(16)}
                 </button>
+                ${this._renderAvatarButton()}
               </div>
             </div>
 
@@ -1860,7 +1819,7 @@ class AudiobookApp {
           </div>
 
           <div class="hidden md:flex items-center justify-end gap-2 w-64 shrink-0">
-            <button data-action="cycle-speed" class="btn-press px-2.5 py-1 rounded-full surface-card text-xs font-semibold text-white tabular-nums">${snap.playbackRate}x</button>
+            <button data-action="cycle-speed" class="btn-press px-2.5 py-1 rounded-full surface-card text-xs font-semibold text-white tabular-nums">${formatPlaybackRate(snap.playbackRate)}</button>
             <button data-action="cycle-sleep" class="btn-press inline-flex items-center gap-1 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white">
               ${ICON_SLEEP(13)}
               <span>${snap.sleepTimerMode ? (snap.sleepTimerMode === 'chapter' ? 'Ch' : `${snap.sleepTimerMode}m`) : 'Sleep'}</span>
@@ -2086,30 +2045,41 @@ class AudiobookApp {
     if (!this.rootEl) return;
     const activeBook = this.getActiveBook();
     const snap = this.state.snapshot;
+    const layoutMode = this._detectViewportLayout();
+    this.state.layoutMode = layoutMode;
 
     let bodyView = '';
-    if (this.state.compareMode) {
-      bodyView = this._renderThemeCompareView();
-    } else if (this.state.previewMode === 'watch') {
+    if (layoutMode === 'watch') {
       bodyView = this._renderGalaxyWatchView(activeBook, snap);
-    } else if (this.state.previewMode === 'auto' && this.state.androidAutoConnected) {
+    } else if (layoutMode === 'auto') {
       bodyView = this._renderAndroidAutoView(activeBook, snap);
-    } else if (this.state.previewMode === 'android') {
-      bodyView = this._renderAndroidMobileView(activeBook, snap, false);
-    } else if (this.state.previewMode === 'shade') {
-      bodyView = this._renderAndroidMobileView(activeBook, snap, true);
+    } else if (layoutMode === 'android') {
+      bodyView = this._renderAndroidMobileView(activeBook, snap);
     } else {
       bodyView = this._renderDesktopView(activeBook, snap);
     }
 
     this.rootEl.innerHTML = `
       <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
-        ${this._renderTopPreviewBar()}
         ${bodyView}
         ${this._renderProfilePopover()}
         ${this._renderCoverSearchModal()}
       </div>
     `;
+
+    if (this.state.profileOpen && typeof document !== 'undefined' && typeof window !== 'undefined') {
+      const btn = document.getElementById('profileAvatarBtn');
+      const pop = document.getElementById('profilePopover');
+      if (btn && pop && typeof btn.getBoundingClientRect === 'function') {
+        const rect = btn.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          const rightOffset = Math.max(12, window.innerWidth - rect.right);
+          const topOffset = Math.min(window.innerHeight - 20, rect.bottom + 8);
+          pop.style.right = `${Math.round(rightOffset)}px`;
+          pop.style.top = `${Math.round(topOffset)}px`;
+        }
+      }
+    }
 
     this._bindViewEvents();
   }
@@ -2159,41 +2129,31 @@ class AudiobookApp {
       el.addEventListener('click', (e) => {
         e.stopPropagation();
         switch (action) {
-          case 'set-preview': {
-            this.state.compareMode = false;
-            this.state.previewMode = el.dataset.mode;
+          case 'toggle-theme': {
+            const nextTheme = this.state.theme === 'pitch' ? 'midnight' : 'pitch';
+            this._saveTheme(nextTheme);
             this.render();
             break;
           }
           case 'set-theme': {
-            const nextTheme = el.dataset.theme;
-            if (nextTheme === 'compare') {
-              this.state.compareMode = true;
-            } else {
-              this.state.compareMode = false;
-              this._saveTheme(nextTheme);
-            }
+            const nextTheme = el.dataset.theme === 'pitch' ? 'pitch' : 'midnight';
+            this._saveTheme(nextTheme);
             this.render();
             break;
           }
           case 'toggle-profile': {
             this.state.profileOpen = !this.state.profileOpen;
+            if (this.state.profileOpen) {
+              void this.mediaBridge.refreshAudioOutputs();
+            }
             this.render();
             break;
           }
-          case 'select-device': {
-            this.state.activeOutputDevice = el.dataset.device;
-            const book = this.getActiveBook();
-            if (book) {
-              this.syncService.broadcastPlaybackState({
-                isPlaying: this.state.snapshot.playing,
-                bookKey: book.bookKey,
-                chapterIndex: this.state.snapshot.chapterIndex,
-                positionSec: this.state.snapshot.positionSec,
-                deviceName: this.state.activeOutputDevice
-              });
+          case 'select-output-device': {
+            const deviceId = el.dataset.deviceId;
+            if (deviceId) {
+              void this.selectOutputDevice(deviceId);
             }
-            this.render();
             break;
           }
           case 'cycle-device': {
@@ -2283,9 +2243,6 @@ class AudiobookApp {
           }
           case 'toggle-shade': {
             this.state.shadeOpen = !this.state.shadeOpen;
-            if (this.state.previewMode === 'shade' && !this.state.shadeOpen) {
-              this.state.previewMode = 'android';
-            }
             this.render();
             break;
           }
@@ -2340,10 +2297,6 @@ class AudiobookApp {
           }
           case 'auto-match-tags': {
             void this.handleAutoMatchTags(el.dataset.book);
-            break;
-          }
-          case 'toggle-android-auto': {
-            this.mediaBridge.setAndroidAutoConnected(!this.state.androidAutoConnected);
             break;
           }
           case 'sign-out': {

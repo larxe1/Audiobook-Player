@@ -29,14 +29,18 @@ Choose either option:
 
 ### Windows PC
 
-Choose either option:
+Choose any option:
 
-1. **One-Click Desktop App Launcher (`Launch-Audiobook-Player.bat`)**
+1. **Standalone Native Desktop App (`Audiobook Player.exe` via Tauri 2)**
+   - Double-click `Audiobook Player.exe` (or build locally with `npm run tauri:build`, which prepares `ui-dist/` and compiles `src-tauri/` into a standalone Windows executable with no browser chrome or console window).
+   - Downloadable from **GitHub Releases** as [`Audiobook-Player.exe`](https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe).
+
+2. **One-Click Local Server Launcher (`Launch-Audiobook-Player.bat`)**
    - Ensure [Node.js](https://nodejs.org/) (v18+) is installed.
    - Double-click `Launch-Audiobook-Player.bat` in the repository root.
    - It starts the local server on `http://127.0.0.1:4173` (if not already running) and opens Microsoft Edge or Google Chrome in standalone borderless app mode (`--app=http://127.0.0.1:4173`).
 
-2. **Install via Edge / Chrome (GitHub Pages or Local Server)**
+3. **Install via Edge / Chrome (GitHub Pages or Local Server)**
    - Open [`https://larxe1.github.io/Audiobook-Player/`](https://larxe1.github.io/Audiobook-Player/) (or `http://127.0.0.1:4173`) in Microsoft Edge or Google Chrome.
    - Click the **Install Audiobook Player** icon in the address bar (or browser menu → **Apps → Install this site as an app**).
 

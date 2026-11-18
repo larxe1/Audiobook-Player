@@ -1,0 +1,12 @@
+[package]
+name = "audiobook-player"
+version = "1.0.0"
+description = "Audiobook Player Standalone Windows Desktop App (Tauri 2)"
+authors = ["Audiobook Player"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
