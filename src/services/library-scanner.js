@@ -287,131 +287,302 @@ function createLocalFileUrl(file) {
   return '';
 }
 
-function getParentFolder(file) {
-  const rel = file?.webkitRelativePath || file?.relativePath || '';
-  if (!rel || !rel.includes('/')) return '';
-  const parts = rel.split('/').filter(Boolean);
-  if (parts.length < 2) return '';
-  return parts[parts.length - 2];
+function getDirectoryInfo(file) {
+  const raw = String(file?.webkitRelativePath || file?.relativePath || '').replace(/\\/g, '/');
+  if (!raw || !raw.includes('/')) {
+    return { dirPath: '', folderName: '', parentFolderName: '', depth: 0 };
+  }
+  const parts = raw.split('/').filter(Boolean);
+  if (parts.length < 2) {
+    return { dirPath: '', folderName: '', parentFolderName: '', depth: 0 };
+  }
+  const dirParts = parts.slice(0, -1);
+  return {
+    dirPath: dirParts.join('/'),
+    folderName: dirParts[dirParts.length - 1] || '',
+    parentFolderName: dirParts.length >= 2 ? dirParts[dirParts.length - 2] : '',
+    depth: dirParts.length - 1,
+  };
 }
 
 /**
- * Scan local FileList / File[] from <input type="file" webkitdirectory multiple>
- * into deduplicated audiobook items with extracted tags and chapters.
+ * Recursively scan local FileList / File[] (from `<input type="file" webkitdirectory multiple>`,
+ * `showDirectoryPicker`, or multi-file selection) into deduplicated audiobook items with
+ * extracted tags, chapters, and sibling folder cover images.
  * @param {FileList|Array<File|object>} fileList
+ * @param {{ onProgress?: Function, signal?: AbortSignal }} [options={}]
  * @returns {Promise<Array<object>>}
  */
-export async function scanLocalFiles(fileList) {
+export async function scanLocalFiles(fileList, options = {}) {
   if (!fileList) return [];
-  const files = Array.from(fileList).filter(
-    (f) => f && typeof f.name === 'string' && SUPPORTED_AUDIO_RE.test(f.name),
+  const allEntries = Array.from(fileList).filter((f) => f && typeof f.name === 'string');
+  const files = allEntries.filter(
+    (f) => SUPPORTED_AUDIO_RE.test(f.name) || (typeof f.type === 'string' && f.type.startsWith('audio/')),
   );
   if (files.length === 0) return [];
 
-  // Sort deterministically by relative path or name so multi-part tracks stay ordered
-  files.sort((a, b) =>
-    (a.webkitRelativePath || a.name).localeCompare(b.webkitRelativePath || b.name, undefined, {
-      numeric: true,
-      sensitivity: 'base',
-    }),
-  );
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+  const signal = options.signal || null;
 
-  const parsedEntries = await Promise.all(
-    files.map(async (file) => {
-      const headerBytes = await readHeaderBytes(file);
-      const tags = parseAudioTags(headerBytes, file.name);
-      const parentFolder = getParentFolder(file);
-      const localUrl = createLocalFileUrl(file);
-      return { file, tags, parentFolder, localUrl };
-    }),
-  );
-
-  // Count audio files per subfolder to detect multi-track folder books
-  const folderCounts = new Map();
-  for (const entry of parsedEntries) {
-    if (entry.parentFolder) {
-      folderCounts.set(entry.parentFolder, (folderCounts.get(entry.parentFolder) || 0) + 1);
+  // Map sibling cover images (cover.jpg, folder.png, etc.) by exact directory path
+  const coverByDir = new Map();
+  for (const imgFile of allEntries) {
+    if (!IMAGE_FILE_RE.test(imgFile.name)) continue;
+    const { dirPath } = getDirectoryInfo(imgFile);
+    if (!dirPath) continue;
+    const existing = coverByDir.get(dirPath);
+    if (!existing || /cover|folder|front|poster/i.test(imgFile.name)) {
+      coverByDir.set(dirPath, imgFile);
     }
   }
 
-  const grouped = new Map();
+  // Sort deterministically by full relative path so nested subfolders & multi-part tracks stay ordered
+  files.sort((a, b) =>
+    (a.webkitRelativePath || a.relativePath || a.name).localeCompare(
+      b.webkitRelativePath || b.relativePath || b.name,
+      undefined,
+      { numeric: true, sensitivity: 'base' },
+    ),
+  );
 
-  for (const entry of parsedEntries) {
-    const { file, tags, parentFolder, localUrl } = entry;
-    const isMultiFileFolder =
-      parentFolder &&
-      (folderCounts.get(parentFolder) || 0) > 1 &&
-      (TRACK_LIKE_FILE_RE.test(file.name) || Boolean(tags.series));
+  // Group files by exact directory path first so subfolders with identical names (e.g. Disc 1) never collide
+  const dirGroups = new Map();
+  for (const file of files) {
+    const info = getDirectoryInfo(file);
+    const dirKey = info.dirPath || '__root__';
+    if (!dirGroups.has(dirKey)) {
+      dirGroups.set(dirKey, { info, files: [] });
+    }
+    dirGroups.get(dirKey).files.push(file);
+  }
 
-    let title = tags.title || file.name.replace(ANY_AUDIO_EXT_RE, '');
-    let author = tags.author || '';
+  const totalFiles = files.length;
+  let processed = 0;
+  const collectedBooks = [];
 
-    if (isMultiFileFolder) {
-      const folderMeta = parseFilenameMetadata(parentFolder);
-      title = tags.series || folderMeta.title || parentFolder;
-      author = tags.author || folderMeta.author || '';
-    } else if (tags.series && TRACK_LIKE_FILE_RE.test(file.name)) {
-      title = tags.series;
+  for (const [dirKey, group] of dirGroups.entries()) {
+    if (signal?.aborted) {
+      throw new DOMException('Local folder scan cancelled.', 'AbortError');
     }
 
-    const bookKey = normalizeBookKey(title, author);
+    const { info, files: dirFiles } = group;
+    const folderName = info.folderName;
+    const isRootLevel = dirKey === '__root__' || info.depth === 0;
+    const coverFile = dirKey !== '__root__' ? coverByDir.get(dirKey) : null;
+    const folderCoverUrl = coverFile ? createLocalFileUrl(coverFile) : '';
 
-    if (!grouped.has(bookKey)) {
-      const initialChapters =
-        tags.chapters && tags.chapters.length > 0
-          ? tags.chapters
-          : [
-              {
-                index: 0,
-                title: isMultiFileFolder
-                  ? tags.title || file.name.replace(ANY_AUDIO_EXT_RE, '')
-                  : 'Chapter 1',
-                startSec: 0,
-                localUrl,
-              },
-            ];
+    const parsedEntries = [];
+    for (const file of dirFiles) {
+      if (signal?.aborted) {
+        throw new DOMException('Local folder scan cancelled.', 'AbortError');
+      }
+      const headerBytes = await readHeaderBytes(file);
+      const tags = parseAudioTags(headerBytes, file.name);
+      const localUrl = createLocalFileUrl(file);
+      parsedEntries.push({ file, tags, localUrl });
+      processed += 1;
+      if (onProgress) {
+        onProgress({
+          phase: 'local',
+          processed,
+          total: totalFiles,
+          currentFolder: folderName || 'Local Files',
+          booksFound: collectedBooks.length,
+          percent: Math.min(99, Math.round((processed / totalFiles) * 100)),
+        });
+      }
+    }
 
-      grouped.set(bookKey, {
+    // Multiple files inside a subfolder: group into 1 book unless they are distinct .m4b book containers in a series folder
+    const allSingleM4bContainers = parsedEntries.every(
+      ({ file }) => /\.m4b$/i.test(file.name) && !TRACK_LIKE_FILE_RE.test(file.name),
+    );
+    const shouldGroupFolderAsOneBook =
+      !isRootLevel &&
+      parsedEntries.length > 1 &&
+      !allSingleM4bContainers;
+
+    const folderIsDisc = /^(disc|cd|part|volume|vol)[\s_-]*\d+$/i.test(folderName || '');
+    const parentMeta =
+      folderIsDisc && info.depth >= 2 && info.parentFolderName
+        ? parseFilenameMetadata(info.parentFolderName)
+        : { title: '', author: '' };
+    const effectiveFolderTitle =
+      folderIsDisc && info.depth >= 2 && info.parentFolderName
+        ? `${parentMeta.title || info.parentFolderName} - ${folderName}`
+        : '';
+
+    if (shouldGroupFolderAsOneBook) {
+      const folderMeta = parseFilenameMetadata(folderName || '');
+      const firstTags = parsedEntries[0].tags;
+      const title = firstTags.series || effectiveFolderTitle || folderMeta.title || folderName;
+      const author = firstTags.author || folderMeta.author || parentMeta.author || '';
+      const bookKey = normalizeBookKey(title, author);
+
+      const tracks = parsedEntries.map(({ file, localUrl }) => ({
+        name: file.name,
+        localUrl,
+        size: file.size || 0,
+      }));
+      const chapters = parsedEntries.map(({ file, tags, localUrl }, idx) => ({
+        index: idx,
+        title: tags.title || file.name.replace(ANY_AUDIO_EXT_RE, '') || `Chapter ${idx + 1}`,
+        startSec: 0,
+        localUrl,
+        localFile: file,
+      }));
+
+      collectedBooks.push({
         id: bookKey,
         bookKey,
         title,
         author,
-        narrator: tags.narrator || '',
-        series: tags.series || '',
-        description: tags.description || '',
-        year: tags.year || '',
-        totalDurationSec: tags.totalDurationSec || 0,
+        narrator: parsedEntries.find((e) => e.tags.narrator)?.tags.narrator || '',
+        series: info.depth >= 2 ? info.parentFolderName : (firstTags.series || ''),
+        description: parsedEntries.find((e) => e.tags.description)?.tags.description || '',
+        year: parsedEntries.find((e) => e.tags.year)?.tags.year || '',
+        totalDurationSec: parsedEntries.reduce((s, e) => s + Number(e.tags.totalDurationSec || 0), 0),
+        coverUrl: folderCoverUrl || '',
         sources: ['local'],
         preferredPlaybackSource: 'local',
-        localUrl,
-        localFile: file,
-        tracks: [{ name: file.name, localUrl, size: file.size || 0 }],
-        chapters: initialChapters,
+        localUrl: parsedEntries[0].localUrl,
+        localFile: parsedEntries[0].file,
+        tracks,
+        chapters,
         bookmarks: [],
         positionSec: 0,
         progressSec: 0,
         chapterIndex: 0,
         isOffline: true,
         offline: true,
-        fileSizeBytes: Number(file.size || 0),
+        fileSizeBytes: parsedEntries.reduce((s, e) => s + Number(e.file.size || 0), 0),
       });
-    } else {
-      const book = grouped.get(bookKey);
-      const nextIndex = book.chapters.length;
-      book.tracks.push({ name: file.name, localUrl, size: file.size || 0 });
-      book.chapters.push({
-        index: nextIndex,
-        title: tags.title || file.name.replace(ANY_AUDIO_EXT_RE, '') || `Chapter ${nextIndex + 1}`,
-        startSec: 0,
-        localUrl,
-      });
-      book.fileSizeBytes += Number(file.size || 0);
-      if (!book.narrator && tags.narrator) book.narrator = tags.narrator;
-      if (!book.author && author) book.author = author;
+      continue;
     }
+
+    // Individual book files (or series folder containing multiple distinct .m4b books)
+    const perFileGroups = new Map();
+    for (const { file, tags, localUrl } of parsedEntries) {
+      const folderMeta = !isRootLevel && folderName ? parseFilenameMetadata(folderName) : { title: '', author: '' };
+      const useFolderTitle =
+        parsedEntries.length === 1 &&
+        !isRootLevel &&
+        folderName &&
+        (TRACK_LIKE_FILE_RE.test(file.name) || /^(audiobook|book|audio|part)/i.test(file.name));
+
+      const title = useFolderTitle
+        ? effectiveFolderTitle || folderMeta.title || folderName
+        : tags.title || file.name.replace(ANY_AUDIO_EXT_RE, '');
+      const author = tags.author || folderMeta.author || parentMeta.author || '';
+      const series =
+        !isRootLevel && parsedEntries.length > 1 && folderName
+          ? folderName
+          : info.depth >= 2 && info.parentFolderName
+            ? info.parentFolderName
+            : tags.series || '';
+      const bookKey = normalizeBookKey(title, author);
+
+      if (!perFileGroups.has(bookKey)) {
+        const initialChapters =
+          tags.chapters && tags.chapters.length > 0
+            ? tags.chapters
+            : [
+                {
+                  index: 0,
+                  title: 'Chapter 1',
+                  startSec: 0,
+                  localUrl,
+                  localFile: file,
+                },
+              ];
+
+        perFileGroups.set(bookKey, {
+          id: bookKey,
+          bookKey,
+          title,
+          author,
+          narrator: tags.narrator || '',
+          series,
+          description: tags.description || '',
+          year: tags.year || '',
+          totalDurationSec: tags.totalDurationSec || 0,
+          coverUrl: folderCoverUrl || '',
+          sources: ['local'],
+          preferredPlaybackSource: 'local',
+          localUrl,
+          localFile: file,
+          tracks: [{ name: file.name, localUrl, size: file.size || 0 }],
+          chapters: initialChapters,
+          bookmarks: [],
+          positionSec: 0,
+          progressSec: 0,
+          chapterIndex: 0,
+          isOffline: true,
+          offline: true,
+          fileSizeBytes: Number(file.size || 0),
+        });
+      } else {
+        const book = perFileGroups.get(bookKey);
+        const nextIndex = book.chapters.length;
+        book.tracks.push({ name: file.name, localUrl, size: file.size || 0 });
+        book.chapters.push({
+          index: nextIndex,
+          title: tags.title || file.name.replace(ANY_AUDIO_EXT_RE, '') || `Chapter ${nextIndex + 1}`,
+          startSec: 0,
+          localUrl,
+          localFile: file,
+        });
+        book.fileSizeBytes += Number(file.size || 0);
+        if (!book.narrator && tags.narrator) book.narrator = tags.narrator;
+        if (!book.author && author) book.author = author;
+      }
+    }
+
+    collectedBooks.push(...perFileGroups.values());
   }
 
-  return deduplicateLibraryItems(Array.from(grouped.values()));
+  const deduped = deduplicateLibraryItems(collectedBooks);
+  if (onProgress) {
+    onProgress({
+      phase: 'local',
+      processed: totalFiles,
+      total: totalFiles,
+      currentFolder: '',
+      booksFound: deduped.length,
+      percent: 100,
+    });
+  }
+  return deduped;
+}
+
+/**
+ * Recursively collect all File objects from a File System Access API DirectoryHandle.
+ * @param {FileSystemDirectoryHandle} dirHandle
+ * @param {string} [prefix='']
+ * @returns {Promise<Array<File>>}
+ */
+export async function collectFilesFromDirectoryHandle(dirHandle, prefix = '') {
+  if (!dirHandle || typeof dirHandle.values !== 'function') return [];
+  const rootPrefix = prefix || dirHandle.name || 'Audiobooks';
+  const collected = [];
+  for await (const entry of dirHandle.values()) {
+    if (entry.kind === 'file') {
+      const file = await entry.getFile();
+      try {
+        Object.defineProperty(file, 'relativePath', {
+          value: `${rootPrefix}/${file.name}`,
+          configurable: true,
+        });
+      } catch {
+        // ignore if read-only
+      }
+      collected.push(file);
+    } else if (entry.kind === 'directory') {
+      const nested = await collectFilesFromDirectoryHandle(entry, `${rootPrefix}/${entry.name}`);
+      collected.push(...nested);
+    }
+  }
+  return collected;
 }
 
 function isDriveFolder(file) {
@@ -454,12 +625,65 @@ function isDriveImageFile(file) {
   return IMAGE_FILE_RE.test(file.name) || (typeof mime === 'string' && mime.startsWith('image/'));
 }
 
-async function listDriveQueryPages(accessToken, q, fetchImpl) {
+async function parseDriveErrorMessage(res) {
+  const status = res?.status || 0;
+  let apiMsg = '';
+  try {
+    if (res && typeof res.text === 'function') {
+      const text = await res.text();
+      if (text) {
+        try {
+          const parsed = JSON.parse(text);
+          apiMsg = parsed?.error?.message || parsed?.error_description || '';
+        } catch {
+          apiMsg = text.slice(0, 200);
+        }
+      }
+    }
+  } catch {
+    // ignore body read failure
+  }
+
+  if (status === 401) {
+    const err = new Error(
+      `Google Drive session expired (401). Please sign in with Google again.${apiMsg ? ` (${apiMsg})` : ''}`,
+    );
+    err.status = 401;
+    return err;
+  }
+  if (status === 403) {
+    const err = new Error(
+      `Google Drive access denied (403). Check Drive permissions.${apiMsg ? ` (${apiMsg})` : ''}`,
+    );
+    err.status = 403;
+    return err;
+  }
+  if (status === 404) {
+    const err = new Error(
+      `Google Drive folder not found (404). Verify the folder link or sharing permissions.${apiMsg ? ` (${apiMsg})` : ''}`,
+    );
+    err.status = 404;
+    return err;
+  }
+  const err = new Error(
+    `Google Drive scan failed (${status || 'network error'})${apiMsg ? `: ${apiMsg}` : ''}`,
+  );
+  err.status = status;
+  return err;
+}
+
+async function listDriveQueryPages(accessToken, q, fetchImpl, options = {}) {
   const allFiles = [];
   let pageToken = '';
   let guard = 0;
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 15000;
+  const externalSignal = options.signal || null;
 
   do {
+    if (externalSignal?.aborted) {
+      throw new DOMException('Google Drive sync cancelled.', 'AbortError');
+    }
+
     const params = new URLSearchParams({
       q,
       fields:
@@ -473,15 +697,46 @@ async function listDriveQueryPages(accessToken, q, fetchImpl) {
     }
 
     const url = `https://www.googleapis.com/drive/v3/files?${params.toString()}`;
-    const res = await fetchImpl(url, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: 'application/json',
-      },
-    });
+    const reqCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    let timedOut = false;
+    const onExternalAbort = () => reqCtrl?.abort();
+    if (externalSignal && reqCtrl) {
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+    const timer =
+      reqCtrl && timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            reqCtrl.abort();
+          }, timeoutMs)
+        : null;
+
+    let res;
+    try {
+      res = await fetchImpl(url, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json',
+        },
+        signal: reqCtrl?.signal,
+      });
+    } catch (err) {
+      if (timer) clearTimeout(timer);
+      if (externalSignal && reqCtrl) externalSignal.removeEventListener('abort', onExternalAbort);
+      if (timedOut) {
+        throw new Error(`Google Drive request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+      }
+      if (externalSignal?.aborted || err?.name === 'AbortError') {
+        throw new DOMException('Google Drive sync cancelled.', 'AbortError');
+      }
+      throw new Error(`Google Drive network error: ${err?.message || 'Unable to reach Google Drive.'}`);
+    }
+
+    if (timer) clearTimeout(timer);
+    if (externalSignal && reqCtrl) externalSignal.removeEventListener('abort', onExternalAbort);
 
     if (!res || !res.ok) {
-      throw new Error(`Google Drive scan failed (${res ? res.status : 'no response'})`);
+      throw await parseDriveErrorMessage(res);
     }
 
     const data = await res.json();
@@ -630,7 +885,7 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
  * @param {string} accessToken
  * @param {string} [folderIdOrUrl='']
  * @param {typeof fetch} [fetchImpl=globalThis.fetch]
- * @param {{ maxDepth?: number }} [options={}]
+ * @param {{ maxDepth?: number, concurrency?: number, timeoutMs?: number, signal?: AbortSignal, onProgress?: Function }} [options={}]
  * @returns {Promise<Array<object>>}
  */
 export async function scanGoogleDriveFolder(
@@ -643,68 +898,141 @@ export async function scanGoogleDriveFolder(
 
   const rootFolderId = extractGoogleDriveFolderId(folderIdOrUrl);
   const maxDepth = Number.isFinite(options.maxDepth) ? options.maxDepth : 5;
+  const concurrency = Math.max(1, Math.min(8, Number(options.concurrency) || 4));
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+  const signal = options.signal || null;
 
   if (!rootFolderId) {
+    if (onProgress) {
+      onProgress({
+        phase: 'drive',
+        scannedFolders: 0,
+        discoveredFolders: 1,
+        currentFolder: 'Google Drive',
+        booksFound: 0,
+        percent: 15,
+      });
+    }
     const q =
       "trashed = false and (mimeType contains 'audio/' or name contains '.m4b' or name contains '.mp3' or name contains '.m4a' or name contains '.ogg' or name contains '.flac')";
-    const files = await listDriveQueryPages(accessToken, q, fetchImpl);
+    const files = await listDriveQueryPages(accessToken, q, fetchImpl, options);
     const audioFiles = files.filter(isDriveAudioFile);
-    return deduplicateLibraryItems(
+    const result = deduplicateLibraryItems(
       buildGroupedDriveBooksFromFolder('', '', audioFiles, null, true),
     );
+    if (onProgress) {
+      onProgress({
+        phase: 'drive',
+        scannedFolders: 1,
+        discoveredFolders: 1,
+        currentFolder: 'Google Drive',
+        booksFound: result.length,
+        percent: 100,
+      });
+    }
+    return result;
   }
 
   const visited = new Set([rootFolderId]);
   const queue = [{ id: rootFolderId, name: '', parentName: '', depth: 0, isRoot: true }];
   const collectedBooks = [];
+  let scannedFolders = 0;
+  let discoveredFolders = 1;
+
+  if (onProgress) {
+    onProgress({
+      phase: 'drive',
+      scannedFolders: 0,
+      discoveredFolders: 1,
+      currentFolder: 'Root Folder',
+      booksFound: 0,
+      percent: 5,
+    });
+  }
 
   while (queue.length > 0) {
-    const current = queue.shift();
-    const safeId = current.id.replace(/'/g, "\\'");
-    const q = `'${safeId}' in parents and trashed = false`;
-    const children = await listDriveQueryPages(accessToken, q, fetchImpl);
-
-    const audioFiles = [];
-    let coverFile = null;
-
-    for (const entry of children) {
-      if (!entry || !entry.id || !entry.name) continue;
-      if (isDriveFolder(entry)) {
-        const childFolderId = resolveDriveFileId(entry);
-        if (childFolderId && !visited.has(childFolderId) && current.depth < maxDepth) {
-          visited.add(childFolderId);
-          queue.push({
-            id: childFolderId,
-            name: entry.name,
-            parentName: current.isRoot ? '' : current.name,
-            depth: current.depth + 1,
-            isRoot: false,
-          });
-        }
-        continue;
-      }
-
-      if (isDriveAudioFile(entry)) {
-        audioFiles.push(entry);
-      } else if (isDriveImageFile(entry)) {
-        if (!coverFile || /cover|folder|front|poster/i.test(entry.name)) {
-          coverFile = entry;
-        }
-      }
+    if (signal?.aborted) {
+      throw new DOMException('Google Drive sync cancelled.', 'AbortError');
     }
 
-    if (audioFiles.length > 0) {
-      collectedBooks.push(
-        ...buildGroupedDriveBooksFromFolder(
-          current.name,
-          current.parentName,
-          audioFiles,
-          coverFile,
-          current.isRoot,
-        ),
-      );
+    const batch = queue.splice(0, concurrency);
+    const results = await Promise.all(
+      batch.map(async (current) => {
+        const safeId = current.id.replace(/'/g, "\\'");
+        const q = `'${safeId}' in parents and trashed = false`;
+        const children = await listDriveQueryPages(accessToken, q, fetchImpl, options);
+        return { current, children };
+      }),
+    );
+
+    for (const { current, children } of results) {
+      scannedFolders += 1;
+      const audioFiles = [];
+      let coverFile = null;
+
+      for (const entry of children) {
+        if (!entry || !entry.id || !entry.name) continue;
+        if (isDriveFolder(entry)) {
+          const childFolderId = resolveDriveFileId(entry);
+          if (childFolderId && !visited.has(childFolderId) && current.depth < maxDepth) {
+            visited.add(childFolderId);
+            discoveredFolders += 1;
+            queue.push({
+              id: childFolderId,
+              name: entry.name,
+              parentName: current.isRoot ? '' : current.name,
+              depth: current.depth + 1,
+              isRoot: false,
+            });
+          }
+          continue;
+        }
+
+        if (isDriveAudioFile(entry)) {
+          audioFiles.push(entry);
+        } else if (isDriveImageFile(entry)) {
+          if (!coverFile || /cover|folder|front|poster/i.test(entry.name)) {
+            coverFile = entry;
+          }
+        }
+      }
+
+      if (audioFiles.length > 0) {
+        collectedBooks.push(
+          ...buildGroupedDriveBooksFromFolder(
+            current.name,
+            current.parentName,
+            audioFiles,
+            coverFile,
+            current.isRoot,
+          ),
+        );
+      }
+
+      if (onProgress) {
+        const pct = Math.min(98, Math.max(8, Math.round((scannedFolders / discoveredFolders) * 100)));
+        onProgress({
+          phase: 'drive',
+          scannedFolders,
+          discoveredFolders,
+          currentFolder: current.name || 'Root Folder',
+          booksFound: collectedBooks.length,
+          percent: pct,
+        });
+      }
     }
   }
 
-  return deduplicateLibraryItems(collectedBooks);
+  const deduped = deduplicateLibraryItems(collectedBooks);
+  if (onProgress) {
+    onProgress({
+      phase: 'drive',
+      scannedFolders,
+      discoveredFolders,
+      currentFolder: '',
+      booksFound: deduped.length,
+      percent: 100,
+    });
+  }
+  return deduped;
 }

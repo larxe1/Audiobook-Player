@@ -15,6 +15,7 @@ import {
   deduplicateLibraryItems,
   scanLocalFiles,
   scanGoogleDriveFolder,
+  collectFilesFromDirectoryHandle,
   normalizeBookKey
 } from '../services/library-scanner.js';
 import { enrichBookMetadata, parseFilenameMetadata } from '../services/metadata-enrichment.js';
@@ -105,7 +106,10 @@ class AudiobookApp {
       onChapterChange: () => this._syncMediaSessionMetadata(),
       onEnded: () => this._handleBookEnded(),
       onSleepTimerUpdate: () => this.render(),
-      onOfflineChange: (bookKey, cached) => this._handleOfflineChange(bookKey, cached)
+      onOfflineChange: (bookKey, cached) => this._handleOfflineChange(bookKey, cached),
+      onError: (errMsg) => {
+        if (errMsg) this.showError('Playback Error', errMsg);
+      }
     });
 
     this.mediaBridge = new MediaSessionBridge({
@@ -178,6 +182,21 @@ class AudiobookApp {
         loading: false,
         results: []
       },
+      syncProgress: {
+        active: false,
+        phase: 'drive',
+        percent: 0,
+        currentFolder: '',
+        scannedFolders: 0,
+        discoveredFolders: 0,
+        booksFound: 0
+      },
+      errorModal: {
+        open: false,
+        title: '',
+        message: '',
+        showRelogin: false
+      },
       enrichingBookKey: null,
       updateState: {
         checking: false,
@@ -198,6 +217,81 @@ class AudiobookApp {
     };
 
     this._lastCheckpointAt = 0;
+    this._syncAbortController = null;
+
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('error', (event) => {
+        const msg = event?.error?.message || event?.message;
+        if (msg) this.showError('Unexpected Error', msg);
+      });
+      window.addEventListener('unhandledrejection', (event) => {
+        const reason = event?.reason;
+        if (reason?.name === 'AbortError') return;
+        const msg = reason?.message || (typeof reason === 'string' ? reason : '');
+        if (msg) this.showError('Unexpected Error', msg);
+      });
+    }
+  }
+
+  showError(title = 'Something went wrong', message = '', options = {}) {
+    const cleanMsg = String(message || '').trim() || 'An unexpected error occurred.';
+    this.state.errorModal = {
+      open: true,
+      title: String(title || 'Error'),
+      message: cleanMsg,
+      showRelogin: Boolean(options.showRelogin) || /\b401\b|expired|unauthorized/i.test(cleanMsg)
+    };
+    this.render();
+  }
+
+  cancelActiveSync() {
+    if (this._syncAbortController) {
+      try {
+        this._syncAbortController.abort();
+      } catch {
+        // ignore
+      }
+      this._syncAbortController = null;
+    }
+    this.state.syncProgress.active = false;
+    this.state.driveModal.loading = false;
+    this.render();
+  }
+
+  _updateSyncProgress(progress = {}) {
+    const next = {
+      active: true,
+      phase: progress.phase || this.state.syncProgress.phase || 'drive',
+      percent: Math.max(0, Math.min(100, Math.round(Number(progress.percent || 0)))),
+      currentFolder: progress.currentFolder || '',
+      scannedFolders: Number(progress.scannedFolders ?? progress.processed ?? 0),
+      discoveredFolders: Number(progress.discoveredFolders ?? progress.total ?? 0),
+      booksFound: Number(progress.booksFound || 0)
+    };
+    this.state.syncProgress = next;
+
+    if (typeof document !== 'undefined') {
+      const bars = document.querySelectorAll('[data-sync-progress-bar]');
+      const labels = document.querySelectorAll('[data-sync-progress-label]');
+      const pcts = document.querySelectorAll('[data-sync-progress-pct]');
+      if (bars.length > 0) {
+        bars.forEach((el) => {
+          el.style.width = `${next.percent}%`;
+        });
+        const summary =
+          next.discoveredFolders > 0
+            ? `${next.scannedFolders}/${next.discoveredFolders}${next.currentFolder ? ` • ${next.currentFolder}` : ''}${next.booksFound > 0 ? ` • ${next.booksFound} books` : ''}`
+            : next.currentFolder || 'Scanning...';
+        labels.forEach((el) => {
+          el.textContent = summary;
+        });
+        pcts.forEach((el) => {
+          el.textContent = `${next.percent}%`;
+        });
+        return;
+      }
+    }
+    this.render();
   }
 
   get books() {
@@ -418,64 +512,98 @@ class AudiobookApp {
   async _importLocalFiles(fileList) {
     if (!fileList || fileList.length === 0) return;
     const filesArr = Array.from(fileList);
-    const scanned = await scanLocalFiles(filesArr);
-
-    // Fallback for .wav / generic audio/* files not matched by scanLocalFiles
-    const scannedNames = new Set(
-      scanned.flatMap((b) => (b.tracks || []).map((t) => t.name)).filter(Boolean)
-    );
-    const extraAudio = filesArr.filter(
-      (f) =>
-        f &&
-        typeof f.name === 'string' &&
-        !scannedNames.has(f.name) &&
-        (/\.(wav|aac|opus|m4b|mp3|m4a|ogg|flac)$/i.test(f.name) ||
-          (typeof f.type === 'string' && f.type.startsWith('audio/')))
-    );
-
-    const extraBooks = extraAudio.map((file) => {
-      const meta = parseFilenameMetadata(file.name);
-      const title = meta.title || file.name.replace(/\.[^/.]+$/, '');
-      const author = meta.author || '';
-      const bookKey = normalizeBookKey(title, author);
-      const localUrl =
-        typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
-          ? URL.createObjectURL(file)
-          : '';
-      return {
-        id: bookKey,
-        bookKey,
-        title,
-        author,
-        narrator: '',
-        series: '',
-        description: '',
-        totalDurationSec: 0,
-        sources: ['local'],
-        preferredPlaybackSource: 'local',
-        localUrl,
-        localFile: file,
-        tracks: [{ name: file.name, localUrl, size: file.size || 0 }],
-        chapters: [{ index: 0, title: 'Chapter 1', startSec: 0, localUrl }],
-        bookmarks: [],
-        positionSec: 0,
-        progressSec: 0,
-        chapterIndex: 0,
-        isOffline: true,
-        offline: true
-      };
-    });
-
-    const imported = deduplicateLibraryItems([...scanned, ...extraBooks]);
-    if (imported.length === 0) return;
-
-    this.books = deduplicateLibraryItems([...this.books, ...imported]);
-    this._persistBooks();
-    if (this.syncService.isAuthenticated()) {
-      void this.syncService.syncLibraryItems(imported).catch(() => null);
-    }
-    await this.selectBook(imported[0].bookKey, false);
+    this._syncAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    this.state.syncProgress = {
+      active: true,
+      phase: 'local',
+      percent: 5,
+      currentFolder: 'Scanning local files...',
+      scannedFolders: 0,
+      discoveredFolders: filesArr.length,
+      booksFound: 0
+    };
     this.render();
+
+    try {
+      const scanned = await scanLocalFiles(filesArr, {
+        signal: this._syncAbortController?.signal,
+        onProgress: (p) => this._updateSyncProgress(p)
+      });
+
+      // Fallback for .wav / generic audio/* files not matched by scanLocalFiles
+      const scannedNames = new Set(
+        scanned.flatMap((b) => (b.tracks || []).map((t) => t.name)).filter(Boolean)
+      );
+      const extraAudio = filesArr.filter(
+        (f) =>
+          f &&
+          typeof f.name === 'string' &&
+          !scannedNames.has(f.name) &&
+          (/\.(wav|aac|opus|m4b|mp3|m4a|ogg|flac)$/i.test(f.name) ||
+            (typeof f.type === 'string' && f.type.startsWith('audio/')))
+      );
+
+      const extraBooks = extraAudio.map((file) => {
+        const meta = parseFilenameMetadata(file.name);
+        const title = meta.title || file.name.replace(/\.[^/.]+$/, '');
+        const author = meta.author || '';
+        const bookKey = normalizeBookKey(title, author);
+        const localUrl =
+          typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function'
+            ? URL.createObjectURL(file)
+            : '';
+        return {
+          id: bookKey,
+          bookKey,
+          title,
+          author,
+          narrator: '',
+          series: '',
+          description: '',
+          totalDurationSec: 0,
+          sources: ['local'],
+          preferredPlaybackSource: 'local',
+          localUrl,
+          localFile: file,
+          tracks: [{ name: file.name, localUrl, size: file.size || 0 }],
+          chapters: [{ index: 0, title: 'Chapter 1', startSec: 0, localUrl }],
+          bookmarks: [],
+          positionSec: 0,
+          progressSec: 0,
+          chapterIndex: 0,
+          isOffline: true,
+          offline: true
+        };
+      });
+
+      const imported = deduplicateLibraryItems([...scanned, ...extraBooks]);
+      this.state.syncProgress.active = false;
+      this._syncAbortController = null;
+
+      if (imported.length === 0) {
+        this.showError(
+          'No Audiobooks Found',
+          'No supported audio files (.m4b, .mp3, .m4a, .ogg, .flac, .wav) were found in the selected folder.'
+        );
+        return;
+      }
+
+      this.books = deduplicateLibraryItems([...this.books, ...imported]);
+      this._persistBooks();
+      if (this.syncService.isAuthenticated()) {
+        void this.syncService.syncLibraryItems(imported).catch(() => null);
+      }
+      await this.selectBook(imported[0].bookKey, false);
+      this.render();
+    } catch (err) {
+      this.state.syncProgress.active = false;
+      this._syncAbortController = null;
+      if (err?.name !== 'AbortError') {
+        this.showError('Local Scan Failed', err?.message || 'Unable to scan local audiobooks.');
+      } else {
+        this.render();
+      }
+    }
   }
 
   _bindGlobalInputs() {
@@ -933,11 +1061,12 @@ class AudiobookApp {
     const cleanToken = (tokenInput || this.syncService.getGoogleAccessToken() || '').trim();
     const cleanFolderId = (folderIdInput || '').trim();
     if (!cleanToken) {
+      const msg = 'Your Google Drive session is not connected. Click Continue with Google to authorize Drive.';
       this.state.driveModal = {
         ...this.state.driveModal,
-        error: 'Enter a Google OAuth token or sign in with Google.'
+        error: msg
       };
-      this.render();
+      this.showError('Google Sign-In Required', msg, { showRelogin: true });
       return;
     }
 
@@ -950,6 +1079,8 @@ class AudiobookApp {
         // ignore storage errors
       }
     }
+
+    this._syncAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
     this.state.driveModal = {
       ...this.state.driveModal,
       token: cleanToken,
@@ -957,10 +1088,27 @@ class AudiobookApp {
       loading: true,
       error: ''
     };
+    this.state.syncProgress = {
+      active: true,
+      phase: 'drive',
+      percent: 5,
+      currentFolder: 'Connecting to Google Drive...',
+      scannedFolders: 0,
+      discoveredFolders: 1,
+      booksFound: 0
+    };
     this.render();
 
     try {
-      const driveBooks = await scanGoogleDriveFolder(cleanToken, cleanFolderId);
+      const driveBooks = await scanGoogleDriveFolder(cleanToken, cleanFolderId, undefined, {
+        signal: this._syncAbortController?.signal,
+        timeoutMs: 15000,
+        concurrency: 4,
+        onProgress: (p) => this._updateSyncProgress(p)
+      });
+      this.state.syncProgress.active = false;
+      this._syncAbortController = null;
+
       if (driveBooks.length > 0) {
         this.books = deduplicateLibraryItems([...this.books, ...driveBooks]);
         this._persistBooks();
@@ -974,11 +1122,21 @@ class AudiobookApp {
         this.state.driveModal.loading = false;
       } else {
         this.state.driveModal.loading = false;
-        this.state.driveModal.error = 'No audio files found in Google Drive.';
+        const emptyMsg = 'No audio files (.m4b, .mp3, .m4a, .ogg, .flac) were found in that Google Drive folder or its subfolders.';
+        this.state.driveModal.error = emptyMsg;
+        this.showError('No Audiobooks Found', emptyMsg);
       }
     } catch (err) {
+      this.state.syncProgress.active = false;
       this.state.driveModal.loading = false;
-      this.state.driveModal.error = err?.message || 'Google Drive sync failed.';
+      this._syncAbortController = null;
+      if (err?.name === 'AbortError') {
+        this.state.driveModal.error = 'Sync cancelled.';
+      } else {
+        const errMsg = err?.message || 'Google Drive sync failed.';
+        this.state.driveModal.error = errMsg;
+        this.showError('Google Drive Sync Error', errMsg, { showRelogin: err?.status === 401 });
+      }
     }
     this.render();
   }
@@ -1056,6 +1214,7 @@ class AudiobookApp {
 
   async handleGoogleOAuth() {
     this.state.profileOpen = false;
+    this.state.errorModal.open = false;
     this.state.authError = '';
     this.state.authNotice = '';
     this.state.authLoading = true;
@@ -1097,15 +1256,19 @@ class AudiobookApp {
         this.state.driveModal.error = fallbackMsg;
       } else {
         this.state.authError = fallbackMsg;
+        this.showError('Google Sign-In Error', fallbackMsg);
+        return;
       }
       this.render();
     } catch (err) {
       this.state.authLoading = false;
-      const msg = err?.message || 'Google OAuth could not start. Sign in with Gmail & password above.';
+      const msg = err?.message || 'Google sign-in could not start. Please try again.';
       if (this.state.driveModal.open) {
         this.state.driveModal.error = msg;
       } else {
         this.state.authError = msg;
+        this.showError('Google Sign-In Error', msg);
+        return;
       }
       this.render();
     }
@@ -1152,8 +1315,10 @@ class AudiobookApp {
           await this.updaterService.applyOtaUpdate();
         }
       }
-    } catch {
+    } catch (err) {
       this.state.updateState.checking = false;
+      this.showError('Update Check Failed', err?.message || 'Unable to check for updates.');
+      return;
     }
     this.render();
   }
@@ -1434,6 +1599,70 @@ class AudiobookApp {
     `;
   }
 
+  _renderSyncProgressBarHtml() {
+    const { active, percent, currentFolder, scannedFolders, discoveredFolders, booksFound } =
+      this.state.syncProgress;
+    if (!active) return '';
+    const summary =
+      discoveredFolders > 0
+        ? `${scannedFolders}/${discoveredFolders}${currentFolder ? ` • ${currentFolder}` : ''}${booksFound > 0 ? ` • ${booksFound} books` : ''}`
+        : currentFolder || 'Scanning...';
+
+    return `
+      <div class="rounded-2xl bg-white/5 border border-[var(--border-subtle)] p-3 space-y-2">
+        <div class="flex items-center justify-between gap-2 text-[11px]">
+          <span data-sync-progress-label class="text-[var(--text-secondary)] truncate min-w-0">${escapeHtml(summary)}</span>
+          <span data-sync-progress-pct class="font-mono font-semibold text-[#1ed760] shrink-0">${percent}%</span>
+        </div>
+        <div class="w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
+          <div data-sync-progress-bar class="h-full bg-[#1ed760] transition-all duration-200 rounded-full" style="width:${percent}%"></div>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSyncProgressOverlay() {
+    if (!this.state.syncProgress.active || this.state.driveModal.open) return '';
+    return `
+      <div class="fixed bottom-24 right-4 z-[60] w-80 max-w-[calc(100vw-2rem)] surface-panel rounded-2xl p-3.5 border border-[var(--border-subtle)] shadow-2xl space-y-2.5">
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-bold text-white truncate">Scanning Library</span>
+          <button type="button" data-action="cancel-sync" class="btn-press px-2.5 py-0.5 rounded-full surface-card text-[11px] font-medium text-[var(--text-secondary)] hover:text-white">Cancel</button>
+        </div>
+        ${this._renderSyncProgressBarHtml()}
+      </div>
+    `;
+  }
+
+  _renderErrorModal() {
+    const { open, title, message, showRelogin } = this.state.errorModal;
+    if (!open) return '';
+
+    return `
+      <div class="fixed inset-0 z-[70] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="sheet-modal w-full max-w-sm rounded-3xl overflow-hidden border border-red-500/30">
+          <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
+            <h2 class="text-sm font-bold text-red-300 truncate">${escapeHtml(title || 'Error')}</h2>
+            <button type="button" data-action="close-error-modal" aria-label="Close" class="btn-press p-1 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white">
+              ${ICON_CLOSE(16)}
+            </button>
+          </div>
+          <div class="p-5 space-y-4">
+            <p class="text-xs text-[var(--text-primary)] leading-relaxed break-words">${escapeHtml(message)}</p>
+            <div class="flex items-center justify-end gap-2">
+              ${
+                showRelogin
+                  ? `<button type="button" data-action="login-google" class="btn-press px-4 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold">Continue with Google</button>`
+                  : ''
+              }
+              <button type="button" data-action="close-error-modal" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">Dismiss</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   _renderDriveSyncModal() {
     const { open, folderId, token, loading, error } = this.state.driveModal;
     if (!open) return '';
@@ -1444,7 +1673,7 @@ class AudiobookApp {
         <div class="sheet-modal w-full max-w-md rounded-3xl overflow-hidden">
           <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
             <h2 class="text-base font-bold text-white truncate">Sync Google Drive</h2>
-            <button data-action="close-drive-modal" aria-label="Close" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white">
+            <button type="button" data-action="close-drive-modal" aria-label="Close" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white">
               ${ICON_CLOSE(18)}
             </button>
           </div>
@@ -1463,6 +1692,8 @@ class AudiobookApp {
               <input id="driveFolderIdInput" type="text" value="${escapeHtml(folderId)}" placeholder="Paste Drive folder URL or ID (blank scans all Drive)" class="w-full px-3.5 py-2.5 rounded-xl bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
             </div>
 
+            ${loading ? this._renderSyncProgressBarHtml() : ''}
+
             ${
               error
                 ? `<div class="rounded-xl bg-red-500/10 border border-red-500/30 px-3 py-2 text-xs text-red-300">${escapeHtml(error)}</div>`
@@ -1471,14 +1702,16 @@ class AudiobookApp {
 
             <div class="flex items-center justify-end gap-2 pt-1">
               ${
-                !hasToken
-                  ? `<button type="button" data-action="login-google" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-semibold text-white mr-auto">Sign In with Google</button>`
+                !hasToken && !loading
+                  ? `<button type="button" data-action="login-google" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-semibold text-white mr-auto">Continue with Google</button>`
                   : ''
               }
-              <button type="button" data-action="close-drive-modal" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Cancel</button>
-              <button type="submit" ${loading ? 'disabled' : ''} class="btn-press px-5 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold disabled:opacity-50">
-                ${loading ? 'Syncing...' : 'Sync Drive'}
-              </button>
+              ${
+                loading
+                  ? `<button type="button" data-action="cancel-sync" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-red-300 hover:text-white">Cancel Sync</button>`
+                  : `<button type="button" data-action="close-drive-modal" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Cancel</button>
+                     <button type="submit" class="btn-press px-5 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold">Sync Drive</button>`
+              }
             </div>
           </form>
         </div>
@@ -2462,6 +2695,7 @@ class AudiobookApp {
       this.rootEl.innerHTML = `
         <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
           ${this._renderLoginView()}
+          ${this._renderErrorModal()}
         </div>
       `;
       this._bindViewEvents();
@@ -2490,6 +2724,8 @@ class AudiobookApp {
         ${this._renderProfilePopover()}
         ${this._renderCoverSearchModal()}
         ${this._renderDriveSyncModal()}
+        ${this._renderSyncProgressOverlay()}
+        ${this._renderErrorModal()}
       </div>
     `;
 
@@ -2719,6 +2955,26 @@ class AudiobookApp {
           }
           case 'trigger-local-folder': {
             this.state.profileOpen = false;
+            if (!this._isAndroidOrMobileViewport() && typeof window.showDirectoryPicker === 'function') {
+              void (async () => {
+                try {
+                  const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+                  const pickedFiles = await collectFilesFromDirectoryHandle(dirHandle);
+                  await this._importLocalFiles(pickedFiles);
+                } catch (err) {
+                  if (err?.name === 'AbortError') return;
+                  const fallbackEl =
+                    document.getElementById('localFolderInput') ||
+                    document.getElementById('localAudioFilesInput');
+                  if (fallbackEl) {
+                    fallbackEl.click();
+                  } else {
+                    this.showError('Folder Picker Error', err?.message || 'Unable to open folder picker.');
+                  }
+                }
+              })();
+              break;
+            }
             const targetId = this._isAndroidOrMobileViewport()
               ? 'localAudioFilesInput'
               : 'localFolderInput';
@@ -2733,6 +2989,15 @@ class AudiobookApp {
             this.state.profileOpen = false;
             const filesInput = document.getElementById('localAudioFilesInput');
             if (filesInput) filesInput.click();
+            break;
+          }
+          case 'cancel-sync': {
+            this.cancelActiveSync();
+            break;
+          }
+          case 'close-error-modal': {
+            this.state.errorModal.open = false;
+            this.render();
             break;
           }
           case 'login-google': {

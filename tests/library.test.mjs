@@ -490,3 +490,116 @@ test('scanGoogleDriveFolder recursively scans subfolders and groups multi-track 
   assert.ok(blade);
   assert.equal(blade.series, 'First Law World');
 });
+
+test('scanLocalFiles scans nested subfolders, isolates identical Disc folders, attaches sibling covers, and emits progress', async () => {
+  const prevCreateObjectURL = globalThis.URL?.createObjectURL;
+  let objCounter = 0;
+  if (globalThis.URL) {
+    globalThis.URL.createObjectURL = (blob) => `blob:test-${++objCounter}-${blob?.name || 'item'}`;
+  }
+
+  const makeMockFile = (name, webkitRelativePath, type = 'audio/mpeg') => {
+    const blob = new Blob([new Uint8Array(128)], { type });
+    Object.defineProperties(blob, {
+      name: { value: name, configurable: true },
+      webkitRelativePath: { value: webkitRelativePath, configurable: true },
+    });
+    return blob;
+  };
+
+  const progressUpdates = [];
+  try {
+    const books = await scanLocalFiles(
+      [
+        makeMockFile('01 Intro.mp3', 'audiobooks/Red Rising/01 Intro.mp3'),
+        makeMockFile('02 Chapter Two.mp3', 'audiobooks/Red Rising/02 Chapter Two.mp3'),
+        makeMockFile('cover.jpg', 'audiobooks/Red Rising/cover.jpg', 'image/jpeg'),
+        makeMockFile('The Blade Itself.m4b', 'audiobooks/First Law World/The Blade Itself.m4b', 'audio/mp4'),
+        makeMockFile('Before They Are Hanged.m4b', 'audiobooks/First Law World/Before They Are Hanged.m4b', 'audio/mp4'),
+        makeMockFile('01 Opening.mp3', 'audiobooks/Book Alpha/Disc 1/01 Opening.mp3'),
+        makeMockFile('01 Opening.mp3', 'audiobooks/Book Beta/Disc 1/01 Opening.mp3'),
+      ],
+      {
+        onProgress: (info) => progressUpdates.push(info),
+      },
+    );
+
+    assert.equal(books.length, 5);
+    assert.ok(progressUpdates.length >= 2);
+    assert.equal(progressUpdates[progressUpdates.length - 1].percent, 100);
+
+    const redRising = books.find((b) => b.title === 'Red Rising');
+    assert.ok(redRising);
+    assert.equal(redRising.chapters.length, 2);
+    assert.ok(redRising.coverUrl && redRising.coverUrl.startsWith('blob:test-'));
+
+    const blade = books.find((b) => b.title.includes('The Blade Itself'));
+    assert.ok(blade);
+    assert.equal(blade.series, 'First Law World');
+
+    const discBooks = books.filter((b) => /Disc 1/i.test(b.title));
+    assert.equal(discBooks.length, 2);
+    assert.notEqual(discBooks[0].bookKey, discBooks[1].bookKey);
+  } finally {
+    if (globalThis.URL) {
+      globalThis.URL.createObjectURL = prevCreateObjectURL;
+    }
+  }
+});
+
+test('scanGoogleDriveFolder emits progress, supports AbortSignal cancellation, and formats 401/403 API errors', async () => {
+  const driveTree = {
+    rootFolder: [
+      { id: 'f-book1', name: 'Project Hail Mary', mimeType: 'application/vnd.google-apps.folder' },
+    ],
+    'f-book1': [
+      { id: 'track-1', name: 'Hail Mary.m4b', mimeType: 'audio/mp4', size: '12345' },
+    ],
+  };
+
+  const progressEvents = [];
+  const okFetch = async (url) => {
+    const u = new URL(url);
+    const q = u.searchParams.get('q') || '';
+    const match = q.match(/'([^']+)'\s+in\s+parents/);
+    const parentId = match ? match[1] : '';
+    return {
+      ok: true,
+      json: async () => ({ files: driveTree[parentId] || [] }),
+    };
+  };
+
+  const books = await scanGoogleDriveFolder('token', 'rootFolder', okFetch, {
+    onProgress: (p) => progressEvents.push(p),
+  });
+  assert.equal(books.length, 1);
+  assert.ok(progressEvents.length >= 2);
+  assert.equal(progressEvents[progressEvents.length - 1].percent, 100);
+
+  const ac = new AbortController();
+  ac.abort();
+  await assert.rejects(
+    () => scanGoogleDriveFolder('token', 'rootFolder', okFetch, { signal: ac.signal }),
+    /cancelled|abort/i,
+  );
+
+  const errFetch401 = async () => ({
+    ok: false,
+    status: 401,
+    json: async () => ({ error: { message: 'Invalid Credentials' } }),
+  });
+  await assert.rejects(
+    () => scanGoogleDriveFolder('token', 'rootFolder', errFetch401),
+    (err) => err?.status === 401 && /expired/i.test(err.message),
+  );
+
+  const errFetch403 = async () => ({
+    ok: false,
+    status: 403,
+    json: async () => ({ error: { message: 'Insufficient Permission' } }),
+  });
+  await assert.rejects(
+    () => scanGoogleDriveFolder('token', 'rootFolder', errFetch403),
+    (err) => err?.status === 403 && /access denied|403/i.test(err.message),
+  );
+});
