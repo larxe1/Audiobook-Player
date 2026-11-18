@@ -12,12 +12,18 @@ const ROMAN_MAP = new Map([
   ['XVI', 16], ['XVII', 17], ['XVIII', 18], ['XIX', 19], ['XX', 20],
 ]);
 
+const GENERIC_SERIES_FOLDER_RE =
+  /^(?:audio|audiobooks?|books?|media|downloads?|mp3s?|m4bs?|music|root folder|google drive|local files)$/i;
+const TRAILING_COPY_NUM_RE = /\s*\(\d{1,2}\)\s*$/;
+const LEADING_NUM_PREFIX_RE = /^\d{1,3}\s*[-–—.]\s+/;
+const NOVELLA_PREFIX_RE = /^(?:an?|the)\s+(.+?)\s+novella\s*[-–—:]\s*(.+)$/i;
+
 const KNOWN_FRANCHISES = [
   {
     series: 'The Expanse',
     author: 'James S. A. Corey',
     requireHintForAmbiguous: true,
-    hintRe: /\b(expanse|corey|leviathan|caliban|abaddon|cibola|nemesis|babylon|persepolis|tiamat)\b/i,
+    hintRe: /\b(expanse|corey|leviathan|caliban|abaddon|cibola|nemesis|babylon|persepolis|tiamat|memory'?s legion|novella collection)\b/i,
     books: [
       { order: 0.1, title: 'drive', ambiguous: true },
       { order: 0.2, title: 'the churn', ambiguous: true },
@@ -40,6 +46,8 @@ const KNOWN_FRANCHISES = [
       { order: 8.5, title: 'auberon', ambiguous: false },
       { order: 9, title: 'leviathan falls', ambiguous: false },
       { order: 9.5, title: 'the sins of our fathers', ambiguous: false },
+      { order: 10, title: 'complete novella collection', ambiguous: false },
+      { order: 10, title: "memory's legion", ambiguous: false },
     ],
   },
   {
@@ -71,6 +79,28 @@ const KNOWN_FRANCHISES = [
       { order: 7, title: 'harry potter and the deathly hallows', ambiguous: false },
     ],
   },
+  {
+    series: 'The First Law',
+    author: 'Joe Abercrombie',
+    requireHintForAmbiguous: false,
+    hintRe: /\b(first law|blade itself|before they are hanged|last argument of kings|abercrombie)\b/i,
+    books: [
+      { order: 1, title: 'the blade itself', ambiguous: false },
+      { order: 2, title: 'before they are hanged', ambiguous: false },
+      { order: 3, title: 'last argument of kings', ambiguous: false },
+    ],
+  },
+  {
+    series: 'The Age of Madness',
+    author: 'Joe Abercrombie',
+    requireHintForAmbiguous: false,
+    hintRe: /\b(age of madness|little hatred|trouble with peace|wisdom of crowds|abercrombie)\b/i,
+    books: [
+      { order: 1, title: 'a little hatred', ambiguous: false },
+      { order: 2, title: 'the trouble with peace', ambiguous: false },
+      { order: 3, title: 'the wisdom of crowds', ambiguous: false },
+    ],
+  },
 ];
 
 function parseOrderToken(token = '') {
@@ -87,13 +117,75 @@ function stripTrailingYear(text = '') {
 
 function normalizeMatchText(text = '') {
   return stripTrailingYear(String(text || '').replace(AUDIO_EXT_RE, ''))
+    .replace(/[\u2018\u2019\u02BC]/g, "'")
     .toLowerCase()
     .replace(/[:\-–—_]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-function matchSeriesNumberPattern(raw = '') {
+function containsWholePhrase(haystack = '', needle = '') {
+  if (!haystack || !needle) return false;
+  if (haystack === needle) return true;
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|\\s)${escaped}(?:$|\\s)`).test(haystack);
+}
+
+function isKnownFranchiseSeries(candidate = '') {
+  const norm = normalizeMatchText(candidate);
+  if (!norm) return false;
+  return KNOWN_FRANCHISES.some((f) => normalizeMatchText(f.series) === norm);
+}
+
+/**
+ * Returns true if a folder name is a generic container (e.g. "Audio", "Books")
+ * that should not be used as a series name.
+ * @param {string} [name='']
+ * @returns {boolean}
+ */
+export function isGenericSeriesFolderName(name = '') {
+  const trimmed = String(name || '').trim();
+  return !trimmed || GENERIC_SERIES_FOLDER_RE.test(trimmed);
+}
+
+/**
+ * Clean a raw series or folder name by removing copy numbers `(1)`, leading
+ * numeric prefixes `01 - `, generic container names, author prefixes, and
+ * edition/narrator suffixes, while canonicalizing known franchises.
+ * @param {string} [rawSeries='']
+ * @param {string} [author='']
+ * @returns {string}
+ */
+export function cleanSeriesName(rawSeries = '', author = '') {
+  let cleaned = String(rawSeries || '').trim();
+  if (!cleaned) return '';
+
+  cleaned = cleaned.replace(TRAILING_COPY_NUM_RE, '').trim();
+  cleaned = cleaned.replace(LEADING_NUM_PREFIX_RE, '').trim();
+  if (!cleaned || GENERIC_SERIES_FOLDER_RE.test(cleaned)) return '';
+
+  const rawAuthor = String(author || '').trim();
+  if (rawAuthor && rawAuthor !== 'Unknown Author') {
+    const escapedAuthor = rawAuthor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    cleaned = cleaned.replace(new RegExp(`^${escapedAuthor}\\s*[-–—:]\\s*`, 'i'), '').trim();
+  }
+
+  const normCleaned = normalizeMatchText(cleaned);
+  for (const franchise of KNOWN_FRANCHISES) {
+    if (containsWholePhrase(normCleaned, normalizeMatchText(franchise.series))) {
+      return franchise.series;
+    }
+  }
+
+  cleaned = cleaned
+    .replace(/\s+(?:complete(?:\s+\d+(?:\.\d+)?)?|unabridged|box\s*set|omnibus)(?:\s*[-–—]\s*.*)?$/i, '')
+    .trim();
+
+  if (!cleaned || GENERIC_SERIES_FOLDER_RE.test(cleaned)) return '';
+  return cleaned;
+}
+
+function matchSeriesNumberPattern(raw = '', options = {}) {
   const value = stripTrailingYear(String(raw || '').trim());
   if (!value) return null;
 
@@ -134,6 +226,23 @@ function matchSeriesNumberPattern(raw = '') {
     }
   }
 
+  // Pattern 2b: "<Series> <Roman>" (e.g., "The Expanse X") when followed by remainder or matching a known series
+  const trailingRomanMatch = value.match(/^(.+?)\s+([IVXLCDM]{1,5})$/);
+  if (trailingRomanMatch) {
+    const candidateSeries = trailingRomanMatch[1].replace(/[-–—:,\s]+$/, '').trim();
+    const romanToken = trailingRomanMatch[2];
+    const order = ROMAN_MAP.get(romanToken) ?? null;
+    if (
+      order !== null &&
+      candidateSeries.length >= 2 &&
+      /[a-zA-Z]/.test(candidateSeries) &&
+      !GENERIC_SECTION_ONLY_RE.test(candidateSeries) &&
+      (options.allowRoman || isKnownFranchiseSeries(candidateSeries))
+    ) {
+      return { series: candidateSeries, seriesOrder: order, remainder: '' };
+    }
+  }
+
   return null;
 }
 
@@ -141,11 +250,15 @@ function lookupKnownFranchise(title = '', author = '', series = '', parentFolder
   const normTitle = normalizeMatchText(title);
   const hintPool = [title, author, series, parentFolderName].filter(Boolean).join(' ');
   const normSeries = normalizeMatchText(series);
+  const normParent = normalizeMatchText(parentFolderName);
 
   for (const franchise of KNOWN_FRANCHISES) {
     const hasHint = franchise.hintRe.test(hintPool);
     for (const entry of franchise.books) {
-      if (normTitle === entry.title || (normTitle.startsWith(`${entry.title} `) && !entry.ambiguous)) {
+      const exactOrPrefix =
+        normTitle === entry.title || (normTitle.startsWith(`${entry.title} `) && !entry.ambiguous);
+      const containedUnambiguous = !entry.ambiguous && containsWholePhrase(normTitle, entry.title);
+      if (exactOrPrefix || containedUnambiguous) {
         if (entry.ambiguous && !hasHint) continue;
         return {
           series: franchise.series,
@@ -154,7 +267,11 @@ function lookupKnownFranchise(title = '', author = '', series = '', parentFolder
         };
       }
     }
-    if (normSeries && normSeries === normalizeMatchText(franchise.series)) {
+    const normFranchise = normalizeMatchText(franchise.series);
+    if (
+      (normSeries && containsWholePhrase(normSeries, normFranchise)) ||
+      (normParent && containsWholePhrase(normParent, normFranchise))
+    ) {
       return {
         series: franchise.series,
         seriesOrder: null,
@@ -172,7 +289,7 @@ function lookupKnownFranchise(title = '', author = '', series = '', parentFolder
  * @param {string} [author='']
  * @param {string} [series='']
  * @param {string} [parentFolderName='']
- * @returns {{ series: string, seriesOrder: number|null, cleanTitle: string, inferredAuthor: string, authorPolluted: boolean }}
+ * @returns {{ series: string, seriesOrder: number|null, cleanTitle: string, inferredAuthor: string, authorPolluted: boolean, titleCleaned: boolean }}
  */
 export function parseSeriesAndOrder(title = '', author = '', series = '', parentFolderName = '') {
   const rawTitle = String(title || '').trim();
@@ -184,6 +301,7 @@ export function parseSeriesAndOrder(title = '', author = '', series = '', parent
   let detectedOrder = null;
   let cleanTitle = rawTitle;
   let authorPolluted = false;
+  let titleCleaned = false;
 
   // 1. Check parenthesized series markers inside title, e.g. "Leviathan Wakes (The Expanse, Book 1)"
   const parenSeriesMatch = rawTitle.match(/^(.+?)\s*\(([^()]+?)\s*(?:,\s*|\s+)(?:book|vol\.?|volume|part|#)\s*(\d+(?:\.\d+)?|[IVXLCDM]{1,5})\)\s*$/i);
@@ -196,7 +314,14 @@ export function parseSeriesAndOrder(title = '', author = '', series = '', parent
     }
   }
 
-  // 2. Check polluted author field (e.g. author = "The Expanse 0.1")
+  // Strip trailing copy suffixes like "(1)" (1-2 digits, NOT 4-digit years) from cleanTitle
+  const strippedCopyTitle = cleanTitle.replace(TRAILING_COPY_NUM_RE, '').trim();
+  if (strippedCopyTitle && strippedCopyTitle !== cleanTitle) {
+    cleanTitle = strippedCopyTitle;
+    titleCleaned = true;
+  }
+
+  // 2. Check polluted author field (e.g. author = "The Expanse 0.1" or "The Expanse X")
   if (rawAuthor) {
     const authorMatch = matchSeriesNumberPattern(rawAuthor);
     if (authorMatch) {
@@ -206,22 +331,23 @@ export function parseSeriesAndOrder(title = '', author = '', series = '', parent
     }
   }
 
-  // 3. Check explicit series field (e.g. series = "The Expanse 0.1" or "The Expanse")
-  if (rawSeries) {
-    const seriesMatch = matchSeriesNumberPattern(rawSeries);
+  // 3. Check explicit series field (clean copy numbers/prefixes/generic names first)
+  const cleanedRawSeries = cleanSeriesName(rawSeries, rawAuthor);
+  if (cleanedRawSeries) {
+    const seriesMatch = matchSeriesNumberPattern(cleanedRawSeries);
     if (seriesMatch) {
       detectedSeries = seriesMatch.series;
       if (detectedOrder === null) detectedOrder = seriesMatch.seriesOrder;
     } else if (!detectedSeries) {
-      detectedSeries = rawSeries;
+      detectedSeries = cleanedRawSeries;
     }
   }
 
   // 4. Check title for "<Series> <num> - <Title>" or "<Series> Act II"
-  if (rawTitle) {
-    const dashParts = rawTitle.split(/\s+[-–—]\s+/).map((p) => p.trim()).filter(Boolean);
+  if (cleanTitle) {
+    const dashParts = cleanTitle.split(/\s+[-–—]\s+/).map((p) => p.trim()).filter(Boolean);
     if (dashParts.length >= 2) {
-      const leftMatch = matchSeriesNumberPattern(dashParts[0]);
+      const leftMatch = matchSeriesNumberPattern(dashParts[0], { allowRoman: true });
       if (leftMatch) {
         detectedSeries = leftMatch.series;
         detectedOrder = leftMatch.seriesOrder;
@@ -229,7 +355,7 @@ export function parseSeriesAndOrder(title = '', author = '', series = '', parent
       }
     }
     if (detectedOrder === null) {
-      const titleMatch = matchSeriesNumberPattern(rawTitle);
+      const titleMatch = matchSeriesNumberPattern(cleanTitle);
       if (titleMatch) {
         detectedSeries = detectedSeries || titleMatch.series;
         detectedOrder = titleMatch.seriesOrder;
@@ -241,21 +367,47 @@ export function parseSeriesAndOrder(title = '', author = '', series = '', parent
   }
 
   // 5. Check parentFolderName if series/order still missing
-  if (rawParent && (!detectedSeries || detectedOrder === null)) {
-    const parentMatch = matchSeriesNumberPattern(rawParent);
+  const cleanedParent = cleanSeriesName(rawParent, rawAuthor);
+  if (cleanedParent && (!detectedSeries || detectedOrder === null)) {
+    const parentMatch = matchSeriesNumberPattern(cleanedParent);
     if (parentMatch) {
       detectedSeries = detectedSeries || parentMatch.series;
       if (detectedOrder === null) detectedOrder = parentMatch.seriesOrder;
     } else if (!detectedSeries) {
-      detectedSeries = rawParent;
+      detectedSeries = cleanedParent;
     }
   }
 
-  // 6. Known franchise lookup (e.g. The Sandman, The Expanse, Harry Potter)
-  const known = lookupKnownFranchise(cleanTitle, rawAuthor, detectedSeries || rawSeries, rawParent);
+  // Strip redundant "An Expanse Novella - " style prefix when series/franchise applies
+  const novellaMatch = cleanTitle.match(NOVELLA_PREFIX_RE);
+  if (novellaMatch) {
+    const novellaSubject = novellaMatch[1].trim();
+    const novellaRest = novellaMatch[2].trim();
+    const candidateFranchise = lookupKnownFranchise(
+      novellaRest,
+      rawAuthor,
+      detectedSeries || cleanedRawSeries || novellaSubject,
+      cleanedParent,
+    );
+    if (detectedSeries || candidateFranchise) {
+      cleanTitle = novellaRest;
+      titleCleaned = true;
+    }
+  }
+
+  // 6. Known franchise lookup (e.g. The Sandman, The Expanse, Harry Potter, First Law)
+  const known = lookupKnownFranchise(cleanTitle, rawAuthor, detectedSeries || cleanedRawSeries, cleanedParent);
   let inferredAuthor = '';
   if (known) {
-    detectedSeries = known.series;
+    const preserveFirstLawWorld =
+      known.series === 'The First Law' &&
+      (normalizeMatchText(detectedSeries) === 'first law world' ||
+        normalizeMatchText(cleanedParent) === 'first law world');
+    if (preserveFirstLawWorld) {
+      detectedSeries = 'First Law World';
+    } else {
+      detectedSeries = known.series;
+    }
     if (detectedOrder === null && known.seriesOrder !== null) {
       detectedOrder = known.seriesOrder;
     }
@@ -268,6 +420,7 @@ export function parseSeriesAndOrder(title = '', author = '', series = '', parent
     cleanTitle: cleanTitle || rawTitle,
     inferredAuthor,
     authorPolluted,
+    titleCleaned,
   };
 }
 
@@ -590,7 +743,7 @@ export function normalizeBookSeriesAndChapters(book) {
     author = parsed.inferredAuthor;
   }
 
-  const series = parsed.series || String(book.series || '').trim();
+  const series = parsed.series || cleanSeriesName(book.series || '', author);
   const seriesOrder =
     parsed.seriesOrder !== null
       ? parsed.seriesOrder
@@ -598,12 +751,18 @@ export function normalizeBookSeriesAndChapters(book) {
         ? Number(book.seriesOrder)
         : null;
 
+  const title =
+    parsed.titleCleaned && parsed.cleanTitle
+      ? parsed.cleanTitle
+      : (book.title || '');
+
   const chapters = Array.isArray(book.chapters)
-    ? normalizeBookChapters(book.chapters, book.title || parsed.cleanTitle || '')
+    ? normalizeBookChapters(book.chapters, title || parsed.cleanTitle || '')
     : [];
 
   return {
     ...book,
+    title,
     author,
     series,
     seriesOrder,
@@ -733,6 +892,18 @@ function readLatin1(bytes, offset, length) {
   return readAscii(bytes, offset, length);
 }
 
+function cleanParsedFilenameTitle(rawTitle = '', hasSeriesContext = false) {
+  let cleaned = String(rawTitle || '').trim().replace(TRAILING_COPY_NUM_RE, '').trim();
+  const novellaMatch = cleaned.match(NOVELLA_PREFIX_RE);
+  if (novellaMatch) {
+    const rest = novellaMatch[2].trim();
+    if (hasSeriesContext || lookupKnownFranchise(rest, '', novellaMatch[1].trim(), '')) {
+      cleaned = rest;
+    }
+  }
+  return cleaned || String(rawTitle || '').trim();
+}
+
 /**
  * Parse filename into fallback title, author, and optional series + seriesOrder.
  * Examples:
@@ -758,13 +929,14 @@ export function parseFilenameMetadata(filename = '') {
   if (dashParts.length === 2) {
     const [left, right] = dashParts;
     if (TRACK_PREFIX_RE.test(left)) {
-      return { title: right, author: '', series: '', seriesOrder: null };
+      return { title: cleanParsedFilenameTitle(right, false), author: '', series: '', seriesOrder: null };
     }
-    const leftSeries = matchSeriesNumberPattern(left);
+    const leftSeries = matchSeriesNumberPattern(left, { allowRoman: true });
     if (leftSeries) {
-      const known = lookupKnownFranchise(right, '', leftSeries.series, '');
+      const cleanedRight = cleanParsedFilenameTitle(right, true);
+      const known = lookupKnownFranchise(cleanedRight, '', leftSeries.series, '');
       return {
-        title: right,
+        title: cleanedRight,
         author: known?.inferredAuthor || '',
         series: known?.series || leftSeries.series,
         seriesOrder: leftSeries.seriesOrder,
@@ -772,9 +944,10 @@ export function parseFilenameMetadata(filename = '') {
     }
     const rightSeries = matchSeriesNumberPattern(right);
     if (rightSeries) {
-      const known = lookupKnownFranchise(left, '', rightSeries.series, '');
+      const cleanedLeft = cleanParsedFilenameTitle(left, true);
+      const known = lookupKnownFranchise(cleanedLeft, '', rightSeries.series, '');
       return {
-        title: left,
+        title: cleanedLeft,
         author: known?.inferredAuthor || '',
         series: known?.series || rightSeries.series,
         seriesOrder: rightSeries.seriesOrder,
@@ -782,7 +955,7 @@ export function parseFilenameMetadata(filename = '') {
     }
     const parsed = parseSeriesAndOrder(right, left, '', '');
     return {
-      title: right,
+      title: parsed.titleCleaned ? parsed.cleanTitle : right,
       author: left,
       series: parsed.series || '',
       seriesOrder: parsed.seriesOrder,
@@ -794,9 +967,9 @@ export function parseFilenameMetadata(filename = '') {
     if (TRACK_PREFIX_RE.test(first)) {
       return { title: [second, ...rest].join(' - '), author: '', series: '', seriesOrder: null };
     }
-    const firstSeries = matchSeriesNumberPattern(first);
+    const firstSeries = matchSeriesNumberPattern(first, { allowRoman: true });
     if (firstSeries) {
-      const titleStr = [second, ...rest].join(' - ');
+      const titleStr = cleanParsedFilenameTitle([second, ...rest].join(' - '), true);
       const known = lookupKnownFranchise(titleStr, '', firstSeries.series, '');
       return {
         author: known?.inferredAuthor || '',
@@ -805,20 +978,22 @@ export function parseFilenameMetadata(filename = '') {
         title: titleStr,
       };
     }
-    const secondSeries = matchSeriesNumberPattern(second);
+    const secondSeries = matchSeriesNumberPattern(second, { allowRoman: true });
     if (secondSeries) {
       return {
         author: first,
         series: secondSeries.series,
         seriesOrder: secondSeries.seriesOrder,
-        title: rest.join(' - '),
+        title: cleanParsedFilenameTitle(rest.join(' - '), true),
       };
     }
+    const fallbackTitle = rest.join(' - ');
+    const parsed = parseSeriesAndOrder(fallbackTitle, first, second, '');
     return {
-      author: first,
-      series: second,
-      seriesOrder: null,
-      title: rest.join(' - '),
+      author: first || parsed.inferredAuthor || '',
+      series: parsed.series || cleanSeriesName(second, first),
+      seriesOrder: parsed.seriesOrder,
+      title: parsed.titleCleaned ? parsed.cleanTitle : fallbackTitle,
     };
   }
 
@@ -828,7 +1003,7 @@ export function parseFilenameMetadata(filename = '') {
     const a = byMatch[2].trim();
     const parsed = parseSeriesAndOrder(t, a, '', '');
     return {
-      title: t,
+      title: parsed.titleCleaned ? parsed.cleanTitle : t,
       author: a,
       series: parsed.series || '',
       seriesOrder: parsed.seriesOrder,
@@ -837,7 +1012,7 @@ export function parseFilenameMetadata(filename = '') {
 
   const parsed = parseSeriesAndOrder(cleaned, '', '', '');
   return {
-    title: cleaned,
+    title: parsed.titleCleaned ? parsed.cleanTitle : cleaned,
     author: parsed.inferredAuthor || '',
     series: parsed.series || '',
     seriesOrder: parsed.seriesOrder,
@@ -1234,14 +1409,15 @@ export function parseAudioTags(uint8ArrayOrBuffer, filename = '') {
     parsed = null;
   }
 
-  const title = parsed?.title || fallback.title || '';
+  const rawTitle = parsed?.title || fallback.title || '';
   const rawAuthor = parsed?.author || fallback.author || '';
   const rawSeries = parsed?.series || fallback.series || '';
-  const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, '');
+  const seriesParsed = parseSeriesAndOrder(rawTitle, rawAuthor, rawSeries, '');
+  const title = seriesParsed.titleCleaned && seriesParsed.cleanTitle ? seriesParsed.cleanTitle : rawTitle;
   const author = seriesParsed.authorPolluted
     ? (seriesParsed.inferredAuthor || '')
     : (rawAuthor || seriesParsed.inferredAuthor || '');
-  const series = seriesParsed.series || rawSeries || '';
+  const series = seriesParsed.series || cleanSeriesName(rawSeries, author) || '';
   const seriesOrder = seriesParsed.seriesOrder ?? fallback.seriesOrder ?? null;
   const narrator = parsed?.narrator || '';
   const description = parsed?.description || '';

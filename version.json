@@ -1,11 +1,11 @@
 {
-  "version": "1.0.8",
-  "build": 9,
+  "version": "1.0.9",
+  "build": 10,
   "channel": "stable",
-  "publishedAt": "2026-11-18T05:53:00Z",
+  "publishedAt": "2026-11-18T06:05:50Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Fix sync/wipe modal flicker, preserve desktop & mobile scroll positions across re-renders, and enforce English-first metadata enrichment"
+  "releaseNotes": "Unify split series folders (The Expanse, The First Law, The Age of Madness, The Sandman), normalize curly apostrophes and Roman numerals, and heal cached library keys on startup"
 }

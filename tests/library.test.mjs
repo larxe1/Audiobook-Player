@@ -12,6 +12,7 @@ import {
   parseAudioTags,
   parseFilenameMetadata,
   parseSeriesAndOrder,
+  cleanSeriesName,
   normalizeBookChapters,
   normalizeBookSeriesAndChapters,
   isDriveThumbnailOrMissingCover,
@@ -1193,4 +1194,148 @@ test('enrichBookMetadata never falls back to Spanish/Italian description when no
   assert.equal(enrichedNoDesc.description, '');
   assert.equal(enrichedNoDesc.asin, undefined);
   assert.equal(enrichedNoDesc.enrichmentVersion, 2);
+});
+
+test('cleanSeriesName, parseSeriesAndOrder, and normalizeBookSeriesAndChapters unify split Expanse, Abercrombie, Sandman, and Harry Potter cached entries', async () => {
+  // cleanSeriesName rules
+  assert.equal(cleanSeriesName('James S. A. Corey - The Expanse Complete 2.0 - Jefferson Mays (1)', 'James S. A. Corey'), 'The Expanse');
+  assert.equal(cleanSeriesName('James S. A. Corey - The Expanse Complete 2.0 - Jefferson Mays'), 'The Expanse');
+  assert.equal(cleanSeriesName('01 - The First Law (1)'), 'The First Law');
+  assert.equal(cleanSeriesName('02 - The Age of Madness (1)'), 'The Age of Madness');
+  assert.equal(cleanSeriesName('Neil Gaiman Dirk Maggs - The Sandman'), 'The Sandman');
+  assert.equal(cleanSeriesName('Audio'), '');
+  assert.equal(cleanSeriesName('Audiobooks'), '');
+
+  // Filename metadata with novella prefix, curly apostrophes, and Roman numeral X
+  const driveNovella = parseFilenameMetadata('The Expanse 0.1 - An Expanse Novella - Drive (2013).m4b');
+  assert.equal(driveNovella.title, 'Drive (2013)');
+  assert.equal(driveNovella.series, 'The Expanse');
+  assert.equal(driveNovella.seriesOrder, 0.1);
+  assert.equal(driveNovella.author, 'James S. A. Corey');
+
+  const expanseX = parseFilenameMetadata('The Expanse X - Complete Novella Collection (2022).m4b');
+  assert.equal(expanseX.title, 'Complete Novella Collection (2022)');
+  assert.equal(expanseX.series, 'The Expanse');
+  assert.equal(expanseX.seriesOrder, 10);
+  assert.equal(expanseX.author, 'James S. A. Corey');
+
+  // Cached broken entries heal in-place
+  const healedNovella = normalizeBookSeriesAndChapters({
+    title: 'An Expanse Novella - Drive (2013)',
+    author: 'James S. A. Corey',
+    series: 'James S. A. Corey - The Expanse Complete 2.0 - Jefferson Mays',
+  });
+  assert.equal(healedNovella.title, 'Drive (2013)');
+  assert.equal(healedNovella.series, 'The Expanse');
+  assert.equal(healedNovella.seriesOrder, 0.1);
+
+  const healedCaliban = normalizeBookSeriesAndChapters({
+    title: 'Caliban’s War (2013)',
+    author: 'James S. A. Corey',
+    series: 'James S. A. Corey - The Expanse Complete 2.0 - Jefferson Mays (1)',
+  });
+  assert.equal(healedCaliban.series, 'The Expanse');
+  assert.equal(healedCaliban.seriesOrder, 2);
+
+  const healedAbaddon = normalizeBookSeriesAndChapters({
+    title: 'Abaddon’s Gate (2013)',
+    author: 'James S. A. Corey',
+    series: 'James S. A. Corey - The Expanse Complete 2.0 - Jefferson Mays',
+  });
+  assert.equal(healedAbaddon.series, 'The Expanse');
+  assert.equal(healedAbaddon.seriesOrder, 3);
+
+  const healedExpanseX = normalizeBookSeriesAndChapters({
+    title: 'Complete Novella Collection (2022)',
+    author: 'The Expanse X',
+    series: 'James S. A. Corey - The Expanse Complete 2.0 - Jefferson Mays (1)',
+    seriesOrder: 2,
+  });
+  assert.equal(healedExpanseX.author, 'James S. A. Corey');
+  assert.equal(healedExpanseX.series, 'The Expanse');
+  assert.equal(healedExpanseX.seriesOrder, 10);
+
+  const healedWisdom = normalizeBookSeriesAndChapters({
+    title: 'The Wisdom of Crowds (1)',
+    author: 'Joe Abercrombie',
+    series: '02 - The Age of Madness (1)',
+  });
+  assert.equal(healedWisdom.title, 'The Wisdom of Crowds');
+  assert.equal(healedWisdom.series, 'The Age of Madness');
+  assert.equal(healedWisdom.seriesOrder, 3);
+
+  const healedFirstLaw = normalizeBookSeriesAndChapters({
+    title: 'The Blade Itself',
+    author: 'Joe Abercrombie',
+    series: '01 - The First Law (1)',
+  });
+  assert.equal(healedFirstLaw.series, 'The First Law');
+  assert.equal(healedFirstLaw.seriesOrder, 1);
+
+  const healedHp4 = normalizeBookSeriesAndChapters({
+    title: 'J.K. Rowling (2000) Harry Potter and the Goblet of Fire (Various Artists)',
+    author: 'Unknown Author',
+    series: 'Audio',
+  });
+  assert.equal(healedHp4.series, 'Harry Potter');
+  assert.equal(healedHp4.seriesOrder, 4);
+  assert.equal(healedHp4.author, 'J.K. Rowling');
+
+  const healedSandman = normalizeBookSeriesAndChapters({
+    title: 'The Sandman',
+    author: 'Neil Gaiman',
+    series: 'Neil Gaiman Dirk Maggs - The Sandman',
+  });
+  assert.equal(healedSandman.series, 'The Sandman');
+  assert.equal(healedSandman.seriesOrder, 1);
+
+  const standaloneInAudio = normalizeBookSeriesAndChapters({
+    title: 'Standalone Novel',
+    author: 'Some Author',
+    series: 'Audio',
+  });
+  assert.equal(standaloneInAudio.series, '');
+
+  // Drive scanner ignores generic folder names and unifies Expanse folder variants
+  const driveTree = {
+    root: [
+      { id: 'exp-dir', name: 'James S. A. Corey - The Expanse Complete 2.0 - Jefferson Mays (1)', mimeType: 'application/vnd.google-apps.folder' },
+      { id: 'audio-dir', name: 'Audio', mimeType: 'application/vnd.google-apps.folder' },
+    ],
+    'exp-dir': [
+      { id: 'e-01', name: 'The Expanse 0.1 - An Expanse Novella - Drive (2013).m4b', mimeType: 'audio/mp4', size: '1000' },
+      { id: 'e-02', name: 'The Expanse 02 - Caliban’s War (2013).m4b', mimeType: 'audio/mp4', size: '1000' },
+      { id: 'e-10', name: 'The Expanse X - Complete Novella Collection (2022).m4b', mimeType: 'audio/mp4', size: '1000' },
+    ],
+    'audio-dir': [
+      { id: 'hp-4', name: 'J.K. Rowling (2000) Harry Potter and the Goblet of Fire (Various Artists).m4b', mimeType: 'audio/mp4', size: '1000' },
+      { id: 'standalone', name: 'Jane Doe - Standalone Book.m4b', mimeType: 'audio/mp4', size: '1000' },
+    ],
+  };
+
+  const mockDriveFetch = async (url) => {
+    const u = new URL(url);
+    const q = u.searchParams.get('q') || '';
+    const match = q.match(/'([^']+)'\s+in\s+parents/);
+    const parentId = match ? match[1] : '';
+    return {
+      ok: true,
+      json: async () => ({ files: driveTree[parentId] || [] }),
+    };
+  };
+
+  const driveBooks = await scanGoogleDriveFolder('token', 'root', mockDriveFetch);
+  const expanseBooks = driveBooks.filter((b) => b.series === 'The Expanse');
+  assert.equal(expanseBooks.length, 3);
+  assert.ok(expanseBooks.every((b) => b.author === 'James S. A. Corey'));
+  assert.equal(expanseBooks.find((b) => b.seriesOrder === 0.1)?.title, 'Drive (2013)');
+  assert.equal(expanseBooks.find((b) => b.seriesOrder === 2)?.title, 'Caliban’s War (2013)');
+  assert.equal(expanseBooks.find((b) => b.seriesOrder === 10)?.title, 'Complete Novella Collection (2022)');
+
+  const hpBook = driveBooks.find((b) => b.title.includes('Goblet of Fire'));
+  assert.equal(hpBook?.series, 'Harry Potter');
+  assert.equal(hpBook?.seriesOrder, 4);
+
+  const standaloneBook = driveBooks.find((b) => b.title === 'Standalone Book');
+  assert.equal(standaloneBook?.series, '');
 });

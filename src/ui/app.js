@@ -289,6 +289,7 @@ class AudiobookApp {
     this._lastMainHtml = null;
     this._prevMainViewMeta = null;
     this._overlayState = {};
+    this._legacyBookKeyMap = new Map();
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
       window.addEventListener('error', (event) => {
@@ -473,8 +474,30 @@ class AudiobookApp {
   _normalizeBookRecord(book) {
     if (!book || typeof book !== 'object') return book;
     const normalized = normalizeBookSeriesAndChapters(book) || book;
+    const prevKey = normalized.bookKey || book.bookKey || '';
+    const hasTitle = Boolean(normalized.title && String(normalized.title).trim());
+    const canonicalKey = hasTitle
+      ? normalizeBookKey(normalized.title, normalized.author || '')
+      : prevKey;
+    const nextKey = canonicalKey || prevKey;
+    if (prevKey && nextKey && prevKey !== nextKey) {
+      if (!this._legacyBookKeyMap) this._legacyBookKeyMap = new Map();
+      if (!this._legacyBookKeyMap.has(nextKey)) {
+        this._legacyBookKeyMap.set(nextKey, new Set());
+      }
+      this._legacyBookKeyMap.get(nextKey).add(prevKey);
+      const prevBookmarks = this.state?.bookmarksByBook?.[prevKey];
+      if (Array.isArray(prevBookmarks) && prevBookmarks.length > 0) {
+        const existingNext = this.state.bookmarksByBook[nextKey] || [];
+        if (existingNext.length === 0) {
+          this.state.bookmarksByBook[nextKey] = prevBookmarks;
+        }
+      }
+    }
     return {
       ...normalized,
+      id: nextKey || normalized.id,
+      bookKey: nextKey || normalized.bookKey,
       positionSec: normalized.positionSec ?? normalized.elapsedSec ?? 0
     };
   }
@@ -485,7 +508,8 @@ class AudiobookApp {
       if (raw) {
         const saved = JSON.parse(raw);
         if (Array.isArray(saved) && saved.length > 0) {
-          return deduplicateLibraryItems(saved).map((b) => this._normalizeBookRecord(b));
+          const preNormalized = saved.map((b) => this._normalizeBookRecord(b));
+          return deduplicateLibraryItems(preNormalized).map((b) => this._normalizeBookRecord(b));
         }
       }
     } catch {
@@ -522,15 +546,23 @@ class AudiobookApp {
     if (this.syncService.isAuthenticated()) {
       const remoteBooks = await this.syncService.fetchLibraryItems().catch(() => []);
       if (Array.isArray(remoteBooks) && remoteBooks.length > 0) {
-        combined = deduplicateLibraryItems([...localBooks, ...remoteBooks]);
+        const normalizedRemote = remoteBooks.map((b) => this._normalizeBookRecord(b));
+        combined = deduplicateLibraryItems([...localBooks, ...normalizedRemote]);
       }
     }
 
     const progressMap = await this.syncService.fetchAllProgress().catch(() => ({}));
     this.books = combined.map((book) => {
       const normalized = this._normalizeBookRecord(book);
-      const localStored = progressMap[normalized.bookKey];
-      const merged = localStored ? resolveProgressConflict(normalized, localStored) : normalized;
+      const legacyKeys = this._legacyBookKeyMap?.get(normalized.bookKey);
+      let merged = normalized;
+      const candidates = [normalized.bookKey, ...(legacyKeys ? Array.from(legacyKeys) : [])];
+      for (const candidateKey of candidates) {
+        const stored = progressMap[candidateKey];
+        if (stored) {
+          merged = resolveProgressConflict(merged, stored);
+        }
+      }
       return {
         ...normalized,
         positionSec: merged?.positionSec ?? normalized.positionSec ?? 0,
@@ -542,9 +574,23 @@ class AudiobookApp {
     }
 
     for (const book of this.books) {
-      this.state.bookmarksByBook[book.bookKey] = await this.syncService
+      let fetchedBookmarks = await this.syncService
         .fetchBookmarks(book.bookKey)
-        .catch(() => book.bookmarks || []);
+        .catch(() => []);
+      if (!fetchedBookmarks || fetchedBookmarks.length === 0) {
+        const legacyKeys = this._legacyBookKeyMap?.get(book.bookKey);
+        if (legacyKeys) {
+          for (const legacyKey of legacyKeys) {
+            const legacyBm = await this.syncService.fetchBookmarks(legacyKey).catch(() => []);
+            if (legacyBm && legacyBm.length > 0) {
+              fetchedBookmarks = legacyBm;
+              break;
+            }
+          }
+        }
+      }
+      this.state.bookmarksByBook[book.bookKey] =
+        fetchedBookmarks && fetchedBookmarks.length > 0 ? fetchedBookmarks : book.bookmarks || [];
     }
 
     if (this.books.length > 0) {
@@ -555,7 +601,11 @@ class AudiobookApp {
         // ignore
       }
       const initialBook =
-        this.books.find((b) => b.bookKey === savedActiveKey) || this.books[0];
+        this.books.find(
+          (b) =>
+            b.bookKey === savedActiveKey ||
+            (savedActiveKey && this._legacyBookKeyMap?.get(b.bookKey)?.has(savedActiveKey))
+        ) || this.books[0];
       if (initialBook) {
         await this.selectBook(initialBook.bookKey, false);
       }

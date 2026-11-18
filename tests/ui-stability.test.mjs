@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AudiobookApp } from '../src/ui/app.js';
+import { normalizeBookKey } from '../src/services/library-scanner.js';
 import * as metadataEnrichment from '../src/services/metadata-enrichment.js';
 
 const VOID_TAGS = new Set(['input', 'img', 'br', 'hr', 'meta', 'link', 'circle', 'line', 'polyline', 'polygon', 'path']);
@@ -269,10 +270,12 @@ function createDomEnv({ innerWidth = 1280 } = {}) {
 }
 
 function makeBook(idx, overrides = {}) {
+  const title = overrides.title ?? `Series Saga: Book ${idx}`;
+  const author = overrides.author ?? `Author ${idx}`;
   return {
-    bookKey: `book-${idx}`,
-    title: `Series Saga: Book ${idx}`,
-    author: `Author ${idx}`,
+    bookKey: normalizeBookKey(title, author),
+    title,
+    author,
     series: 'Series Saga',
     seriesOrder: idx,
     sources: ['drive'],
@@ -296,7 +299,7 @@ test('handleWipeSyncedFiles suppresses per-book render/sheetSlideUp and disables
       makeBook(3, { offlineCached: true }),
       makeBook(4, { sources: ['local'], offlineCached: false })
     ];
-    app.state.activeBookKey = 'book-1';
+    app.state.activeBookKey = app.books[0].bookKey;
     app.state.showWipeSyncedModal = true;
     app.state.driveModal.open = true;
 
@@ -366,7 +369,7 @@ test('scroll positions persist across folder toggle and open-detail on Desktop a
     app._runBackgroundMetadataEnrichment = async () => {};
     app.guestLocalMode = true;
     app.books = [makeBook(1), makeBook(2), makeBook(3, { series: 'Other Saga', title: 'Other Saga: Book 1' })];
-    app.state.activeBookKey = 'book-1';
+    app.state.activeBookKey = app.books[0].bookKey;
     app.render();
 
     // Scroll left library list and desktop right panel
@@ -457,7 +460,7 @@ test('open overlays preserve DOM identity across background renders and update s
     app._runBackgroundMetadataEnrichment = async () => {};
     app.guestLocalMode = true;
     app.books = [makeBook(1)];
-    app.state.activeBookKey = 'book-1';
+    app.state.activeBookKey = app.books[0].bookKey;
     app.state.driveModal = {
       open: true,
       folderId: 'folder-123',
@@ -582,6 +585,112 @@ test('_mergeEnrichedBook preserves enrichmentVersion and upgrades non-English de
     app.syncService?.destroy?.();
     app.audioEngine?.destroy?.();
   } finally {
+    env.restore();
+  }
+});
+
+test('loading cached split Expanse books normalizes keys/series, deduplicates copies, preserves progress, and groups into one The Expanse folder', async () => {
+  const env = createDomEnv({ innerWidth: 1280 });
+  let app = null;
+  try {
+    const cachedBooks = [
+      {
+        bookKey: 'leviathan-wakes-2011::james-s-a-corey',
+        title: 'Leviathan Wakes (2011)',
+        author: 'James S. A. Corey',
+        series: 'James S. A. Corey - The Expanse Complete 2.0 - Jefferson Mays (1)',
+        sources: ['drive'],
+        positionSec: 120,
+        totalDurationSec: 3600
+      },
+      {
+        bookKey: 'caliban’s-war-2013::james-s-a-corey',
+        title: 'Caliban’s War (2013)',
+        author: 'James S. A. Corey',
+        series: 'The Expanse',
+        sources: ['drive'],
+        positionSec: 450,
+        totalDurationSec: 3600
+      },
+      {
+        bookKey: 'drive-2013::james-s-a-corey',
+        title: 'An Expanse Novella - Drive (2013)',
+        author: 'James S. A. Corey',
+        series: 'James S. A. Corey - The Expanse Complete 2.0 - Jefferson Mays',
+        sources: ['drive'],
+        positionSec: 90,
+        totalDurationSec: 1800
+      },
+      {
+        bookKey: 'the-expanse-x-complete-novella-collection-2022::the-expanse-x',
+        title: 'Complete Novella Collection (2022)',
+        author: 'The Expanse X',
+        series: 'James S. A. Corey - The Expanse Complete 2.0 - Jefferson Mays (1)',
+        seriesOrder: 2,
+        sources: ['drive'],
+        positionSec: 0,
+        totalDurationSec: 7200
+      },
+      {
+        bookKey: 'the-wisdom-of-crowds-1::joe-abercrombie',
+        title: 'The Wisdom of Crowds (1)',
+        author: 'Joe Abercrombie',
+        series: '02 - The Age of Madness (1)',
+        sources: ['local'],
+        positionSec: 300,
+        totalDurationSec: 5000
+      },
+      {
+        bookKey: 'the-wisdom-of-crowds::joe-abercrombie',
+        title: 'The Wisdom of Crowds',
+        author: 'Joe Abercrombie',
+        series: 'The Age of Madness',
+        sources: ['drive'],
+        positionSec: 100,
+        totalDurationSec: 5000
+      }
+    ];
+
+    globalThis.localStorage.setItem('audiobook_user_library_v1', JSON.stringify(cachedBooks));
+    globalThis.localStorage.setItem('audiobook_player_active_book_v1', 'drive-2013::james-s-a-corey');
+
+    app = new AudiobookApp(env.rootEl);
+    app._enrichSingleBookInBackground = async () => {};
+    app._runBackgroundMetadataEnrichment = async () => {};
+    app.guestLocalMode = true;
+    app.audioEngine.loadBook = async () => {};
+    app.syncService.fetchAllProgress = async () => ({
+      'the-wisdom-of-crowds-1::joe-abercrombie': {
+        bookKey: 'the-wisdom-of-crowds-1::joe-abercrombie',
+        positionSec: 650,
+        chapterIndex: 2,
+        clientUpdatedAt: '2026-11-18T12:00:00.000Z'
+      }
+    });
+    app.syncService.fetchBookmarks = async (key) =>
+      key === 'leviathan-wakes-2011::james-s-a-corey'
+        ? [{ id: 'bm-1', positionSec: 120, label: 'Chapter 1' }]
+        : [];
+
+    await app._loadUserLibraryAndSync();
+
+    // Duplicate "The Wisdom of Crowds (1)" + "The Wisdom of Crowds" should merge into 1 entry
+    const wisdomBooks = app.books.filter((b) => /wisdom of crowds/i.test(b.title));
+    assert.equal(wisdomBooks.length, 1, 'duplicate (1) copy and Drive copy should deduplicate into one book');
+    assert.equal(wisdomBooks[0].series, 'The Age of Madness');
+    assert.equal(wisdomBooks[0].positionSec, 650, 'progress from legacy key should be preserved');
+    assert.deepEqual(wisdomBooks[0].sources.sort(), ['drive', 'local']);
+
+    const entries = app._groupBooksByFranchise(app.books);
+    const expanseFolders = entries.filter(
+      (e) => e.type === 'franchise' && /expanse/i.test(e.seriesName)
+    );
+    assert.equal(expanseFolders.length, 1, 'all Expanse books must group into a single folder');
+    assert.equal(expanseFolders[0].seriesName, 'The Expanse');
+    assert.equal(expanseFolders[0].books.length, 4);
+  } finally {
+    app?.syncService?.destroy?.();
+    app?.audioEngine?.destroy?.();
     env.restore();
   }
 });

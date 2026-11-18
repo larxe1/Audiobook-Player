@@ -8,6 +8,8 @@ import {
   parseFilenameMetadata,
   parseSeriesAndOrder,
   normalizeBookSeriesAndChapters,
+  cleanSeriesName,
+  isGenericSeriesFolderName,
 } from './metadata-enrichment.js';
 
 const SUPPORTED_AUDIO_RE = /\.(m4b|mp3|m4a|ogg|flac)$/i;
@@ -434,17 +436,23 @@ export async function scanLocalFiles(fileList, options = {}) {
         ? `${parentMeta.title || info.parentFolderName} - ${folderName}`
         : '';
 
+    const safeParentName =
+      info.depth >= 2 && info.parentFolderName && !isGenericSeriesFolderName(info.parentFolderName)
+        ? info.parentFolderName
+        : '';
+
     if (shouldGroupFolderAsOneBook) {
       const folderMeta = parseFilenameMetadata(folderName || '');
       const firstTags = parsedEntries[0].tags;
       const title = firstTags.series || effectiveFolderTitle || folderMeta.title || folderName;
       const rawAuthor = firstTags.author || folderMeta.author || parentMeta.author || '';
-      const rawSeries = info.depth >= 2 ? info.parentFolderName : (firstTags.series || folderMeta.series || '');
-      const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, info.depth >= 2 ? info.parentFolderName : '');
+      const rawSeries = firstTags.series || folderMeta.series || safeParentName || '';
+      const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, safeParentName);
       const author = seriesParsed.authorPolluted
         ? (seriesParsed.inferredAuthor || '')
         : (rawAuthor || seriesParsed.inferredAuthor || '');
-      const bookKey = normalizeBookKey(title, author);
+      const finalTitle = seriesParsed.titleCleaned && seriesParsed.cleanTitle ? seriesParsed.cleanTitle : title;
+      const bookKey = normalizeBookKey(finalTitle, author);
 
       const tracks = parsedEntries.map(({ file, localUrl }) => ({
         name: file.name,
@@ -465,12 +473,12 @@ export async function scanLocalFiles(fileList, options = {}) {
         normalizeBookSeriesAndChapters({
           id: bookKey,
           bookKey,
-          title,
+          title: finalTitle,
           author,
           narrator: parsedEntries.find((e) => e.tags.narrator)?.tags.narrator || '',
-          series: seriesParsed.series || rawSeries,
+          series: seriesParsed.series || cleanSeriesName(rawSeries, author),
           seriesOrder: seriesParsed.seriesOrder ?? folderMeta.seriesOrder ?? firstTags.seriesOrder ?? null,
-          parentFolderName: info.depth >= 2 ? info.parentFolderName : '',
+          parentFolderName: safeParentName,
           description: parsedEntries.find((e) => e.tags.description)?.tags.description || '',
           year: parsedEntries.find((e) => e.tags.year)?.tags.year || '',
           totalDurationSec: parsedEntries.reduce((s, e) => s + Number(e.tags.totalDurationSec || 0), 0),
@@ -507,19 +515,30 @@ export async function scanLocalFiles(fileList, options = {}) {
         ? effectiveFolderTitle || folderMeta.title || folderName
         : tags.title || file.name.replace(ANY_AUDIO_EXT_RE, '');
       const rawAuthor = tags.author || folderMeta.author || parentMeta.author || '';
-      const rawSeries =
-        !isRootLevel && parsedEntries.length > 1 && folderName
+      const safeFolderSeries =
+        !isRootLevel && parsedEntries.length > 1 && folderName && !isGenericSeriesFolderName(folderName)
           ? folderName
-          : info.depth >= 2 && info.parentFolderName
-            ? info.parentFolderName
-            : tags.series || folderMeta.series || '';
-      const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, info.depth >= 2 ? info.parentFolderName : '');
+          : '';
+      const explicitFolderFirstLawWorld = /^first law world$/i.test(safeFolderSeries.trim())
+        ? safeFolderSeries.trim()
+        : /^first law world$/i.test(safeParentName.trim())
+          ? safeParentName.trim()
+          : '';
+      const rawSeries =
+        explicitFolderFirstLawWorld ||
+        tags.series ||
+        folderMeta.series ||
+        safeFolderSeries ||
+        safeParentName ||
+        '';
+      const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, safeParentName);
       const author = seriesParsed.authorPolluted
         ? (seriesParsed.inferredAuthor || '')
         : (rawAuthor || seriesParsed.inferredAuthor || '');
-      const series = seriesParsed.series || rawSeries;
+      const finalTitle = seriesParsed.titleCleaned && seriesParsed.cleanTitle ? seriesParsed.cleanTitle : title;
+      const series = seriesParsed.series || cleanSeriesName(rawSeries, author);
       const seriesOrder = seriesParsed.seriesOrder ?? tags.seriesOrder ?? folderMeta.seriesOrder ?? null;
-      const bookKey = normalizeBookKey(title, author);
+      const bookKey = normalizeBookKey(finalTitle, author);
 
       if (!perFileGroups.has(bookKey)) {
         const initialChapters =
@@ -817,16 +836,24 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
   // Only use thumbnailLink from an actual image file in the folder, NEVER from audio files
   const preferredCoverUrl = coverFile?.thumbnailLink || '';
 
+  const safeParentName =
+    parentFolderName && !isGenericSeriesFolderName(parentFolderName) ? parentFolderName : '';
+  const safeFolderSeries =
+    !isRootFolder && sorted.length > 1 && folderName && !isGenericSeriesFolderName(folderName)
+      ? folderName
+      : '';
+
   if (shouldGroupAsOneBook) {
     const folderMeta = parseFilenameMetadata(folderName || '');
     const title = folderMeta.title || folderName || sorted[0].name.replace(ANY_AUDIO_EXT_RE, '');
     const rawAuthor = folderMeta.author || '';
-    const rawSeries = parentFolderName || folderMeta.series || '';
-    const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, parentFolderName);
+    const rawSeries = folderMeta.series || safeParentName || '';
+    const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, safeParentName);
     const author = seriesParsed.authorPolluted
       ? (seriesParsed.inferredAuthor || '')
       : (rawAuthor || seriesParsed.inferredAuthor || '');
-    const bookKey = normalizeBookKey(title, author);
+    const finalTitle = seriesParsed.titleCleaned && seriesParsed.cleanTitle ? seriesParsed.cleanTitle : title;
+    const bookKey = normalizeBookKey(finalTitle, author);
     const primaryFileId = resolveDriveFileId(sorted[0]);
     const primaryStreamUrl = buildDriveStreamUrl(primaryFileId);
 
@@ -853,11 +880,11 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
       normalizeBookSeriesAndChapters({
         id: bookKey,
         bookKey,
-        title,
+        title: finalTitle,
         author,
-        series: seriesParsed.series || rawSeries,
+        series: seriesParsed.series || cleanSeriesName(rawSeries, author),
         seriesOrder: seriesParsed.seriesOrder ?? folderMeta.seriesOrder ?? null,
-        parentFolderName: parentFolderName || '',
+        parentFolderName: safeParentName,
         narrator: '',
         description: '',
         totalDurationSec,
@@ -897,28 +924,37 @@ function buildGroupedDriveBooksFromFolder(folderName, parentFolderName, audioFil
       ? folderMeta.title || folderName
       : fileMeta.title || file.name.replace(ANY_AUDIO_EXT_RE, '');
     const rawAuthor = fileMeta.author || folderMeta.author || '';
+    const explicitFolderFirstLawWorld = /^first law world$/i.test(safeFolderSeries.trim())
+      ? safeFolderSeries.trim()
+      : /^first law world$/i.test(safeParentName.trim())
+        ? safeParentName.trim()
+        : '';
     const rawSeries =
-      !isRootFolder && sorted.length > 1 && folderName
-        ? folderName
-        : fileMeta.series || folderMeta.series || parentFolderName || '';
-    const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, parentFolderName);
+      explicitFolderFirstLawWorld ||
+      fileMeta.series ||
+      folderMeta.series ||
+      safeFolderSeries ||
+      safeParentName ||
+      '';
+    const seriesParsed = parseSeriesAndOrder(title, rawAuthor, rawSeries, safeParentName);
     const author = seriesParsed.authorPolluted
       ? (seriesParsed.inferredAuthor || '')
       : (rawAuthor || seriesParsed.inferredAuthor || '');
-    const series = seriesParsed.series || rawSeries;
+    const finalTitle = seriesParsed.titleCleaned && seriesParsed.cleanTitle ? seriesParsed.cleanTitle : title;
+    const series = seriesParsed.series || cleanSeriesName(rawSeries, author);
     const seriesOrder = seriesParsed.seriesOrder ?? fileMeta.seriesOrder ?? folderMeta.seriesOrder ?? null;
-    const bookKey = normalizeBookKey(title, author);
+    const bookKey = normalizeBookKey(finalTitle, author);
     const driveStreamUrl = buildDriveStreamUrl(fileId);
     const durationSec = extractDriveDurationSec(file);
 
     return normalizeBookSeriesAndChapters({
       id: bookKey,
       bookKey,
-      title,
+      title: finalTitle,
       author,
       series,
       seriesOrder,
-      parentFolderName: parentFolderName || '',
+      parentFolderName: safeParentName,
       narrator: '',
       description: '',
       totalDurationSec: durationSec,
