@@ -679,6 +679,46 @@ async fn desktop_install_update(
     }))
 }
 
+#[tauri::command]
+fn fetch_podcast_rss(url: String) -> Result<String, String> {
+    let trimmed = url.trim().to_string();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("Podcast RSS URL must start with http:// or https://".into());
+    }
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("Podcast RSS URL contains invalid characters.".into());
+    }
+
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; (Invoke-WebRequest -Uri $env:AB_RSS_URL -UseBasicParsing -TimeoutSec 20).Content",
+    ])
+    .env("AB_RSS_URL", &trimmed);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to execute PowerShell RSS fetch: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("RSS fetch failed: {}", stderr.trim()));
+    }
+    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    if body.trim().is_empty() {
+        return Err("Empty RSS response.".into());
+    }
+    Ok(body)
+}
+
 fn build_main_window(
     app: &App,
     label: &str,
@@ -781,7 +821,8 @@ fn main() {
             desktop_save_auth_session,
             desktop_load_auth_session,
             desktop_clear_auth_session,
-            desktop_install_update
+            desktop_install_update,
+            fetch_podcast_rss
         ])
         .setup(|app| {
             let win = create_main_window_with_fallback(app)?;

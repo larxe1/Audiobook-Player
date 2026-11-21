@@ -98,6 +98,8 @@ export const ICON_DOWNLOADED = (size = 14, cls = '') => `
   <path d="M8 4.2v6.1M5.4 8l2.6 2.7L10.6 8" stroke="#060911" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 
+export const ICON_DOWNLOADED_CIRCLE = ICON_DOWNLOADED;
+
 export const ICON_DOWNLOAD_CIRCLE = (size = 18, cls = '') => `
 <svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="${cls}" aria-hidden="true">
   <circle cx="12" cy="12" r="9"/>
@@ -204,4 +206,45 @@ export const FLUENT_3D_CLOUD = (size = 16, cls = '') => `
   <path d="M9.5 25.5h13.8c3.26 0 5.9-2.55 5.9-5.7 0-2.86-2.18-5.23-5.01-5.63C23.56 9.81 19.86 6.5 15.35 6.5c-4.7 0-8.57 3.55-8.98 8.08C3.78 15.17 2 17.42 2 20.08c0 3.01 2.52 5.42 5.65 5.42H9.5z" fill="url(#cldMain)"/>
   <circle cx="14.5" cy="13.5" r="7" fill="url(#cldGlow)"/>
   <path d="M7.8 25.5h15.5c2.9 0 5.3-2.1 5.7-4.8-.9 2-3 3.3-5.5 3.3H8.3c-2.8 0-5.1-1.6-5.9-3.9.4 3.05 2.7 5.4 5.4 5.4z" fill="#0d47a1" opacity="0.24"/>
+</svg>`;
+
+/**
+ * Crisp vector podcast microphone with broadcast waves SVG icon.
+ */
+export const ICON_PODCAST = (size = 16, cls = '') => `
+<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="${cls}" aria-hidden="true">
+  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+  <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+  <line x1="12" y1="19" x2="12" y2="22"/>
+  <line x1="8" y1="22" x2="16" y2="22"/>
+</svg>`;
+
+/**
+ * Microsoft Fluent 3D style studio podcast microphone / broadcast badge SVG.
+ */
+export const FLUENT_3D_PODCAST = (size = 18, cls = '') => `
+<svg width="${size}" height="${size}" viewBox="0 0 32 32" fill="none" class="${cls}" aria-label="Podcast" role="img">
+  <defs>
+    <linearGradient id="podBg" x1="4" y1="3" x2="28" y2="29" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#a855f7"/>
+      <stop offset="52%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <linearGradient id="podMic" x1="12" y1="6" x2="20" y2="20" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="60%" stop-color="#e2e8f0"/>
+      <stop offset="100%" stop-color="#94a3b8"/>
+    </linearGradient>
+    <linearGradient id="podAccent" x1="9" y1="14" x2="23" y2="27" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="26" height="26" rx="8" fill="url(#podBg)"/>
+  <path d="M7.5 11.5a10 10 0 0 1 0 7M24.5 11.5a10 10 0 0 0 0 7" stroke="#67e8f9" stroke-width="1.8" stroke-linecap="round" opacity="0.85"/>
+  <rect x="12.2" y="6.5" width="7.6" height="12" rx="3.8" fill="url(#podMic)"/>
+  <line x1="13.8" y1="10.2" x2="18.2" y2="10.2" stroke="#6366f1" stroke-width="1.2" stroke-linecap="round" opacity="0.55"/>
+  <line x1="13.8" y1="12.8" x2="18.2" y2="12.8" stroke="#6366f1" stroke-width="1.2" stroke-linecap="round" opacity="0.55"/>
+  <path d="M9.8 14.5v.8a6.2 6.2 0 0 0 12.4 0v-.8" stroke="url(#podAccent)" stroke-width="2.2" stroke-linecap="round"/>
+  <path d="M16 21.5v4M12.5 25.5h7" stroke="url(#podAccent)" stroke-width="2.2" stroke-linecap="round"/>
 </svg>`;

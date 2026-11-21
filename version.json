@@ -1,13 +1,13 @@
 {
-  "version": "1.0.16",
-  "build": 17,
+  "version": "1.0.17",
+  "build": 18,
   "minNativeBuild": 15,
   "channel": "stable",
-  "publishedAt": "2026-11-21T11:30:00Z",
+  "publishedAt": "2026-11-21T14:45:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "webBundleUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Persist Google and local logins reliably across shutdowns and restarts with instant session hydration, native Windows and Android session backups, and proactive Google Drive token refresh"
+  "releaseNotes": "Add Spotify-style live podcasts with automatic show search, category discovery, background RSS episode refresh, on-demand episode streaming, and per-episode offline downloads across Windows and Android"
 }

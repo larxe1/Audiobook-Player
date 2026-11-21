@@ -85,6 +85,71 @@ export function buildDriveStreamUrl(fileId) {
   return `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`;
 }
 
+function isPodcastItem(item) {
+  return Boolean(
+    item?.isPodcast ||
+      item?.mediaType === 'podcast' ||
+      String(item?.bookKey || '').startsWith('podcast:') ||
+      item?.source === 'podcast' ||
+      (Array.isArray(item?.sources) && item.sources.includes('podcast'))
+  );
+}
+
+function normalizeFeedUrlKey(feedUrl = '') {
+  return String(feedUrl || '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
+function mergeEpisodeProgress(existingMap = {}, incomingMap = {}) {
+  const a = existingMap && typeof existingMap === 'object' && !Array.isArray(existingMap) ? existingMap : {};
+  const b = incomingMap && typeof incomingMap === 'object' && !Array.isArray(incomingMap) ? incomingMap : {};
+  const merged = {};
+  for (const epId of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    const first = a[epId];
+    const second = b[epId];
+    if (!first) {
+      if (second && typeof second === 'object') merged[epId] = { ...second };
+      continue;
+    }
+    if (!second) {
+      if (first && typeof first === 'object') merged[epId] = { ...first };
+      continue;
+    }
+    const firstTs = parseTimestampMs(first.updatedAt);
+    const secondTs = parseTimestampMs(second.updatedAt);
+    const winner =
+      secondTs > firstTs
+        ? second
+        : firstTs > secondTs
+          ? first
+          : Number(second.positionSec || 0) >= Number(first.positionSec || 0)
+            ? second
+            : first;
+    merged[epId] = {
+      ...winner,
+      completed: Boolean(first.completed || second.completed || winner.completed)
+    };
+  }
+  return merged;
+}
+
+function mergePodcastChapters(existing = [], incoming = [], preferIncoming = false) {
+  const a = Array.isArray(existing) ? existing : [];
+  const b = Array.isArray(incoming) ? incoming : [];
+  if (a.length === 0) return b.map((ch) => ({ ...ch }));
+  if (b.length === 0) return a.map((ch) => ({ ...ch }));
+  const offlineById = new Map();
+  for (const ch of [...a, ...b]) {
+    if (ch?.episodeId && ch.offlineCached) {
+      offlineById.set(ch.episodeId, true);
+    }
+  }
+  const base = preferIncoming || b.length >= a.length ? b : a;
+  return base.map((ch) => ({
+    ...ch,
+    ...(ch?.episodeId && offlineById.has(ch.episodeId) ? { offlineCached: true } : {})
+  }));
+}
+
 function collectSources(item) {
   const set = new Set();
   if (Array.isArray(item?.sources)) {
@@ -94,6 +159,9 @@ function collectSources(item) {
   }
   if (typeof item?.source === 'string' && item.source) {
     set.add(item.source.toLowerCase());
+  }
+  if (isPodcastItem(item)) {
+    set.add('podcast');
   }
   if (item?.driveFileId || item?.driveStreamUrl) {
     set.add('drive');
@@ -157,12 +225,27 @@ export function deduplicateLibraryItems(items = []) {
   if (!Array.isArray(items) || items.length === 0) return [];
 
   const byKey = new Map();
+  const podcastByFeedUrl = new Map();
 
   for (const raw of items) {
     if (!raw || typeof raw !== 'object') continue;
+    const isPodcast = isPodcastItem(raw);
+    const normFeedUrl = isPodcast ? normalizeFeedUrlKey(raw.feedUrl) : '';
     const key = raw.bookKey
       ? String(raw.bookKey).trim()
-      : normalizeBookKey(raw.title || '', raw.author || '');
+      : (isPodcast && normFeedUrl
+        ? `podcast:${normFeedUrl}`
+        : normalizeBookKey(raw.title || '', raw.author || ''));
+
+    let mapKey = isPodcast ? `podcast-ns:${key}` : key;
+    if (isPodcast && normFeedUrl) {
+      const existingFeedMapKey = podcastByFeedUrl.get(normFeedUrl);
+      if (existingFeedMapKey) {
+        mapKey = existingFeedMapKey;
+      } else {
+        podcastByFeedUrl.set(normFeedUrl, mapKey);
+      }
+    }
 
     const rawSources = collectSources(raw);
     const rawPos = Number(raw.positionSec ?? raw.progressSec ?? 0) || 0;
@@ -171,19 +254,33 @@ export function deduplicateLibraryItems(items = []) {
     const rawChapterIdx = Number(raw.chapterIndex ?? 0) || 0;
     const rawOffline = Boolean(raw.isOffline || raw.offline || rawSources.has('local'));
 
-    if (!byKey.has(key)) {
+    if (!byKey.has(mapKey)) {
       const sources = orderSources(rawSources);
-      byKey.set(key, {
+      byKey.set(mapKey, {
         ...raw,
         id: raw.id || key,
         bookKey: key,
         sources,
-        preferredPlaybackSource: sources.includes('local') ? 'local' : (sources[0] || 'drive'),
+        preferredPlaybackSource: sources.includes('local')
+          ? 'local'
+          : (isPodcast ? 'podcast' : (sources[0] || 'drive')),
         localUrl: raw.localUrl || '',
         driveFileId: raw.driveFileId || '',
         driveStreamUrl: raw.driveStreamUrl || (raw.driveFileId ? buildDriveStreamUrl(raw.driveFileId) : ''),
         isOffline: rawOffline,
         offline: rawOffline,
+        ...(isPodcast
+          ? {
+              isPodcast: true,
+              mediaType: 'podcast',
+              feedUrl: raw.feedUrl || '',
+              lastFeedRefreshAt: raw.lastFeedRefreshAt || '',
+              episodeProgress:
+                raw.episodeProgress && typeof raw.episodeProgress === 'object'
+                  ? { ...raw.episodeProgress }
+                  : {}
+            }
+          : {}),
         chapters: Array.isArray(raw.chapters) ? [...raw.chapters] : [],
         bookmarks: mergeBookmarks(raw.bookmarks),
         seriesOrder:
@@ -199,7 +296,7 @@ export function deduplicateLibraryItems(items = []) {
       continue;
     }
 
-    const existing = byKey.get(key);
+    const existing = byKey.get(mapKey);
     const mergedSourceSet = new Set([...existing.sources, ...rawSources]);
     const sources = orderSources(mergedSourceSet);
 
@@ -229,10 +326,17 @@ export function deduplicateLibraryItems(items = []) {
         : null;
     const mergedSeriesOrder = existingOrder !== null ? existingOrder : rawOrder;
 
-    byKey.set(key, {
+    const existingRefreshMs = parseTimestampMs(existing.lastFeedRefreshAt);
+    const incomingRefreshMs = parseTimestampMs(raw.lastFeedRefreshAt);
+    const preferIncomingFeed = isPodcast && incomingRefreshMs > existingRefreshMs;
+    const mergedChapters = isPodcast
+      ? mergePodcastChapters(existing.chapters, raw.chapters, preferIncomingFeed)
+      : mergeChapters(existing.chapters, raw.chapters);
+
+    byKey.set(mapKey, {
       ...existing,
-      id: existing.id || raw.id || key,
-      bookKey: key,
+      id: existing.id || raw.id || existing.bookKey,
+      bookKey: existing.bookKey || key,
       title: existing.title || raw.title || '',
       author: existing.author || raw.author || '',
       narrator: existing.narrator || raw.narrator || '',
@@ -242,7 +346,9 @@ export function deduplicateLibraryItems(items = []) {
       coverUrl: existing.coverUrl || raw.coverUrl || '',
       year: existing.year || raw.year || '',
       sources,
-      preferredPlaybackSource: sources.includes('local') ? 'local' : (sources[0] || 'drive'),
+      preferredPlaybackSource: sources.includes('local')
+        ? 'local'
+        : (isPodcast ? 'podcast' : (sources[0] || 'drive')),
       localUrl: existing.localUrl || raw.localUrl || '',
       localFile: existing.localFile || raw.localFile || null,
       tracks: Array.isArray(existing.tracks) && existing.tracks.length > 0
@@ -255,7 +361,24 @@ export function deduplicateLibraryItems(items = []) {
         (raw.driveFileId ? buildDriveStreamUrl(raw.driveFileId) : ''),
       isOffline: offlineStatus,
       offline: offlineStatus,
-      chapters: mergeChapters(existing.chapters, raw.chapters),
+      ...(isPodcast
+        ? {
+            isPodcast: true,
+            mediaType: 'podcast',
+            feedUrl: existing.feedUrl || raw.feedUrl || '',
+            lastFeedRefreshAt:
+              preferIncomingFeed
+                ? raw.lastFeedRefreshAt
+                : (existing.lastFeedRefreshAt || raw.lastFeedRefreshAt || ''),
+            episodeProgress: mergeEpisodeProgress(existing.episodeProgress, raw.episodeProgress),
+            hasOfflineEpisodes: Boolean(
+              mergedChapters.some((c) => Boolean(c?.offlineCached)) ||
+                existing.hasOfflineEpisodes ||
+                raw.hasOfflineEpisodes
+            )
+          }
+        : {}),
+      chapters: mergedChapters,
       bookmarks: mergeBookmarks(existing.bookmarks, raw.bookmarks),
       positionSec: bestPos,
       progressSec: bestPos,
@@ -269,8 +392,12 @@ export function deduplicateLibraryItems(items = []) {
     });
   }
 
-  return Array.from(byKey.values()).map((item) => normalizeBookSeriesAndChapters(item));
+  return Array.from(byKey.values()).map((item) =>
+    isPodcastItem(item) ? item : normalizeBookSeriesAndChapters(item)
+  );
 }
+
+export const deduplicateBooks = deduplicateLibraryItems;
 
 /**
  * Safely read up to the first 128 KB of a File/Blob-like object.

@@ -1258,3 +1258,195 @@ test('guestLocalMode persists across AudiobookApp restart and clears on handleSi
     env.restore();
   }
 });
+
+test('podcasts filter chip, + Podcast trigger, Podcast Finder modal stability, series exclusion, New Episodes shelf, and episode actions on Desktop and Mobile', async () => {
+  const env = createDomEnv({ innerWidth: 1280 });
+  let app = null;
+  try {
+    app = new AudiobookApp(env.rootEl);
+    app._enrichSingleBookInBackground = async () => {};
+    app._runBackgroundMetadataEnrichment = async () => {};
+    app.guestLocalMode = true;
+    app.audioEngine.loadBook = async (book) => {
+      app.audioEngine.currentBook = book;
+    };
+    app.audioEngine.play = async () => {
+      app.audioEngine.playing = true;
+    };
+    app.audioEngine.setChapter = async (idx) => {
+      app.audioEngine.chapterIndex = idx;
+    };
+    app.audioEngine.fetchImpl = async () => ({
+      ok: true,
+      async blob() {
+        return new Blob(['mock-episode-audio'], { type: 'audio/mpeg' });
+      }
+    });
+
+    app.books = [makeBook(1), makeBook(2)];
+    app.state.activeBookKey = app.books[0].bookKey;
+    app.render();
+
+    // 1. Desktop sidebar renders Podcasts filter chip and + Podcast button
+    const desktopPodcastChip = env.rootEl.querySelector('[data-action="set-filter"][data-filter="podcasts"]');
+    const desktopOpenPodcastBtn = env.rootEl.querySelector('[data-action="open-podcast-modal"]');
+    assert.ok(desktopPodcastChip, 'Desktop sidebar must render Podcasts filter chip');
+    assert.ok(desktopOpenPodcastBtn, 'Desktop sidebar must render + Podcast button');
+
+    // Switch to Podcasts filter with 0 podcasts and search query -> renders 1-tap Live Podcasts search button
+    desktopPodcastChip.click();
+    assert.equal(app.state.filterSource, 'podcasts');
+    app.state.searchQuery = 'Hard Fork';
+    app.render();
+    const liveSearchBtn = env.rootEl.querySelector('[data-action="open-podcast-modal"][data-query="Hard Fork"]');
+    assert.ok(liveSearchBtn, 'Must render 1-tap Search in Live Podcasts button when searching under podcasts filter');
+    app.state.searchQuery = '';
+
+    // 2. Podcast Finder modal opens with curated/search results, category chips, and preserves DOM identity across background renders
+    app.state.podcastModal = {
+      open: true,
+      query: '',
+      activeCategory: 'trending',
+      loading: false,
+      subscribingId: '',
+      error: '',
+      results: [
+        {
+          id: 'curated-hard-fork',
+          title: 'Hard Fork',
+          author: 'Kevin Roose & Casey Newton',
+          feedUrl: 'https://feeds.simplecast.com/l2i9YnTd',
+          coverUrl: '',
+          genre: 'Tech & AI',
+          episodeCount: 140
+        }
+      ]
+    };
+    app.render();
+
+    const podcastSlot = env.rootEl.querySelector('#appOverlayPodcast');
+    const initialPodcastModal = podcastSlot.querySelector('.sheet-modal');
+    assert.ok(initialPodcastModal, 'Podcast Finder modal should mount in #appOverlayPodcast');
+    assert.ok(podcastSlot.querySelector('[data-action="podcast-search-input"]'), 'Podcast search input must render');
+    assert.ok(
+      podcastSlot.querySelector('[data-action="select-podcast-category"][data-category-id="tech"]'),
+      '1-tap category chips must render'
+    );
+    const followBtn = podcastSlot.querySelector('[data-action="subscribe-podcast"]');
+    assert.ok(followBtn);
+    assert.match(followBtn.textContent, /Follow/);
+
+    // Background playback tick must preserve open Podcast Finder modal DOM identity
+    app.state.snapshot = { ...app.state.snapshot, positionSec: 45 };
+    app.render();
+    assert.equal(
+      podcastSlot.querySelector('.sheet-modal'),
+      initialPodcastModal,
+      'unchanged open Podcast Finder modal must preserve exact DOM identity'
+    );
+
+    // 3. Add two subscribed podcasts sharing a prefix -> never grouped into book series folders
+    const podcast1 = {
+      bookKey: 'podcast:hardfork1',
+      title: 'Hard Fork: Daily',
+      author: 'Kevin Roose',
+      series: 'Hard Fork',
+      isPodcast: true,
+      mediaType: 'podcast',
+      feedUrl: 'https://feeds.simplecast.com/l2i9YnTd',
+      sources: ['podcast'],
+      source: 'podcast',
+      totalDurationSec: 3600,
+      positionSec: 0,
+      chapterIndex: 0,
+      episodeProgress: {
+        'ep-1': { positionSec: 1800, durationSec: 1800, completed: true, updatedAt: '2026-11-21T10:00:00Z' }
+      },
+      chapters: [
+        {
+          index: 0,
+          episodeId: 'ep-1',
+          title: 'AI Agents in 2026',
+          audioUrl: 'https://cdn.example.com/ep1.mp3',
+          durationSec: 1800,
+          publishedAt: '2026-11-21T08:00:00Z',
+          description: 'Clean plain text episode summary without tags.',
+          offlineCached: false
+        },
+        {
+          index: 1,
+          episodeId: 'ep-2',
+          title: 'Quantum Chips Breakdown',
+          audioUrl: 'https://cdn.example.com/ep2.mp3',
+          durationSec: 2400,
+          publishedAt: '2026-11-19T08:00:00Z',
+          description: 'Second episode notes.',
+          offlineCached: false
+        }
+      ]
+    };
+    const podcast2 = {
+      ...podcast1,
+      bookKey: 'podcast:hardfork2',
+      title: 'Hard Fork: Weekend',
+      feedUrl: 'https://feeds.simplecast.com/weekend'
+    };
+
+    app.state.podcastModal.open = false;
+    app.books = [makeBook(1), makeBook(2), podcast1, podcast2];
+    app._persistBooks();
+
+    const savedPodcastsRaw = globalThis.localStorage.getItem('audiobook_podcasts_v1');
+    assert.ok(savedPodcastsRaw, 'Subscribed podcasts must persist to audiobook_podcasts_v1');
+    assert.equal(JSON.parse(savedPodcastsRaw).length, 2);
+
+    const groupedAll = app._groupBooksBySeries(app.books);
+    const hardForkFolder = groupedAll.find(
+      (e) => e.type === 'franchise' && /hard fork/i.test(e.seriesName || '')
+    );
+    assert.equal(hardForkFolder, undefined, 'Podcasts must NEVER be grouped into series folders');
+
+    // 4. Desktop New Episodes shelf & Podcast Detail view (Episodes list, Refresh, Unfollow, Offline toggle)
+    app.state.filterSource = 'all';
+    app.render();
+    assert.match(env.rootEl.querySelector('#appMainLayer').innerHTML, /New Episodes/);
+    assert.match(env.rootEl.querySelector('#appMainLayer').innerHTML, /AI Agents in 2026/);
+
+    // Open Podcast Detail view
+    app.state.detailBookKey = podcast1.bookKey;
+    app.state.desktopView = 'detail';
+    app.render();
+
+    const detailText = env.rootEl.querySelector('#desktopMainScroll').textContent;
+    assert.match(detailText, /Episodes \(2\)/);
+    assert.match(detailText, /✓ Played/);
+    assert.ok(env.rootEl.querySelector('[data-action="refresh-podcast-feed"]'));
+    assert.ok(env.rootEl.querySelector('[data-action="unsubscribe-podcast"]'));
+
+    // Toggle episode offline download
+    const dlBtn = env.rootEl.querySelector(
+      `[data-action="toggle-episode-offline"][data-book-key="${podcast1.bookKey}"][data-chapter-index="0"]`
+    );
+    assert.ok(dlBtn);
+    await app.toggleEpisodeOffline(podcast1.bookKey, 0);
+    assert.equal(app.books.find((b) => b.bookKey === podcast1.bookKey).chapters[0].offlineCached, true);
+
+    // Saved / downloaded filter includes podcast with offline episode
+    app.state.filterSource = 'downloaded';
+    assert.ok(
+      app.getFilteredBooks().some((b) => b.bookKey === podcast1.bookKey),
+      'downloaded filter must include podcasts with offlineCached episodes'
+    );
+
+    // 5. Switch to Android Mobile viewport (< 768px) -> verifies mobile Podcasts chip, + Podcast button, and New Episodes shelf
+    app.state.filterSource = 'podcasts';
+    env.mockWindow.innerWidth = 390;
+    app.render();
+    assert.ok(env.rootEl.querySelector('[data-action="set-filter"][data-filter="podcasts"]'));
+    assert.ok(env.rootEl.querySelector('[data-action="open-podcast-modal"]'));
+    assert.match(env.rootEl.querySelector('#mobileMainScroll').textContent, /New Episodes/);
+  } finally {
+    app?.destroy?.();
+    env.restore();
+  }
+});

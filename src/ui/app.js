@@ -20,6 +20,15 @@ import {
 } from '../services/library-scanner.js';
 import * as metadataEnrichment from '../services/metadata-enrichment.js';
 import { searchCoverImages, buildCuratedSvgCover } from '../services/cover-search.js';
+import {
+  PODCAST_CATEGORIES,
+  CURATED_PODCAST_DIRECTORY,
+  searchPodcasts,
+  subscribeToPodcastFromChoice,
+  fetchPodcastFeedXml,
+  parsePodcastRssXml,
+  createPodcastBookItem
+} from '../services/podcast-service.js';
 
 const {
   enrichBookMetadata,
@@ -112,15 +121,20 @@ import {
   ICON_SPARKLES,
   ICON_PANEL_RIGHT,
   ICON_UPLOAD,
+  ICON_PODCAST,
+  ICON_DOWNLOADED_CIRCLE,
   FLUENT_3D_FOLDER,
-  FLUENT_3D_CLOUD
+  FLUENT_3D_CLOUD,
+  FLUENT_3D_PODCAST
 } from './icons.js';
 
 const STORAGE_THEME_KEY = 'audiobook_player_theme_v1';
 const STORAGE_LIBRARY_KEY = 'audiobook_user_library_v1';
+const STORAGE_PODCASTS_KEY = 'audiobook_podcasts_v1';
 const STORAGE_ACTIVE_BOOK_KEY = 'audiobook_player_active_book_v1';
 const STORAGE_LAST_EMAIL_KEY = 'audiobook_player_last_email_v1';
 const STORAGE_GUEST_MODE_KEY = 'audiobook_player_guest_mode_v1';
+const PODCAST_AUTO_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
 
 const PLAYBACK_RATES = [1.0, 1.25, 1.5, 1.75, 2.0];
 
@@ -239,7 +253,7 @@ class AudiobookApp {
       profileOpen: false,
       sidebarCollapsed: false,
       rightPanelOpen: true,
-      filterSource: 'all', // 'all' | 'local' | 'drive' | 'downloaded'
+      filterSource: 'all', // 'all' | 'local' | 'drive' | 'podcasts' | 'downloaded'
       searchQuery: '',
       activeOutputDevice: initialAudioOutput.activeLabel || 'System Audio',
       activeOutputDeviceId: initialAudioOutput.activeDeviceId || 'default',
@@ -268,6 +282,17 @@ class AudiobookApp {
         loading: false,
         results: []
       },
+      podcastModal: {
+        open: false,
+        query: '',
+        activeCategory: 'trending',
+        loading: false,
+        subscribingId: '',
+        error: '',
+        results: []
+      },
+      refreshingPodcastKeys: new Set(),
+      downloadingEpisodeKeys: new Set(),
       syncProgress: {
         active: false,
         phase: 'drive',
@@ -334,6 +359,9 @@ class AudiobookApp {
     this._overlayState = {};
     this._legacyBookKeyMap = new Map();
     this._backgroundSyncTimer = null;
+    this._podcastRefreshTimer = null;
+    this._podcastSearchDebounceTimer = null;
+    this._podcastSearchReqId = 0;
     this._syncInFlight = null;
     this._lastDeviceRegisterAt = 0;
     this._lastLocalPlayAt = 0;
@@ -568,6 +596,55 @@ class AudiobookApp {
 
   _normalizeBookRecord(book) {
     if (!book || typeof book !== 'object') return book;
+    const isPodcast = Boolean(
+      book.isPodcast ||
+        book.mediaType === 'podcast' ||
+        (Array.isArray(book.sources) && book.sources.includes('podcast')) ||
+        String(book.bookKey || '').startsWith('podcast:')
+    );
+    if (isPodcast) {
+      const prevKey = String(book.bookKey || '').trim();
+      const bookKey = prevKey.startsWith('podcast:')
+        ? prevKey
+        : `podcast:${normalizeBookKey(book.title || 'podcast', book.author || '')}`;
+      const chapters = Array.isArray(book.chapters)
+        ? book.chapters.map((ch, idx) => ({
+            ...ch,
+            index: typeof ch?.index === 'number' ? ch.index : idx,
+            startSec: 0,
+            durationSec: Math.max(1, Number(ch?.durationSec) || 1800),
+            audioUrl: ch?.audioUrl || ch?.driveStreamUrl || '',
+            driveStreamUrl: ch?.driveStreamUrl || ch?.audioUrl || '',
+            offlineCached: Boolean(ch?.offlineCached)
+          }))
+        : [];
+      const hasOfflineEpisodes = Boolean(
+        book.hasOfflineEpisodes || chapters.some((c) => Boolean(c?.offlineCached))
+      );
+      const sources = Array.from(
+        new Set([...(Array.isArray(book.sources) ? book.sources : []), 'podcast'])
+      );
+      return {
+        ...book,
+        id: bookKey,
+        bookKey,
+        isPodcast: true,
+        mediaType: 'podcast',
+        series: '',
+        seriesOrder: null,
+        sources,
+        source: 'podcast',
+        chapters,
+        hasOfflineEpisodes,
+        episodeProgress:
+          book.episodeProgress && typeof book.episodeProgress === 'object'
+            ? book.episodeProgress
+            : {},
+        positionSec: book.positionSec ?? book.elapsedSec ?? 0,
+        chapterIndex: Number(book.chapterIndex || 0) || 0
+      };
+    }
+
     const normalized = normalizeBookSeriesAndChapters(book) || book;
     const prevKey = normalized.bookKey || book.bookKey || '';
     const hasTitle = Boolean(normalized.title && String(normalized.title).trim());
@@ -597,18 +674,79 @@ class AudiobookApp {
     };
   }
 
+  _loadPodcastsFromStorage() {
+    try {
+      const raw = localStorage.getItem(STORAGE_PODCASTS_KEY);
+      if (raw) {
+        const saved = JSON.parse(raw);
+        if (Array.isArray(saved) && saved.length > 0) {
+          return saved
+            .filter((b) => b && typeof b === 'object')
+            .map((b) =>
+              this._normalizeBookRecord({
+                ...b,
+                isPodcast: true,
+                mediaType: 'podcast',
+                sources: ['podcast']
+              })
+            );
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return [];
+  }
+
+  _savePodcastsToStorage(booksList = this.books) {
+    try {
+      const podcasts = (Array.isArray(booksList) ? booksList : [])
+        .filter((b) => b && (b.isPodcast || b.sources?.includes('podcast')))
+        .map((b) => this._normalizeBookRecord(b));
+      localStorage.setItem(STORAGE_PODCASTS_KEY, JSON.stringify(podcasts));
+    } catch {
+      // ignore storage quota errors
+    }
+  }
+
+  async _restorePodcastOfflineFlags(booksList = this.books) {
+    if (typeof this.audioEngine?.isEpisodeCachedOffline !== 'function') return;
+    const list = Array.isArray(booksList) ? booksList : [];
+    for (const book of list) {
+      if (!book || !(book.isPodcast || book.sources?.includes('podcast'))) continue;
+      const chapters = Array.isArray(book.chapters) ? book.chapters : [];
+      let anyCached = false;
+      for (let i = 0; i < chapters.length; i += 1) {
+        const ch = chapters[i];
+        if (!ch) continue;
+        const cached = Boolean(
+          ch.offlineCached ||
+            (await this.audioEngine.isEpisodeCachedOffline(book, i).catch(() => false))
+        );
+        ch.offlineCached = cached;
+        if (cached) anyCached = true;
+      }
+      book.hasOfflineEpisodes = anyCached;
+    }
+  }
+
   _loadBooks() {
+    let savedLibrary = [];
     try {
       const raw = localStorage.getItem(STORAGE_LIBRARY_KEY);
       if (raw) {
         const saved = JSON.parse(raw);
         if (Array.isArray(saved) && saved.length > 0) {
-          const preNormalized = saved.map((b) => this._normalizeBookRecord(b));
-          return deduplicateLibraryItems(preNormalized).map((b) => this._normalizeBookRecord(b));
+          savedLibrary = saved.map((b) => this._normalizeBookRecord(b));
         }
       }
     } catch {
       // ignore
+    }
+    const savedPodcasts = this._loadPodcastsFromStorage();
+    const combined = [...savedLibrary, ...savedPodcasts];
+    if (combined.length > 0) {
+      return deduplicateLibraryItems(combined).map((b) => this._normalizeBookRecord(b));
     }
     return [];
   }
@@ -637,6 +775,7 @@ class AudiobookApp {
         };
       });
       localStorage.setItem(STORAGE_LIBRARY_KEY, JSON.stringify(serializable));
+      this._savePodcastsToStorage(this.books);
     } catch {
       // ignore storage quota errors
     }
@@ -759,14 +898,19 @@ class AudiobookApp {
     const base = preferRemote ? rc : lc;
     const other = preferRemote ? lc : rc;
     return base.map((ch, idx) => {
-      const mate = other[idx] || {};
+      const mate =
+        (ch?.episodeId && other.find((o) => o?.episodeId === ch.episodeId)) ||
+        other[idx] ||
+        {};
       return {
         ...mate,
         ...ch,
         localUrl: ch.localUrl || mate.localUrl || '',
         localFile: ch.localFile || mate.localFile || undefined,
         driveFileId: ch.driveFileId || mate.driveFileId || '',
-        driveStreamUrl: ch.driveStreamUrl || mate.driveStreamUrl || ''
+        driveStreamUrl: ch.driveStreamUrl || mate.driveStreamUrl || '',
+        audioUrl: ch.audioUrl || mate.audioUrl || '',
+        offlineCached: Boolean(ch.offlineCached || mate.offlineCached)
       };
     });
   }
@@ -809,6 +953,7 @@ class AudiobookApp {
         originDeviceId &&
         this.syncService?.deviceId &&
         originDeviceId !== this.syncService.deviceId;
+      const isPodcast = Boolean(norm.isPodcast || l?.isPodcast || r?.isPodcast);
 
       return this._normalizeBookRecord({
         ...norm,
@@ -822,6 +967,20 @@ class AudiobookApp {
         offlineCached,
         isOffline: remoteOnlyLocal ? false : Boolean(offlineCached || hasLocalHere || norm.isOffline),
         offline: remoteOnlyLocal ? false : Boolean(offlineCached || hasLocalHere || norm.offline),
+        ...(isPodcast
+          ? {
+              isPodcast: true,
+              mediaType: 'podcast',
+              feedUrl: l?.feedUrl || r?.feedUrl || norm.feedUrl || '',
+              lastFeedRefreshAt:
+                l?.lastFeedRefreshAt || r?.lastFeedRefreshAt || norm.lastFeedRefreshAt || '',
+              episodeProgress: {
+                ...(r?.episodeProgress || {}),
+                ...(l?.episodeProgress || {}),
+                ...(norm.episodeProgress || {})
+              }
+            }
+          : {}),
         ...(mergedTracks ? { tracks: mergedTracks } : {}),
         ...(mergedChapters ? { chapters: mergedChapters } : {}),
         ...(originDeviceId ? { originDeviceId } : {}),
@@ -1234,9 +1393,31 @@ class AudiobookApp {
     }
   }
 
+  _startPodcastAutoRefresh() {
+    this._stopPodcastAutoRefresh();
+    if (this._destroyed || typeof setInterval !== 'function') return;
+    this._podcastRefreshTimer = setInterval(() => {
+      if (this._destroyed) return;
+      void this.refreshAllPodcastFeeds({ silent: true });
+    }, PODCAST_AUTO_REFRESH_INTERVAL_MS);
+    this._podcastRefreshTimer?.unref?.();
+  }
+
+  _stopPodcastAutoRefresh() {
+    if (this._podcastRefreshTimer) {
+      clearInterval(this._podcastRefreshTimer);
+      this._podcastRefreshTimer = null;
+    }
+  }
+
   destroy() {
     this._destroyed = true;
     this._stopBackgroundSync();
+    this._stopPodcastAutoRefresh();
+    if (this._podcastSearchDebounceTimer) {
+      clearTimeout(this._podcastSearchDebounceTimer);
+      this._podcastSearchDebounceTimer = null;
+    }
     if (this._statusToastTimer) {
       clearTimeout(this._statusToastTimer);
       this._statusToastTimer = null;
@@ -1423,6 +1604,7 @@ class AudiobookApp {
         chapterIndex: merged?.chapterIndex ?? normalized.chapterIndex ?? 0
       };
     });
+    await this._restorePodcastOfflineFlags(this.books);
     if (this.books.length > 0) {
       this._persistBooks();
     }
@@ -1502,6 +1684,11 @@ class AudiobookApp {
         isPlaying: Boolean(this.state.snapshot?.playing),
         isActivePlayer: Boolean(this.state.snapshot?.playing)
       });
+    }
+
+    this._startPodcastAutoRefresh();
+    if (this.books.some((b) => b && (b.isPodcast || b.sources?.includes('podcast')) && b.feedUrl)) {
+      void this.refreshAllPodcastFeeds({ silent: true });
     }
   }
 
@@ -1910,13 +2097,23 @@ class AudiobookApp {
   getFilteredBooks() {
     const q = (this.state.searchQuery || '').trim().toLowerCase();
     return this.state.books.filter((book) => {
+      const isPodcast = Boolean(book?.isPodcast || book?.sources?.includes('podcast'));
+      if (this.state.filterSource === 'podcasts' && !isPodcast) return false;
       if (this.state.filterSource === 'local' && !book.sources?.includes('local')) return false;
       if (this.state.filterSource === 'drive' && !book.sources?.includes('drive')) return false;
-      if (this.state.filterSource === 'downloaded' && !book.isOffline && !book.offlineCached) {
-        return false;
+      if (this.state.filterSource === 'downloaded') {
+        const hasOfflineEp =
+          book.hasOfflineEpisodes ||
+          (Array.isArray(book.chapters) && book.chapters.some((c) => Boolean(c?.offlineCached)));
+        if (!book.isOffline && !book.offlineCached && !hasOfflineEp) {
+          return false;
+        }
       }
       if (q) {
-        const hay = `${book.title} ${book.author} ${book.narrator || ''} ${book.series || ''}`.toLowerCase();
+        const epTitles = isPodcast
+          ? (book.chapters || []).map((c) => c?.title || '').join(' ')
+          : '';
+        const hay = `${book.title} ${book.author} ${book.narrator || ''} ${book.series || ''} ${epTitles}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -2054,7 +2251,27 @@ class AudiobookApp {
     if (book && snap.bookKey === book.bookKey) {
       book.positionSec = snap.positionSec;
       book.chapterIndex = snap.chapterIndex;
-      if (snap.durationSec > 0) {
+      if (book.isPodcast || book.sources?.includes('podcast')) {
+        const activeCh = book.chapters?.[snap.chapterIndex];
+        if (activeCh) {
+          if (snap.durationSec > 0) {
+            activeCh.durationSec = snap.durationSec;
+          }
+          if (activeCh.episodeId) {
+            if (!book.episodeProgress || typeof book.episodeProgress !== 'object') {
+              book.episodeProgress = {};
+            }
+            const dur = Math.max(1, Number(snap.durationSec || activeCh.durationSec || 1800));
+            const prevProg = book.episodeProgress[activeCh.episodeId] || {};
+            book.episodeProgress[activeCh.episodeId] = {
+              positionSec: Math.round(Number(snap.positionSec || 0)),
+              durationSec: Math.round(dur),
+              completed: Boolean(prevProg.completed || (dur > 0 && snap.positionSec >= dur - 15)),
+              updatedAt: new Date().toISOString()
+            };
+          }
+        }
+      } else if (snap.durationSec > 0) {
         book.totalDurationSec = snap.durationSec;
       }
     }
@@ -2119,8 +2336,30 @@ class AudiobookApp {
     this.render();
   }
 
-  _handleOfflineChange(bookKey, cached) {
-    const book = this.state.books.find((b) => b.bookKey === bookKey);
+  _handleOfflineChange(bookKeyOrPayload, cached) {
+    if (bookKeyOrPayload && typeof bookKeyOrPayload === 'object') {
+      const { bookKey, episodeId, chapterIndex, cached: epCached } = bookKeyOrPayload;
+      const book = this.state.books.find((b) => b.bookKey === bookKey);
+      if (book) {
+        if (Array.isArray(book.chapters)) {
+          const ch =
+            (episodeId && book.chapters.find((c) => c?.episodeId === episodeId)) ||
+            book.chapters[chapterIndex];
+          if (ch) {
+            ch.offlineCached = Boolean(epCached);
+          }
+          book.hasOfflineEpisodes = book.chapters.some((c) => Boolean(c?.offlineCached));
+        }
+        if (this._suppressOfflineRender) {
+          return;
+        }
+        this._persistBooks();
+        this.render();
+      }
+      return;
+    }
+
+    const book = this.state.books.find((b) => b.bookKey === bookKeyOrPayload);
     if (book) {
       const hasLocal = book.sources?.includes('local');
       book.offlineCached = cached;
@@ -2297,11 +2536,450 @@ class AudiobookApp {
   async toggleOfflineDownload(bookKey) {
     const book = this.state.books.find((b) => b.bookKey === bookKey);
     if (!book) return;
+    if (book.isPodcast || book.sources?.includes('podcast')) {
+      const activeIdx =
+        this.state.activeBookKey === bookKey
+          ? Number(this.state.snapshot?.chapterIndex || 0)
+          : Number(book.chapterIndex || 0);
+      await this.toggleEpisodeOffline(bookKey, activeIdx);
+      return;
+    }
     if (book.offlineCached) {
       await this.audioEngine.removeOfflineCopy(book);
     } else {
       await this.audioEngine.cacheBookOffline(book);
     }
+  }
+
+  _findSubscribedPodcastByFeedUrl(feedUrl = '') {
+    const clean = String(feedUrl || '').trim().toLowerCase().replace(/\/+$/, '');
+    if (!clean) return null;
+    return (
+      this.books.find((b) => {
+        if (!b || !(b.isPodcast || b.sources?.includes('podcast'))) return false;
+        const bFeed = String(b.feedUrl || '').trim().toLowerCase().replace(/\/+$/, '');
+        return bFeed === clean;
+      }) || null
+    );
+  }
+
+  async openPodcastModal(initialQuery = '') {
+    const cleanQuery = String(initialQuery || '').trim();
+    const defaultCat = PODCAST_CATEGORIES?.[0]?.id || 'trending';
+    const activeCategory = cleanQuery
+      ? this.state.podcastModal?.activeCategory || defaultCat
+      : this.state.podcastModal?.activeCategory || defaultCat;
+    this.state.profileOpen = false;
+    this.state.podcastModal = {
+      ...this.state.podcastModal,
+      open: true,
+      query: cleanQuery,
+      activeCategory,
+      loading: true,
+      subscribingId: '',
+      error: '',
+      results:
+        !cleanQuery && Array.isArray(this.state.podcastModal?.results) && this.state.podcastModal.results.length > 0
+          ? this.state.podcastModal.results
+          : Array.isArray(CURATED_PODCAST_DIRECTORY)
+            ? CURATED_PODCAST_DIRECTORY.slice(0, 12)
+            : []
+    };
+    this.render();
+    if (cleanQuery) {
+      await this.runPodcastSearch(cleanQuery);
+    } else {
+      await this.selectPodcastCategory(activeCategory);
+    }
+  }
+
+  closePodcastModal() {
+    if (this._podcastSearchDebounceTimer) {
+      clearTimeout(this._podcastSearchDebounceTimer);
+      this._podcastSearchDebounceTimer = null;
+    }
+    this.state.podcastModal = {
+      ...this.state.podcastModal,
+      open: false,
+      loading: false,
+      subscribingId: '',
+      error: ''
+    };
+    this.render();
+  }
+
+  async selectPodcastCategory(categoryId = 'trending') {
+    const cat =
+      (Array.isArray(PODCAST_CATEGORIES) &&
+        PODCAST_CATEGORIES.find((c) => c.id === categoryId)) ||
+      PODCAST_CATEGORIES?.[0] || { id: 'trending', label: 'Trending', query: 'top podcasts' };
+    this.state.podcastModal.activeCategory = cat.id;
+    this.state.podcastModal.query = '';
+    this.state.podcastModal.error = '';
+    this.state.podcastModal.loading = true;
+    this.render();
+
+    const reqId = (this._podcastSearchReqId = (this._podcastSearchReqId || 0) + 1);
+    const results = await searchPodcasts(cat.query).catch(() => []);
+    if (reqId !== this._podcastSearchReqId) return;
+    this.state.podcastModal.loading = false;
+    this.state.podcastModal.results = Array.isArray(results) ? results : [];
+    this.render();
+  }
+
+  async runPodcastSearch(query = '') {
+    const clean = String(query ?? '').trim();
+    this.state.podcastModal.query = clean;
+    this.state.podcastModal.error = '';
+    if (!clean) {
+      await this.selectPodcastCategory(this.state.podcastModal.activeCategory || 'trending');
+      return;
+    }
+    this.state.podcastModal.loading = true;
+    this.render();
+
+    const reqId = (this._podcastSearchReqId = (this._podcastSearchReqId || 0) + 1);
+    const results = await searchPodcasts(clean).catch(() => []);
+    if (reqId !== this._podcastSearchReqId) return;
+    this.state.podcastModal.loading = false;
+    this.state.podcastModal.results = Array.isArray(results) ? results : [];
+    this.render();
+  }
+
+  async handleSubscribePodcast(indexOrChoice) {
+    let choice =
+      typeof indexOrChoice === 'object' && indexOrChoice !== null
+        ? indexOrChoice
+        : this.state.podcastModal?.results?.[Number(indexOrChoice || 0)];
+    if (!choice && typeof indexOrChoice === 'string') {
+      choice = { feedUrl: indexOrChoice };
+    }
+    if (!choice || !choice.feedUrl) return null;
+
+    const existing = this._findSubscribedPodcastByFeedUrl(choice.feedUrl);
+    if (existing) {
+      this.state.podcastModal.open = false;
+      this.state.podcastModal.subscribingId = '';
+      this.state.detailBookKey = existing.bookKey;
+      this.state.desktopView = 'detail';
+      await this.selectBook(existing.bookKey, false);
+      if (this._isAndroidOrMobileViewport()) {
+        this.state.mobileSheetOpen = true;
+      }
+      this.render();
+      return existing;
+    }
+
+    const subKey = String(choice.id || choice.feedUrl || indexOrChoice);
+    this.state.podcastModal.subscribingId = subKey;
+    this.state.podcastModal.error = '';
+    this.render();
+
+    try {
+      const subscribedRaw = await subscribeToPodcastFromChoice(choice);
+      const podcastBook = this._normalizeBookRecord(subscribedRaw);
+      await this._restorePodcastOfflineFlags([podcastBook]);
+
+      const existingIdx = this.books.findIndex((b) => b.bookKey === podcastBook.bookKey);
+      if (existingIdx >= 0) {
+        this.books[existingIdx] = podcastBook;
+      } else {
+        this.books = [podcastBook, ...this.books];
+      }
+
+      this._persistBooks();
+      if (this._hasCloudSyncAuth()) {
+        void this._syncLibraryToCloud([podcastBook]);
+      }
+
+      this.state.podcastModal.open = false;
+      this.state.podcastModal.subscribingId = '';
+      this.state.detailBookKey = podcastBook.bookKey;
+      this.state.desktopView = 'detail';
+      await this.selectBook(podcastBook.bookKey, false);
+      if (this._isAndroidOrMobileViewport()) {
+        this.state.mobileSheetOpen = true;
+      }
+      this._startPodcastAutoRefresh();
+      this.showStatusToast(`Following ${podcastBook.title}`);
+      return podcastBook;
+    } catch (err) {
+      this.state.podcastModal.subscribingId = '';
+      this.state.podcastModal.error =
+        err?.message || 'Unable to load this podcast feed right now.';
+      this.render();
+      return null;
+    }
+  }
+
+  async unsubscribePodcast(bookKey) {
+    const target = this.books.find((b) => b.bookKey === bookKey);
+    if (!target) return;
+    const chapters = Array.isArray(target.chapters) ? target.chapters : [];
+    for (let i = 0; i < chapters.length; i += 1) {
+      if (chapters[i]?.offlineCached && typeof this.audioEngine?.removeEpisodeOffline === 'function') {
+        await this.audioEngine.removeEpisodeOffline(target, i).catch(() => null);
+      }
+    }
+
+    this.books = this.books.filter((b) => b.bookKey !== bookKey);
+    if (this.state.detailBookKey === bookKey) {
+      this.state.detailBookKey = this.books[0]?.bookKey || null;
+      if (this.state.desktopView === 'detail') {
+        this.state.desktopView = 'home';
+      }
+    }
+    if (this.state.activeBookKey === bookKey) {
+      try {
+        this.audioEngine?.pause?.();
+      } catch {
+        // ignore
+      }
+      this.state.activeBookKey = this.books[0]?.bookKey || null;
+      this.state.mobileSheetOpen = false;
+      if (this.state.activeBookKey) {
+        await this.selectBook(this.state.activeBookKey, false);
+      }
+    }
+
+    this._persistBooks();
+    if (this._hasCloudSyncAuth() && typeof this.syncService?.deleteLibraryItems === 'function') {
+      void this.syncService.deleteLibraryItems([bookKey]).catch(() => null);
+    }
+    this.showStatusToast(`Unfollowed ${target.title}`);
+  }
+
+  async refreshPodcastFeed(bookKey, { silent = false } = {}) {
+    const existingBook = this.books.find(
+      (b) => b.bookKey === bookKey && (b.isPodcast || b.sources?.includes('podcast'))
+    );
+    if (!existingBook || !existingBook.feedUrl) return null;
+
+    this.state.refreshingPodcastKeys.add(bookKey);
+    if (!silent) {
+      this.render();
+    }
+
+    try {
+      const xmlText = await fetchPodcastFeedXml(existingBook.feedUrl);
+      const parsed = parsePodcastRssXml(xmlText, existingBook.feedUrl);
+      const mergedRaw = createPodcastBookItem(parsed, existingBook);
+
+      const prevOfflineByEp = new Map(
+        (existingBook.chapters || []).map((c) => [
+          c.episodeId || c.audioUrl,
+          Boolean(c.offlineCached)
+        ])
+      );
+      if (Array.isArray(mergedRaw.chapters)) {
+        for (let i = 0; i < mergedRaw.chapters.length; i += 1) {
+          const ch = mergedRaw.chapters[i];
+          const prevFlag = prevOfflineByEp.get(ch.episodeId || ch.audioUrl) || false;
+          let engineFlag = false;
+          if (typeof this.audioEngine?.isEpisodeCachedOffline === 'function') {
+            engineFlag = Boolean(
+              await this.audioEngine.isEpisodeCachedOffline(mergedRaw, i).catch(() => false)
+            );
+          }
+          ch.offlineCached = Boolean(ch.offlineCached || prevFlag || engineFlag);
+        }
+      }
+      mergedRaw.hasOfflineEpisodes = Boolean(
+        Array.isArray(mergedRaw.chapters) && mergedRaw.chapters.some((c) => Boolean(c?.offlineCached))
+      );
+
+      const updatedBook = this._normalizeBookRecord(mergedRaw);
+      const idx = this.books.findIndex((b) => b.bookKey === bookKey);
+      if (idx >= 0) {
+        this.books[idx] = updatedBook;
+      }
+      if (this.audioEngine?.currentBook?.bookKey === bookKey) {
+        this.audioEngine.currentBook = updatedBook;
+        if (typeof updatedBook.chapterIndex === 'number') {
+          this.audioEngine.chapterIndex = updatedBook.chapterIndex;
+          this.state.snapshot = {
+            ...this.state.snapshot,
+            chapterIndex: updatedBook.chapterIndex
+          };
+        }
+      }
+
+      this._persistBooks();
+      if (this._hasCloudSyncAuth() && typeof this.syncService?.syncLibraryItems === 'function') {
+        void this.syncService.syncLibraryItems([updatedBook]).catch(() => null);
+      }
+      if (!silent) {
+        this.showStatusToast(`Refreshed ${updatedBook.title}`);
+      }
+      return updatedBook;
+    } catch {
+      if (!silent) {
+        this.showStatusToast(`Could not refresh ${existingBook.title}`);
+      }
+      return existingBook;
+    } finally {
+      this.state.refreshingPodcastKeys.delete(bookKey);
+      this.render();
+    }
+  }
+
+  async refreshAllPodcastFeeds({ silent = true } = {}) {
+    const podcasts = this.books.filter(
+      (b) => b && (b.isPodcast || b.sources?.includes('podcast')) && b.feedUrl
+    );
+    if (podcasts.length === 0) return [];
+    const results = await Promise.all(
+      podcasts.map((p) => this.refreshPodcastFeed(p.bookKey, { silent: true }).catch(() => null))
+    );
+    if (!silent) {
+      this.showStatusToast(
+        `Refreshed ${podcasts.length} podcast${podcasts.length === 1 ? '' : 's'}`
+      );
+    }
+    return results.filter(Boolean);
+  }
+
+  getRecentPodcastEpisodes(limit = 8) {
+    const podcasts = (this.books || []).filter(
+      (b) => b && (b.isPodcast || b.sources?.includes('podcast'))
+    );
+    const episodes = [];
+    for (const podcast of podcasts) {
+      const chapters = Array.isArray(podcast.chapters) ? podcast.chapters : [];
+      chapters.slice(0, 10).forEach((ch, idx) => {
+        const chapterIndex = typeof ch?.index === 'number' ? ch.index : idx;
+        const pubMs = ch?.publishedAt ? Date.parse(ch.publishedAt) || 0 : 0;
+        const epProg = ch?.episodeId ? podcast.episodeProgress?.[ch.episodeId] : null;
+        episodes.push({
+          book: podcast,
+          bookKey: podcast.bookKey,
+          podcastTitle: podcast.title,
+          podcastAuthor: podcast.author,
+          coverUrl: ch?.coverUrl || podcast.coverUrl || '',
+          chapter: ch,
+          chapterIndex,
+          episodeId: ch?.episodeId || `${podcast.bookKey}::${chapterIndex}`,
+          title: ch?.title || `Episode ${chapterIndex + 1}`,
+          description: ch?.description || '',
+          durationSec: Math.max(1, Number(ch?.durationSec) || 1800),
+          publishedAt: ch?.publishedAt || '',
+          publishedAtMs: pubMs,
+          offlineCached: Boolean(ch?.offlineCached),
+          completed: Boolean(epProg?.completed),
+          positionSec: Number(epProg?.positionSec || 0)
+        });
+      });
+    }
+    episodes.sort((a, b) => {
+      if (b.publishedAtMs !== a.publishedAtMs) return b.publishedAtMs - a.publishedAtMs;
+      return a.chapterIndex - b.chapterIndex;
+    });
+    return episodes.slice(0, Math.max(1, Number(limit) || 8));
+  }
+
+  async playPodcastEpisode(bookKey, chapterIndex = 0) {
+    const book = this.books.find((b) => b.bookKey === bookKey);
+    if (!book) return;
+    const idx = Math.max(0, Number(chapterIndex || 0));
+    const isSameBook = this.state.activeBookKey === bookKey && this.audioEngine?.currentBook?.bookKey === bookKey;
+    const isSameChapter = isSameBook && Number(this.state.snapshot?.chapterIndex || 0) === idx;
+
+    if (isSameChapter) {
+      await this.audioEngine.togglePlay();
+      this.state.snapshot = this.audioEngine.getSnapshot();
+      this.render();
+      return;
+    }
+
+    if (!isSameBook) {
+      book.chapterIndex = idx;
+      const targetEp = book.chapters?.[idx];
+      const savedEp = targetEp?.episodeId ? book.episodeProgress?.[targetEp.episodeId] : null;
+      book.positionSec = savedEp && !savedEp.completed ? Number(savedEp.positionSec || 0) : 0;
+      await this.selectBook(bookKey, false);
+    } else if (typeof this.audioEngine?.setChapter === 'function') {
+      await this.audioEngine.setChapter(idx);
+    } else {
+      await this.audioEngine.jumpToChapter(idx);
+    }
+    await this.audioEngine.play();
+    this.state.snapshot = this.audioEngine.getSnapshot();
+    this._syncMediaSessionMetadata();
+    this._syncCurrentDevicePlaybackState({ isPlaying: true, isActivePlayer: true });
+    this.syncService?.broadcastPlaybackState?.({
+      isPlaying: true,
+      bookKey: book.bookKey,
+      chapterIndex: this.state.snapshot.chapterIndex,
+      positionSec: this.state.snapshot.positionSec
+    });
+    this._persistBooks();
+    this.render();
+  }
+
+  async toggleEpisodeOffline(bookKey, chapterIndex = 0) {
+    const book = this.books.find((b) => b.bookKey === bookKey);
+    if (!book) return;
+    const idx = Math.max(0, Number(chapterIndex || 0));
+    const ch = book.chapters?.[idx];
+    if (!ch) return;
+
+    const dlKey = `${book.bookKey}::${idx}`;
+    if (this.state.downloadingEpisodeKeys.has(dlKey)) return;
+
+    if (ch.offlineCached) {
+      if (typeof this.audioEngine?.removeEpisodeOffline === 'function') {
+        await this.audioEngine.removeEpisodeOffline(book, idx);
+      } else {
+        ch.offlineCached = false;
+        book.hasOfflineEpisodes = (book.chapters || []).some((c) => Boolean(c?.offlineCached));
+        this._persistBooks();
+        this.render();
+      }
+      return;
+    }
+
+    this.state.downloadingEpisodeKeys.add(dlKey);
+    this.render();
+    try {
+      if (typeof this.audioEngine?.cacheEpisodeOffline === 'function') {
+        await this.audioEngine.cacheEpisodeOffline(book, idx);
+      } else {
+        ch.offlineCached = true;
+        book.hasOfflineEpisodes = true;
+      }
+      this._persistBooks();
+    } finally {
+      this.state.downloadingEpisodeKeys.delete(dlKey);
+      this.render();
+    }
+  }
+
+  _formatEpisodeDate(publishedAt = '') {
+    if (!publishedAt) return '';
+    const ms = Date.parse(String(publishedAt));
+    if (!ms || !Number.isFinite(ms)) return '';
+    const date = new Date(ms);
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const startOfTarget = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+    const diffDays = Math.round((startOfToday - startOfTarget) / (24 * 3600 * 1000));
+    if (diffDays === 0) return 'Today';
+    if (diffDays === 1) return 'Yesterday';
+    if (diffDays > 1 && diffDays < 7) return `${diffDays}d ago`;
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const m = months[date.getMonth()] || '';
+    return date.getFullYear() === now.getFullYear()
+      ? `${m} ${date.getDate()}`
+      : `${m} ${date.getDate()}, ${date.getFullYear()}`;
+  }
+
+  _formatEpisodeDuration(durationSec = 0) {
+    const sec = Math.max(0, Math.round(Number(durationSec) || 0));
+    if (sec <= 0) return '30m';
+    const hrs = Math.floor(sec / 3600);
+    const mins = Math.max(1, Math.round((sec % 3600) / 60));
+    if (hrs > 0) return `${hrs}h ${mins}m`;
+    return `${mins}m`;
   }
 
   _mergeEnrichedBook(existing, enriched) {
@@ -2370,7 +3048,7 @@ class AudiobookApp {
   async _enrichSingleBookInBackground(bookKey) {
     if (!bookKey || this._sessionEnrichedKeys.has(bookKey)) return;
     const book = this.state.books.find((b) => b.bookKey === bookKey);
-    if (!book) return;
+    if (!book || book.isPodcast || book.sources?.includes('podcast')) return;
 
     const hasGenericChapters =
       !book.chapters?.length ||
@@ -2413,7 +3091,9 @@ class AudiobookApp {
     }
     this._isAutoEnriching = true;
     try {
-      const candidates = this.books.filter((b) => needsAutomatedEnrichment(b));
+      const candidates = this.books.filter(
+        (b) => !b?.isPodcast && !b?.sources?.includes('podcast') && needsAutomatedEnrichment(b)
+      );
       for (let i = 0; i < candidates.length; i += 2) {
         const batch = candidates.slice(i, i + 2);
         const updatedBatch = [];
@@ -2633,7 +3313,7 @@ class AudiobookApp {
   }
 
   _getBookSeriesKey(book) {
-    if (!book) return '';
+    if (!book || book.isPodcast || book.sources?.includes('podcast')) return '';
     const parsed = parseSeriesAndOrder(
       book.title || '',
       book.author || '',
@@ -2659,13 +3339,17 @@ class AudiobookApp {
     return stripped || t;
   }
 
+  _groupBooksBySeries(books = []) {
+    return this._groupBooksByFranchise(books);
+  }
+
   _groupBooksByFranchise(books = []) {
     const normalizedList = books.map((b) => this._normalizeBookRecord(b));
 
     // Count shared base prefixes across the full library so filtering stays consistent
     const prefixCounts = new Map();
     for (const b of this.books) {
-      if (b.series) continue;
+      if (b.series || b.isPodcast || b.sources?.includes('podcast')) continue;
       const prefix = this._extractSeriesBasePrefix(b.title);
       const key = prefix.toLowerCase();
       if (key.length >= 3) {
@@ -2677,6 +3361,13 @@ class AudiobookApp {
     const franchiseMap = new Map();
 
     for (const book of normalizedList) {
+      if (book.isPodcast || book.sources?.includes('podcast')) {
+        entries.push({
+          type: 'book',
+          book: { ...book, series: '', seriesOrder: null }
+        });
+        continue;
+      }
       const parsed = parseSeriesAndOrder(
         book.title || '',
         book.author || '',
@@ -3422,6 +4113,9 @@ class AudiobookApp {
       );
       return badges.join('');
     }
+    if (book?.isPodcast || sources.includes('podcast')) {
+      badges.push(`<span class="inline-flex items-center shrink-0" title="Podcast">${FLUENT_3D_PODCAST(size)}</span>`);
+    }
     if (sources.includes('local')) {
       badges.push(`<span class="inline-flex items-center shrink-0" title="Local">${FLUENT_3D_FOLDER(size)}</span>`);
     }
@@ -3435,7 +4129,15 @@ class AudiobookApp {
     if (this._isRemoteLocalOnlyBook(book)) {
       return '';
     }
-    if (book?.isOffline || book?.offlineCached || book?.sources?.includes('local')) {
+    const hasOfflineEp =
+      book?.hasOfflineEpisodes ||
+      (Array.isArray(book?.chapters) && book.chapters.some((c) => Boolean(c?.offlineCached)));
+    if (
+      book?.isOffline ||
+      book?.offlineCached ||
+      hasOfflineEp ||
+      book?.sources?.includes('local')
+    ) {
       return `<span class="inline-flex items-center shrink-0">${ICON_DOWNLOADED(size)}</span>`;
     }
     return '';
@@ -3546,6 +4248,12 @@ class AudiobookApp {
           </button>
           <button data-action="connect-drive" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span class="truncate">Sync Google Drive</span>
+          </button>
+          <button data-action="open-podcast-modal" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+            <span class="inline-flex items-center gap-2 truncate">
+              ${FLUENT_3D_PODCAST(14)}
+              <span>Find Podcasts</span>
+            </span>
           </button>
           ${
             this._getDriveSyncedBooksStats().totalDriveCount > 0
@@ -3921,6 +4629,10 @@ class AudiobookApp {
             </button>
             <button data-action="connect-drive" class="btn-press px-4 py-2.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white text-xs font-semibold">
               Sync Google Drive
+            </button>
+            <button data-action="open-podcast-modal" class="btn-press inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white text-xs font-semibold">
+              ${FLUENT_3D_PODCAST(14)}
+              <span>+ Find Podcasts</span>
             </button>
           </div>
         </div>
@@ -4534,7 +5246,183 @@ class AudiobookApp {
     return `<div class="space-y-1">${mainBtn}${subHtml}</div>`;
   }
 
+  _renderPodcastEpisodesList(book, isCurrent, compact = false) {
+    const chapters = Array.isArray(book?.chapters) ? book.chapters : [];
+    if (chapters.length === 0) {
+      return `<div class="text-xs text-[var(--text-muted)] py-2">No episodes available</div>`;
+    }
+
+    return chapters
+      .map((ch, idx) => {
+        const chIdx = typeof ch?.index === 'number' ? ch.index : idx;
+        const isActiveEp = isCurrent && Number(this.state.snapshot?.chapterIndex || 0) === chIdx;
+        const isPlayingEp = isActiveEp && Boolean(this.state.snapshot?.playing);
+        const epProg = ch?.episodeId ? book.episodeProgress?.[ch.episodeId] : null;
+        const isCompleted = Boolean(epProg?.completed);
+        const dlKey = `${book.bookKey}::${chIdx}`;
+        const isDownloading = this.state.downloadingEpisodeKeys.has(dlKey);
+        const dateLabel = this._formatEpisodeDate(ch?.publishedAt);
+        const durLabel = this._formatEpisodeDuration(ch?.durationSec);
+        const metaText = [dateLabel, durLabel].filter(Boolean).join(' • ');
+        const descText = String(ch?.description || '').trim();
+
+        return `
+          <div class="surface-card rounded-2xl ${compact ? 'p-2.5' : 'p-3.5'} flex items-start gap-3 min-w-0 ${
+            isActiveEp ? 'border border-[#1ed760]/50 bg-[#1ed760]/10' : ''
+          }">
+            <button type="button" data-action="play-podcast-episode" data-book-key="${escapeHtml(book.bookKey)}" data-chapter-index="${chIdx}" aria-label="${isPlayingEp ? 'Pause episode' : 'Play episode'}" class="play-fab ${compact ? 'w-8 h-8' : 'w-9 h-9'} shrink-0 mt-0.5">
+              ${isPlayingEp ? ICON_PAUSE(14) : ICON_PLAY(14)}
+            </button>
+            <button type="button" data-action="play-podcast-episode" data-book-key="${escapeHtml(book.bookKey)}" data-chapter-index="${chIdx}" class="min-w-0 flex-1 text-left space-y-1">
+              <div class="flex items-center gap-2 min-w-0">
+                <span class="text-xs sm:text-sm font-semibold truncate ${
+                  isActiveEp ? 'text-[#1ed760]' : 'text-white'
+                }">${escapeHtml(ch?.title || `Episode ${chIdx + 1}`)}</span>
+                ${
+                  isCompleted
+                    ? `<span class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-[#1ed760]/15 text-[#1ed760] text-[10px] font-bold shrink-0">✓ Played</span>`
+                    : ''
+                }
+              </div>
+              <div class="text-[11px] text-[var(--text-secondary)] truncate">${escapeHtml(metaText)}</div>
+              ${
+                descText
+                  ? `<p class="text-[11px] text-[var(--text-muted)] line-clamp-2 leading-relaxed">${escapeHtml(descText)}</p>`
+                  : ''
+              }
+            </button>
+            <button type="button" data-action="toggle-episode-offline" data-book-key="${escapeHtml(book.bookKey)}" data-chapter-index="${chIdx}" aria-label="${ch?.offlineCached ? 'Saved offline' : 'Download episode'}" title="${ch?.offlineCached ? 'Saved offline — click to remove' : 'Download episode for offline playback'}" class="btn-press p-2 rounded-full hover:bg-white/10 shrink-0 ${
+              ch?.offlineCached ? 'text-[#1ed760]' : 'text-[var(--text-secondary)] hover:text-white'
+            }">
+              ${
+                ch?.offlineCached
+                  ? ICON_DOWNLOADED_CIRCLE(14)
+                  : isDownloading
+                    ? `<span class="inline-block w-3.5 h-3.5 rounded-full border-2 border-[#1ed760] border-t-transparent animate-spin"></span>`
+                    : ICON_DOWNLOAD_CIRCLE(16)
+              }
+            </button>
+          </div>
+        `;
+      })
+      .join('');
+  }
+
+  _renderNewEpisodesShelf(variant = 'desktop') {
+    if (this.state.filterSource !== 'all' && this.state.filterSource !== 'podcasts') {
+      return '';
+    }
+    const recentEpisodes = this.getRecentPodcastEpisodes(8);
+    if (recentEpisodes.length === 0) return '';
+    const activeBook = this.getActiveBook();
+
+    const cardsHtml = recentEpisodes
+      .map((ep) => {
+        const isCurrentEp =
+          activeBook?.bookKey === ep.bookKey &&
+          Number(this.state.snapshot?.chapterIndex || 0) === ep.chapterIndex;
+        const isPlayingEp = isCurrentEp && Boolean(this.state.snapshot?.playing);
+        const dlKey = `${ep.bookKey}::${ep.chapterIndex}`;
+        const isDownloading = this.state.downloadingEpisodeKeys.has(dlKey);
+        const dateLabel = this._formatEpisodeDate(ep.publishedAt);
+        const durLabel = this._formatEpisodeDuration(ep.durationSec);
+        const metaText = [ep.podcastTitle, dateLabel, durLabel].filter(Boolean).join(' • ');
+
+        return `
+          <div class="${
+            variant === 'mobile' ? 'w-72 shrink-0' : 'min-w-0'
+          } surface-card rounded-2xl p-3 flex items-center gap-3 overflow-hidden min-w-0 ${
+            isCurrentEp ? 'ring-1 ring-[#1ed760]/50' : ''
+          }">
+            <button type="button" data-action="open-detail" data-book="${escapeHtml(ep.bookKey)}" class="w-14 h-14 rounded-xl overflow-hidden shrink-0">
+              ${this._renderCoverImg(ep.book)}
+            </button>
+            <button type="button" data-action="play-podcast-episode" data-book-key="${escapeHtml(ep.bookKey)}" data-chapter-index="${ep.chapterIndex}" class="min-w-0 flex-1 text-left space-y-1">
+              <div class="text-xs sm:text-sm font-semibold text-white truncate">${escapeHtml(ep.title)}</div>
+              <div class="text-[11px] text-[var(--text-secondary)] truncate">${escapeHtml(metaText)}</div>
+            </button>
+            <div class="flex items-center gap-1 shrink-0">
+              <button type="button" data-action="toggle-episode-offline" data-book-key="${escapeHtml(ep.bookKey)}" data-chapter-index="${ep.chapterIndex}" aria-label="${ep.offlineCached ? 'Saved offline' : 'Download episode'}" class="btn-press p-1.5 rounded-full hover:bg-white/10 ${
+                ep.offlineCached ? 'text-[#1ed760]' : 'text-[var(--text-secondary)] hover:text-white'
+              }">
+                ${
+                  ep.offlineCached
+                    ? ICON_DOWNLOADED_CIRCLE(14)
+                    : isDownloading
+                      ? `<span class="inline-block w-3.5 h-3.5 rounded-full border-2 border-[#1ed760] border-t-transparent animate-spin"></span>`
+                      : ICON_DOWNLOAD_CIRCLE(16)
+                }
+              </button>
+              <button type="button" data-action="play-podcast-episode" data-book-key="${escapeHtml(ep.bookKey)}" data-chapter-index="${ep.chapterIndex}" aria-label="${isPlayingEp ? 'Pause episode' : 'Play episode'}" class="play-fab w-8 h-8 shrink-0">
+                ${isPlayingEp ? ICON_PAUSE(14) : ICON_PLAY(14)}
+              </button>
+            </div>
+          </div>
+        `;
+      })
+      .join('');
+
+    if (variant === 'mobile') {
+      return `
+        <section class="space-y-3">
+          <h2 class="text-lg font-bold tracking-tight text-[var(--text-primary)]">New Episodes</h2>
+          <div class="flex gap-3 overflow-x-auto pb-1 no-scrollbar">
+            ${cardsHtml}
+          </div>
+        </section>
+      `;
+    }
+
+    return `
+      <section class="space-y-3">
+        <h2 class="text-xl font-bold tracking-tight text-white">New Episodes</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+          ${cardsHtml}
+        </div>
+      </section>
+    `;
+  }
+
+  _renderPodcastEmptyStateCard() {
+    const q = String(this.state.searchQuery || '').trim();
+    return `
+      <div class="flex-1 min-h-[280px] flex items-center justify-center p-4">
+        <div class="w-full max-w-md surface-card rounded-3xl p-7 text-center space-y-4 border border-[var(--border-subtle)]">
+          <div class="w-14 h-14 mx-auto rounded-2xl bg-white/5 border border-[var(--border-subtle)] flex items-center justify-center">
+            ${FLUENT_3D_PODCAST(28)}
+          </div>
+          <div class="space-y-1">
+            <h2 class="text-lg font-bold text-white">${
+              q ? `No followed podcasts match '${escapeHtml(q)}'` : 'No podcasts followed yet'
+            }</h2>
+          </div>
+          <div class="flex flex-wrap items-center justify-center gap-2.5 pt-1">
+            ${
+              q
+                ? `<button type="button" data-action="open-podcast-modal" data-query="${escapeHtml(q)}" class="btn-press inline-flex items-center gap-2 px-4 py-2.5 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold">
+                    ${ICON_SEARCH(14)}
+                    <span>Search '${escapeHtml(q)}' in Live Podcasts</span>
+                  </button>`
+                : ''
+            }
+            <button type="button" data-action="open-podcast-modal" class="btn-press inline-flex items-center gap-1.5 px-4 py-2.5 rounded-full ${
+              q
+                ? 'surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white font-semibold'
+                : 'bg-[#1ed760] text-[#050506] font-bold'
+            } text-xs">
+              ${ICON_PODCAST(14)}
+              <span>+ Find Podcasts</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   _renderChaptersHierarchy(book, isCurrent, compact = false) {
+    if (book?.isPodcast || book?.sources?.includes('podcast')) {
+      return this._renderPodcastEpisodesList(book, isCurrent, compact);
+    }
     const chapters = Array.isArray(book?.chapters) ? book.chapters : [];
     if (chapters.length === 0) {
       return `<div class="text-xs text-[var(--text-muted)] py-2">No chapters available</div>`;
@@ -4619,7 +5507,12 @@ class AudiobookApp {
             ${chip('all', 'All')}
             ${chip('local', 'Local')}
             ${chip('drive', 'Drive')}
+            ${chip('podcasts', 'Podcasts')}
             ${chip('downloaded', 'Saved')}
+            <button data-action="open-podcast-modal" title="Find Podcasts" class="btn-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-full surface-card text-xs font-medium text-[var(--text-primary)] whitespace-nowrap">
+              ${FLUENT_3D_PODCAST(13)}
+              <span>+ Podcast</span>
+            </button>
             <button data-action="toggle-group-series" title="Group by Series" class="btn-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-medium whitespace-nowrap ${
               this.state.groupBySeries
                 ? 'bg-[#1ed760]/20 text-[#1ed760] border border-[#1ed760]/40'
@@ -4669,14 +5562,24 @@ class AudiobookApp {
         <div id="mobileMainScroll" class="flex-1 overflow-y-auto px-4 pb-24 mobile-safe-scroll-bottom space-y-6 min-w-0 flex flex-col">
           ${this._renderContinueFromDeviceCard()}
           ${
-            this.books.length === 0
-              ? this._renderEmptyLibraryCard()
-              : filtered.length === 0
-                ? `<div class="flex-1 flex flex-col items-center justify-center text-center py-12 space-y-3">
-                    <div class="text-sm font-semibold text-white">No matching audiobooks</div>
-                    <button data-action="clear-filters" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-[#1ed760]">Clear filters</button>
-                  </div>`
-                : `
+            this.state.filterSource === 'podcasts' && filtered.length === 0
+              ? this._renderPodcastEmptyStateCard()
+              : this.books.length === 0
+                ? this._renderEmptyLibraryCard()
+                : filtered.length === 0
+                  ? `<div class="flex-1 flex flex-col items-center justify-center text-center py-12 space-y-3">
+                      <div class="text-sm font-semibold text-white">No matching audiobooks</div>
+                      ${
+                        this.state.searchQuery.trim()
+                          ? `<button data-action="open-podcast-modal" data-query="${escapeHtml(this.state.searchQuery.trim())}" class="btn-press inline-flex items-center gap-2 px-4 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold">
+                              ${ICON_SEARCH(14)}
+                              <span>Search '${escapeHtml(this.state.searchQuery.trim())}' in Live Podcasts</span>
+                            </button>`
+                          : ''
+                      }
+                      <button data-action="clear-filters" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-[#1ed760]">Clear filters</button>
+                    </div>`
+                  : `
           <!-- 2-Column Quick-Resume Grid -->
           <div class="grid grid-cols-2 gap-2.5">
             ${filtered
@@ -4696,6 +5599,8 @@ class AudiobookApp {
               )
               .join('')}
           </div>
+
+          ${this._renderNewEpisodesShelf('mobile')}
 
           <!-- Jump back in (zero subtitle!) -->
           <section class="space-y-3">
@@ -4856,10 +5761,24 @@ class AudiobookApp {
         </div>
 
         ${
+          book.isPodcast || book.sources?.includes('podcast')
+            ? `<div class="mt-4 flex items-center justify-end gap-2">
+                <button type="button" data-action="refresh-podcast-feed" data-book-key="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full surface-card text-xs font-semibold text-white">
+                  ${ICON_REFRESH(13)}
+                  <span>${this.state.refreshingPodcastKeys.has(book.bookKey) ? 'Refreshing...' : 'Refresh'}</span>
+                </button>
+                <button type="button" data-action="unsubscribe-podcast" data-book-key="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full surface-card text-xs font-semibold text-red-300">
+                  <span>Unfollow</span>
+                </button>
+              </div>`
+            : ''
+        }
+
+        ${
           chapters.length > 0
             ? `<div class="mt-5 space-y-2">
                 <button data-action="toggle-mobile-chapters" class="w-full flex items-center justify-between text-xs font-semibold text-[var(--text-secondary)]">
-                  <span>Chapters (${chapters.length})</span>
+                  <span>${book.isPodcast || book.sources?.includes('podcast') ? 'Episodes' : 'Chapters'} (${chapters.length})</span>
                   <span>${ICON_CHEVRON(this.state.mobileChaptersExpanded ? 'down' : 'right', 14)}</span>
                 </button>
                 ${
@@ -4931,6 +5850,10 @@ class AudiobookApp {
                               </button>`
                             : ''
                         }
+                        <button data-action="open-podcast-modal" aria-label="Find Podcasts" title="Find Podcasts" class="btn-press inline-flex items-center gap-1 px-2 py-1 rounded-lg surface-card hover:bg-white/10 text-[10px] font-semibold text-white shrink-0">
+                          ${FLUENT_3D_PODCAST(13)}
+                          <span>+ Podcast</span>
+                        </button>
                         <button data-action="trigger-local-folder" aria-label="Add Local Folder" title="Add Local Folder" class="btn-press p-1.5 rounded-lg hover:bg-white/10 text-[var(--text-secondary)] hover:text-white shrink-0">
                           ${FLUENT_3D_FOLDER(16)}
                         </button>
@@ -4941,15 +5864,15 @@ class AudiobookApp {
                 sidebarCollapsed
                   ? ''
                   : `<div class="flex items-center justify-between gap-1 pt-1">
-                      <div class="flex items-center gap-1 min-w-0">
-                        ${['all', 'local', 'drive']
+                      <div class="flex items-center gap-1 overflow-x-auto no-scrollbar min-w-0">
+                        ${['all', 'local', 'drive', 'podcasts', 'downloaded']
                           .map(
                             (f) =>
-                              `<button data-action="set-filter" data-filter="${f}" class="btn-press px-2.5 py-1 rounded-full text-[11px] font-medium capitalize ${
+                              `<button data-action="set-filter" data-filter="${f}" class="btn-press px-2.5 py-1 rounded-full text-[11px] font-medium capitalize whitespace-nowrap ${
                                 filterSource === f
                                   ? 'bg-[#1ed760] text-[#050506]'
                                   : 'surface-card text-[var(--text-secondary)] hover:text-white'
-                              }">${f}</button>`
+                              }">${f === 'downloaded' ? 'Saved' : f}</button>`
                           )
                           .join('')}
                       </div>
@@ -4975,6 +5898,9 @@ class AudiobookApp {
                         <button data-action="trigger-local-files" class="btn-press w-full py-1.5 px-3 rounded-full surface-card text-[11px] font-semibold text-white hover:bg-white/10">
                           + Add Audio Files
                         </button>
+                        <button data-action="open-podcast-modal" class="btn-press w-full py-1.5 px-3 rounded-full surface-card text-[11px] font-semibold text-white hover:bg-white/10">
+                          + Find Podcasts
+                        </button>
                       </div>`
                   : sidebarCollapsed
                     ? filtered
@@ -4997,9 +5923,19 @@ class AudiobookApp {
           <!-- Center Main Feed / Book Detail -->
           <section class="flex-1 min-w-0 surface-panel ambient-surface rounded-2xl flex flex-col overflow-hidden">
             <div class="px-5 py-3 flex items-center justify-between gap-3 border-b border-[var(--border-subtle)]">
-              <div class="relative flex-1 max-w-md min-w-0">
-                <span class="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)] pointer-events-none">${ICON_SEARCH(15)}</span>
-                <input id="desktopSearchInput" data-action="search-input" type="search" value="${escapeHtml(searchQuery)}" placeholder="Search audiobooks, authors..." class="w-full pl-9 pr-3 py-1.5 rounded-full bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
+              <div class="flex items-center gap-2 flex-1 max-w-xl min-w-0">
+                <div class="relative flex-1 max-w-md min-w-0">
+                  <span class="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)] pointer-events-none">${ICON_SEARCH(15)}</span>
+                  <input id="desktopSearchInput" data-action="search-input" type="search" value="${escapeHtml(searchQuery)}" placeholder="Search audiobooks, podcasts, authors..." class="w-full pl-9 pr-3 py-1.5 rounded-full bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
+                </div>
+                ${
+                  filterSource === 'podcasts' && searchQuery.trim()
+                    ? `<button type="button" data-action="open-podcast-modal" data-query="${escapeHtml(searchQuery.trim())}" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold shrink-0 whitespace-nowrap">
+                        ${ICON_SEARCH(13)}
+                        <span>Search '${escapeHtml(searchQuery.trim())}' in Live Podcasts</span>
+                      </button>`
+                    : ''
+                }
               </div>
               <div class="flex items-center gap-2 shrink-0">
                 ${
@@ -5057,8 +5993,8 @@ class AudiobookApp {
               </div>
 
               <div class="surface-card rounded-xl p-3 space-y-1.5 min-w-0">
-                <div class="text-[11px] font-semibold text-[var(--text-secondary)]">Chapter</div>
-                <div class="text-xs font-medium text-white truncate">${escapeHtml(activeChapter?.title || 'Chapter 1')}</div>
+                <div class="text-[11px] font-semibold text-[var(--text-secondary)]">${activeBook.isPodcast || activeBook.sources?.includes('podcast') ? 'Episode' : 'Chapter'}</div>
+                <div class="text-xs font-medium text-white truncate">${escapeHtml(activeChapter?.title || (activeBook.isPodcast ? 'Episode 1' : 'Chapter 1'))}</div>
               </div>
 
               <div class="space-y-2 min-w-0">
@@ -5203,14 +6139,26 @@ class AudiobookApp {
 
   _renderDesktopHome(filtered, activeBook) {
     const continueCard = this._renderContinueFromDeviceCard();
+    if (this.state.filterSource === 'podcasts' && filtered.length === 0) {
+      return `${continueCard}${this._renderPodcastEmptyStateCard()}`;
+    }
     if (this.books.length === 0) {
       return `${continueCard}${this._renderEmptyLibraryCard()}`;
     }
     if (filtered.length === 0) {
+      const q = String(this.state.searchQuery || '').trim();
       return `
         ${continueCard}
         <div class="flex-1 min-h-[280px] flex flex-col items-center justify-center text-center space-y-3">
           <div class="text-sm font-semibold text-white">No matching audiobooks</div>
+          ${
+            q
+              ? `<button data-action="open-podcast-modal" data-query="${escapeHtml(q)}" class="btn-press inline-flex items-center gap-2 px-4 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold">
+                  ${ICON_SEARCH(14)}
+                  <span>Search '${escapeHtml(q)}' in Live Podcasts</span>
+                </button>`
+              : ''
+          }
           <button data-action="clear-filters" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-medium text-[#1ed760]">Clear filters</button>
         </div>
       `;
@@ -5244,6 +6192,8 @@ class AudiobookApp {
           )
           .join('')}
       </div>
+
+      ${this._renderNewEpisodesShelf('desktop')}
 
       <!-- Jump back in (zero subtitle!) -->
       <section class="space-y-3">
@@ -5300,6 +6250,8 @@ class AudiobookApp {
     const activeBook = this.getActiveBook();
     const isCurrent = activeBook?.bookKey === book.bookKey;
     const isEnriching = this.state.enrichingBookKey === book.bookKey;
+    const isPodcast = Boolean(book.isPodcast || book.sources?.includes('podcast'));
+    const isRefreshing = this.state.refreshingPodcastKeys.has(book.bookKey);
 
     return `
       <div class="space-y-6 min-w-0">
@@ -5315,14 +6267,14 @@ class AudiobookApp {
               ${this._renderSourceBadges(book, 16)}
               ${this._renderDownloadedIcon(book, 14)}
               ${
-                book.series
+                !isPodcast && book.series
                   ? `<span class="series-order-pill">${escapeHtml(book.series)}${book.seriesOrder != null ? ` #${book.seriesOrder}` : ''}</span>`
                   : ''
               }
             </div>
             <h1 class="text-2xl sm:text-3xl font-extrabold text-white clamp-2 leading-tight">${escapeHtml(book.title)}</h1>
             <div class="text-sm text-[var(--text-secondary)] truncate">
-              ${escapeHtml(book.author)}${book.narrator ? ` • Narrated by ${escapeHtml(book.narrator)}` : ''}
+              ${escapeHtml(book.author)}${!isPodcast && book.narrator ? ` • Narrated by ${escapeHtml(book.narrator)}` : ''}
             </div>
             ${
               book.description
@@ -5334,28 +6286,141 @@ class AudiobookApp {
                 ${isCurrent && this.state.snapshot.playing ? ICON_PAUSE(16) : ICON_PLAY(16)}
                 <span>${isCurrent && this.state.snapshot.playing ? 'Pause' : 'Play'}</span>
               </button>
-              <button data-action="toggle-download" data-book="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">
-                ${book.offlineCached ? ICON_DOWNLOADED(14) : ICON_DOWNLOAD_CIRCLE(15)}
-                <span>${book.offlineCached ? 'Saved' : 'Download'}</span>
-              </button>
-              <button data-action="open-cover-search" data-book="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">
-                ${ICON_COVER_IMAGE(15)}
-                <span>Cover</span>
-              </button>
-              <button data-action="auto-match-tags" data-book="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">
-                ${ICON_SPARKLES(15, 'text-[#60a5fa]')}
-                <span>${isEnriching ? 'Matching...' : 'Auto-Match'}</span>
-              </button>
+              ${
+                isPodcast
+                  ? `<button type="button" data-action="refresh-podcast-feed" data-book-key="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">
+                      ${ICON_REFRESH(14)}
+                      <span>${isRefreshing ? 'Refreshing...' : 'Refresh'}</span>
+                    </button>
+                    <button type="button" data-action="unsubscribe-podcast" data-book-key="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-red-300 hover:bg-red-500/15">
+                      <span>Unfollow</span>
+                    </button>`
+                  : `<button data-action="toggle-download" data-book="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">
+                      ${book.offlineCached ? ICON_DOWNLOADED(14) : ICON_DOWNLOAD_CIRCLE(15)}
+                      <span>${book.offlineCached ? 'Saved' : 'Download'}</span>
+                    </button>
+                    <button data-action="open-cover-search" data-book="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">
+                      ${ICON_COVER_IMAGE(15)}
+                      <span>Cover</span>
+                    </button>
+                    <button data-action="auto-match-tags" data-book="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">
+                      ${ICON_SPARKLES(15, 'text-[#60a5fa]')}
+                      <span>${isEnriching ? 'Matching...' : 'Auto-Match'}</span>
+                    </button>`
+              }
             </div>
           </div>
         </div>
 
         <div class="space-y-2">
           <div class="flex items-center justify-between gap-2">
-            <h3 class="text-sm font-bold text-white">Chapters (${chapters.length})</h3>
+            <h3 class="text-sm font-bold text-white">${isPodcast ? 'Episodes' : 'Chapters'} (${chapters.length})</h3>
           </div>
           <div class="space-y-1.5">
             ${this._renderChaptersHierarchy(book, isCurrent, false)}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderPodcastModal() {
+    const { open, query, activeCategory, loading, subscribingId, error, results } =
+      this.state.podcastModal || {};
+    if (!open) return '';
+
+    const categories = Array.isArray(PODCAST_CATEGORIES) ? PODCAST_CATEGORIES : [];
+    const items = Array.isArray(results) ? results : [];
+
+    return `
+      <div class="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="sheet-modal w-full max-w-3xl max-h-[86vh] rounded-3xl flex flex-col overflow-hidden">
+          <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
+            <div class="flex items-center gap-2.5 min-w-0">
+              ${FLUENT_3D_PODCAST(20)}
+              <h2 class="text-base font-bold text-white truncate">Podcasts</h2>
+            </div>
+            <button type="button" data-action="close-podcast-modal" aria-label="Close" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white">
+              ${ICON_CLOSE(18)}
+            </button>
+          </div>
+
+          <form id="podcastSearchForm" class="px-5 pt-3.5 pb-2.5 border-b border-[var(--border-subtle)] space-y-3">
+            <div class="flex items-center gap-2">
+              <div class="relative flex-1 min-w-0">
+                <span class="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--text-muted)] pointer-events-none">${ICON_SEARCH(15)}</span>
+                <input id="podcastSearchInput" data-action="podcast-search-input" type="search" value="${escapeHtml(query || '')}" placeholder="Search podcasts, hosts, or topics..." class="w-full pl-9 pr-3 py-2 rounded-xl bg-white/5 border border-[var(--border-subtle)] text-sm text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
+              </div>
+              <button type="submit" class="btn-press px-4 py-2 rounded-xl bg-[#1ed760] text-[#050506] text-xs font-bold shrink-0">Search</button>
+            </div>
+
+            <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
+              ${categories
+                .map((cat) => {
+                  const isActive = !query && activeCategory === cat.id;
+                  return `<button type="button" data-action="select-podcast-category" data-category-id="${escapeHtml(cat.id)}" class="btn-press px-3 py-1 rounded-full text-xs font-medium whitespace-nowrap ${
+                    isActive
+                      ? 'bg-[#1ed760] text-[#050506] font-bold'
+                      : 'surface-card text-[var(--text-secondary)] hover:text-white'
+                  }">${escapeHtml(cat.label)}</button>`;
+                })
+                .join('')}
+            </div>
+          </form>
+
+          ${
+            error
+              ? `<div class="mx-5 mt-3 rounded-xl bg-red-500/10 border border-red-500/30 px-3 py-2 text-xs text-red-300">${escapeHtml(error)}</div>`
+              : ''
+          }
+
+          <div class="flex-1 overflow-y-auto p-5">
+            ${
+              loading && items.length === 0
+                ? `<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">${Array.from({ length: 6 })
+                    .map(() => `<div class="h-24 rounded-2xl surface-card animate-pulse"></div>`)
+                    .join('')}</div>`
+                : items.length === 0
+                  ? `<div class="py-12 text-center text-xs text-[var(--text-secondary)]">No matching podcasts found.</div>`
+                  : `<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      ${items
+                        .map((item, idx) => {
+                          const existing = this._findSubscribedPodcastByFeedUrl(item.feedUrl);
+                          const subKey = String(item.id || item.feedUrl || idx);
+                          const isSubscribing = subscribingId === subKey;
+                          const coverBook = {
+                            bookKey: `podcast:${subKey}`,
+                            title: item.title || 'Podcast',
+                            author: item.author || 'Podcast',
+                            coverUrl: item.coverUrl || ''
+                          };
+                          return `
+                            <div class="surface-card rounded-2xl p-3 flex items-center gap-3 overflow-hidden min-w-0 ${
+                              existing ? 'border border-[#1ed760]/40' : ''
+                            }">
+                              <div class="w-16 h-16 rounded-xl overflow-hidden shrink-0 bg-black/30">
+                                ${this._renderCoverImg(coverBook)}
+                              </div>
+                              <div class="min-w-0 flex-1 space-y-1">
+                                <div class="text-sm font-bold text-white truncate">${escapeHtml(item.title || 'Podcast')}</div>
+                                <div class="text-xs text-[var(--text-secondary)] truncate">${escapeHtml(item.author || 'Podcast')}</div>
+                                <div class="flex items-center gap-1.5 min-w-0">
+                                  <span class="px-2 py-0.5 rounded-full bg-white/5 border border-[var(--border-subtle)] text-[10px] font-medium text-[var(--text-secondary)] truncate">${escapeHtml(item.genre || 'Podcast')}</span>
+                                </div>
+                              </div>
+                              <button type="button" data-action="subscribe-podcast" data-podcast-index="${idx}" ${isSubscribing ? 'disabled' : ''} class="btn-press px-3.5 py-1.5 rounded-full text-xs font-bold shrink-0 ${
+                                existing
+                                  ? 'bg-[#1ed760]/15 text-[#1ed760] border border-[#1ed760]/40'
+                                  : 'bg-[#1ed760] text-[#050506]'
+                              } disabled:opacity-60">
+                                ${existing ? 'Following' : isSubscribing ? 'Following...' : 'Follow'}
+                              </button>
+                            </div>
+                          `;
+                        })
+                        .join('')}
+                    </div>`
+            }
           </div>
         </div>
       </div>
@@ -5452,6 +6517,7 @@ class AudiobookApp {
         <div id="appMainLayer" class="flex-1 flex flex-col min-h-0"></div>
         <div id="appOverlayProfile"></div>
         <div id="appOverlayCover"></div>
+        <div id="appOverlayPodcast"></div>
         <div id="appOverlayDrive"></div>
         <div id="appOverlayDevices"></div>
         <div id="appOverlayWipe"></div>
@@ -5465,6 +6531,7 @@ class AudiobookApp {
       main: this.rootEl.querySelector('#appMainLayer'),
       profile: this.rootEl.querySelector('#appOverlayProfile'),
       cover: this.rootEl.querySelector('#appOverlayCover'),
+      podcast: this.rootEl.querySelector('#appOverlayPodcast'),
       drive: this.rootEl.querySelector('#appOverlayDrive'),
       devices: this.rootEl.querySelector('#appOverlayDevices'),
       wipe: this.rootEl.querySelector('#appOverlayWipe'),
@@ -5639,6 +6706,7 @@ class AudiobookApp {
           ${bodyView}
           ${this._renderProfilePopover()}
           ${this._renderCoverSearchModal()}
+          ${this._renderPodcastModal()}
           ${this._renderDriveSyncModal()}
           ${this._renderDevicesModal()}
           ${this._renderWipeSyncedModal()}
@@ -5722,6 +6790,12 @@ class AudiobookApp {
       () => this._renderCoverSearchModal()
     );
     this._syncOverlaySlot(
+      'podcast',
+      shell.podcast,
+      isLoggedIn && Boolean(this.state.podcastModal?.open),
+      () => this._renderPodcastModal()
+    );
+    this._syncOverlaySlot(
       'drive',
       shell.drive,
       isLoggedIn && Boolean(this.state.driveModal.open),
@@ -5793,6 +6867,42 @@ class AudiobookApp {
       });
     }
 
+    const podcastForm = containerEl.querySelector('#podcastSearchForm');
+    if (podcastForm) {
+      podcastForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        if (this._podcastSearchDebounceTimer) {
+          clearTimeout(this._podcastSearchDebounceTimer);
+          this._podcastSearchDebounceTimer = null;
+        }
+        const input =
+          containerEl.querySelector('#podcastSearchInput') ||
+          (typeof document !== 'undefined' ? document.getElementById('podcastSearchInput') : null);
+        if (input) {
+          void this.runPodcastSearch(input.value);
+        }
+      });
+    }
+
+    const podcastInput =
+      containerEl.querySelector('#podcastSearchInput') ||
+      containerEl.querySelector('[data-action="podcast-search-input"]');
+    if (podcastInput) {
+      podcastInput.addEventListener('input', (e) => {
+        const val = e.target.value;
+        this.state.podcastModal.query = val;
+        if (this._podcastSearchDebounceTimer) {
+          clearTimeout(this._podcastSearchDebounceTimer);
+        }
+        this._podcastSearchDebounceTimer = setTimeout(() => {
+          this._podcastSearchDebounceTimer = null;
+          if (!this._destroyed && this.state.podcastModal?.open) {
+            void this.runPodcastSearch(val);
+          }
+        }, 180);
+      });
+    }
+
     const driveSyncForm = containerEl.querySelector('#driveSyncForm');
     if (driveSyncForm) {
       driveSyncForm.addEventListener('submit', (e) => {
@@ -5828,6 +6938,7 @@ class AudiobookApp {
       if (
         action === 'seek-range' ||
         action === 'search-input' ||
+        action === 'podcast-search-input' ||
         action === 'toggle-wipe-clear-folder'
       ) {
         return;
@@ -5933,7 +7044,18 @@ class AudiobookApp {
             if (franchiseKey) {
               this.state.expandedSeries.add(franchiseKey);
             }
-            this.render();
+            if (
+              this._isAndroidOrMobileViewport() ||
+              this.state.layoutMode === 'android' ||
+              this.state.layoutMode === 'mobile'
+            ) {
+              void this.selectBook(key, false).then(() => {
+                this.state.mobileSheetOpen = true;
+                this.render();
+              });
+            } else {
+              this.render();
+            }
             void this._enrichSingleBookInBackground(key);
             break;
           }
@@ -6222,6 +7344,44 @@ class AudiobookApp {
           }
           case 'auto-match-tags': {
             void this.handleAutoMatchTags(el.dataset.book);
+            break;
+          }
+          case 'open-podcast-modal': {
+            void this.openPodcastModal(el.dataset.query || '');
+            break;
+          }
+          case 'close-podcast-modal': {
+            this.closePodcastModal();
+            break;
+          }
+          case 'select-podcast-category': {
+            void this.selectPodcastCategory(el.dataset.categoryId || 'trending');
+            break;
+          }
+          case 'subscribe-podcast': {
+            void this.handleSubscribePodcast(Number(el.dataset.podcastIndex || 0));
+            break;
+          }
+          case 'unsubscribe-podcast': {
+            void this.unsubscribePodcast(el.dataset.bookKey || el.dataset.book);
+            break;
+          }
+          case 'refresh-podcast-feed': {
+            void this.refreshPodcastFeed(el.dataset.bookKey || el.dataset.book, { silent: false });
+            break;
+          }
+          case 'play-podcast-episode': {
+            void this.playPodcastEpisode(
+              el.dataset.bookKey || el.dataset.book,
+              Number(el.dataset.chapterIndex ?? el.dataset.chapter ?? 0)
+            );
+            break;
+          }
+          case 'toggle-episode-offline': {
+            void this.toggleEpisodeOffline(
+              el.dataset.bookKey || el.dataset.book,
+              Number(el.dataset.chapterIndex ?? el.dataset.chapter ?? 0)
+            );
             break;
           }
           case 'sign-out': {

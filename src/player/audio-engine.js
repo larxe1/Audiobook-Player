@@ -83,6 +83,7 @@ export class AudioEngine {
         this.durationSec = this.audio.duration;
       }
       this._syncChapterFromPosition();
+      this._saveCurrentEpisodeProgress();
       this.onTimeUpdate(this.getSnapshot());
     });
 
@@ -182,6 +183,49 @@ export class AudioEngine {
     });
   }
 
+  getEpisodeCacheKey(book, chapterIndex = 0) {
+    if (!book?.bookKey) return '';
+    const ch = Array.isArray(book.chapters) ? book.chapters[chapterIndex] : null;
+    const suffix = ch?.episodeId || ch?.driveFileId || chapterIndex;
+    return `${book.bookKey}::${suffix}`;
+  }
+
+  async isEpisodeCachedOffline(bookOrKey, chapterIndexOrEpisodeId = 0) {
+    let cacheKey = '';
+    if (typeof bookOrKey === 'string') {
+      if (!bookOrKey) return false;
+      cacheKey =
+        chapterIndexOrEpisodeId !== undefined &&
+        chapterIndexOrEpisodeId !== null &&
+        chapterIndexOrEpisodeId !== ''
+          ? `${bookOrKey}::${chapterIndexOrEpisodeId}`
+          : bookOrKey;
+    } else if (bookOrKey && typeof bookOrKey === 'object') {
+      cacheKey = this.getEpisodeCacheKey(bookOrKey, chapterIndexOrEpisodeId);
+    }
+    if (!cacheKey) return false;
+    if (this._memoryOfflineSet.has(cacheKey)) return true;
+    const record = await this._readCachedBlob(cacheKey);
+    return Boolean(record);
+  }
+
+  _saveCurrentEpisodeProgress(book = this.currentBook) {
+    if (!book?.isPodcast) return;
+    book.episodeProgress =
+      book.episodeProgress && typeof book.episodeProgress === 'object' ? book.episodeProgress : {};
+    const currentChapter = Array.isArray(book.chapters) ? book.chapters[this.chapterIndex] : null;
+    const epId = currentChapter?.episodeId;
+    if (!epId) return;
+    const dur = Math.max(0, Number(this.durationSec || currentChapter?.durationSec || 0));
+    const pos = Math.max(0, Number(this.positionSec || 0));
+    book.episodeProgress[epId] = {
+      positionSec: pos,
+      durationSec: dur,
+      completed: dur > 0 && pos >= dur - 15,
+      updatedAt: new Date().toISOString()
+    };
+  }
+
   async isBookCachedOffline(bookKey) {
     if (!bookKey) return false;
     if (this._memoryOfflineSet.has(bookKey)) return true;
@@ -208,15 +252,25 @@ export class AudioEngine {
       return book.localUrl;
     }
 
-    const cacheKey = ch?.driveFileId ? `${book.bookKey}::${ch.driveFileId}` : book.bookKey;
-    const cached = (await this._readCachedBlob(cacheKey)) || (await this._readCachedBlob(book.bookKey));
+    const epKey = ch?.episodeId || ch?.driveFileId || '';
+    const cacheKey = epKey ? `${book.bookKey}::${epKey}` : book.bookKey;
+    let cached = await this._readCachedBlob(cacheKey);
+    if (!cached && book?.isPodcast) {
+      const fallbackEpKey = this.getEpisodeCacheKey(book, chapterIndex);
+      if (fallbackEpKey && fallbackEpKey !== cacheKey) {
+        cached = await this._readCachedBlob(fallbackEpKey);
+      }
+    }
+    if (!cached && !book?.isPodcast) {
+      cached = await this._readCachedBlob(book.bookKey);
+    }
     if (cached && cached.blob && typeof URL !== 'undefined') {
       const url = URL.createObjectURL(cached.blob);
       this.activeObjectUrl = url;
       return url;
     }
 
-    const streamUrl = ch?.driveStreamUrl || book.driveStreamUrl;
+    const streamUrl = ch?.audioUrl || ch?.driveStreamUrl || book.driveStreamUrl;
     if (streamUrl) {
       if (this.driveAccessToken && streamUrl.includes('googleapis.com')) {
         const fetchFn = this.fetchImpl || (typeof fetch === 'function' ? fetch : null);
@@ -257,18 +311,49 @@ export class AudioEngine {
 
   async loadBook(book, startPositionSec = null) {
     if (!book) return;
+    if (this.currentBook && this.currentBook !== book) {
+      this._saveCurrentEpisodeProgress(this.currentBook);
+    }
     this.pause();
     this._revokeObjectUrl();
 
     this.currentBook = book;
-    this.durationSec = Math.max(60, Number(book.totalDurationSec || 0));
-    const initialPos = startPositionSec !== null && startPositionSec !== undefined
-      ? Number(startPositionSec)
-      : Number(book.positionSec || 0);
-    this.positionSec = Math.max(0, Math.min(this.durationSec, initialPos));
+    if (book.isPodcast) {
+      book.episodeProgress =
+        book.episodeProgress && typeof book.episodeProgress === 'object' ? book.episodeProgress : {};
+    }
+
+    const chapters = Array.isArray(book.chapters) ? book.chapters : [];
+    const isMulti = Boolean(book.isPodcast || this._isMultiFileChapters(chapters));
+
     this.chapterIndex = Number.isInteger(book.chapterIndex)
-      ? Math.max(0, Math.min((book.chapters?.length || 1) - 1, book.chapterIndex))
-      : this.computeChapterIndex(this.positionSec, book.chapters);
+      ? Math.max(0, Math.min(Math.max(0, chapters.length - 1), book.chapterIndex))
+      : (isMulti ? 0 : this.computeChapterIndex(Number(startPositionSec ?? book.positionSec ?? 0), chapters));
+
+    const activeChapter = chapters[this.chapterIndex] || null;
+    if (isMulti) {
+      this.durationSec = Math.max(
+        1,
+        Number(activeChapter?.durationSec) || Number(book.totalDurationSec) || 1800
+      );
+    } else {
+      this.durationSec = Math.max(60, Number(book.totalDurationSec || 0));
+    }
+
+    let initialPos = 0;
+    if (startPositionSec !== null && startPositionSec !== undefined) {
+      initialPos = Number(startPositionSec);
+    } else if (book.isPodcast && activeChapter?.episodeId) {
+      const savedEp = book.episodeProgress[activeChapter.episodeId];
+      if (savedEp) {
+        initialPos = savedEp.completed ? 0 : Number(savedEp.positionSec || 0);
+      } else {
+        initialPos = Number(book.positionSec || 0);
+      }
+    } else {
+      initialPos = Number(book.positionSec || 0);
+    }
+    this.positionSec = Math.max(0, Math.min(this.durationSec, Number.isFinite(initialPos) ? initialPos : 0));
     this.usingSynth = false;
 
     const mediaUrl = await this._resolveChapterMediaUrl(book, this.chapterIndex);
@@ -391,6 +476,7 @@ export class AudioEngine {
         this.positionSec += dtSec * this.playbackRate;
         if (this.positionSec >= this.durationSec) {
           this.positionSec = this.durationSec;
+          this._saveCurrentEpisodeProgress();
           this.pause();
           this.onTimeUpdate(this.getSnapshot());
           this.onEnded(this.getSnapshot());
@@ -398,6 +484,7 @@ export class AudioEngine {
         }
         const prevChapter = this.chapterIndex;
         this._syncChapterFromPosition();
+        this._saveCurrentEpisodeProgress();
         if (this.sleepTimerMode === 'chapter' && this.chapterIndex !== prevChapter) {
           this.sleepTimerMode = 0;
           this.sleepPresetIndex = 0;
@@ -457,6 +544,7 @@ export class AudioEngine {
   }
 
   pause() {
+    this._saveCurrentEpisodeProgress();
     this.playing = false;
     this._stopVirtualClock();
     this._stopSynthTone();
@@ -490,6 +578,7 @@ export class AudioEngine {
       }
     }
     this._syncChapterFromPosition();
+    this._saveCurrentEpisodeProgress();
     this.onTimeUpdate(this.getSnapshot());
     this.onStateChange(this.getSnapshot());
   }
@@ -499,34 +588,85 @@ export class AudioEngine {
     this.seekToSeconds(next);
   }
 
-  async jumpToChapter(index) {
+  async setChapter(index, startPositionSec = null) {
     const chapters = this.currentBook?.chapters || [];
     if (!chapters.length) return;
-    const clampedIdx = Math.max(0, Math.min(chapters.length - 1, index));
+    const clampedIdx = Math.max(0, Math.min(chapters.length - 1, Number(index) || 0));
     const targetChapter = chapters[clampedIdx];
+    const isMulti = Boolean(this.currentBook?.isPodcast || this._isMultiFileChapters(chapters));
     const hasOwnTrack = Boolean(
-      targetChapter?.driveStreamUrl || targetChapter?.localUrl || targetChapter?.localFile
+      isMulti ||
+      targetChapter?.audioUrl ||
+      targetChapter?.episodeId ||
+      targetChapter?.driveStreamUrl ||
+      targetChapter?.localUrl ||
+      targetChapter?.localFile
     );
 
-    if (hasOwnTrack && clampedIdx !== this.chapterIndex) {
+    if (hasOwnTrack) {
+      if (this.currentBook?.isPodcast) {
+        this._saveCurrentEpisodeProgress(this.currentBook);
+      }
+
+      const prevIdx = this.chapterIndex;
+      const isSwitchingEpisode = clampedIdx !== prevIdx;
       const wasPlaying = this.playing;
-      this.pause();
-      this._revokeObjectUrl();
+      if (isSwitchingEpisode) {
+        this.pause();
+        this._revokeObjectUrl();
+      }
+
       this.chapterIndex = clampedIdx;
-      this.positionSec = 0;
-      const mediaUrl = await this._resolveChapterMediaUrl(this.currentBook, clampedIdx);
-      if (mediaUrl && this.audio) {
+      this.durationSec = Math.max(
+        1,
+        Number(targetChapter?.durationSec) || Number(this.currentBook?.totalDurationSec) || 1800
+      );
+
+      let nextPos = 0;
+      if (startPositionSec !== null && startPositionSec !== undefined) {
+        nextPos = Number(startPositionSec) || 0;
+      } else if (this.currentBook?.isPodcast && targetChapter?.episodeId) {
+        this.currentBook.episodeProgress =
+          this.currentBook.episodeProgress && typeof this.currentBook.episodeProgress === 'object'
+            ? this.currentBook.episodeProgress
+            : {};
+        const savedEp = this.currentBook.episodeProgress[targetChapter.episodeId];
+        nextPos =
+          savedEp && !savedEp.completed && Number(savedEp.positionSec) > 0
+            ? Number(savedEp.positionSec)
+            : 0;
+      }
+      this.positionSec = Math.max(0, Math.min(this.durationSec, nextPos));
+
+      if (isSwitchingEpisode) {
         this.usingSynth = false;
-        this.audio.src = mediaUrl;
-        this.audio.playbackRate = this.playbackRate;
-        try {
-          this.audio.currentTime = 0;
-        } catch {
-          // ignore
+        const mediaUrl = await this._resolveChapterMediaUrl(this.currentBook, clampedIdx);
+        if (mediaUrl && this.audio) {
+          this.usingSynth = false;
+          this.audio.src = mediaUrl;
+          this.audio.playbackRate = this.playbackRate;
+          try {
+            this.audio.currentTime = this.positionSec;
+          } catch {
+            // Applied on loadedmetadata
+          }
+        } else {
+          this._activateSynthFallback();
         }
         if (wasPlaying) {
           await this.play();
         }
+      } else if (this.audio && !this.usingSynth) {
+        try {
+          this.audio.currentTime = this.positionSec;
+        } catch {
+          // ignore
+        }
+      }
+
+      if (this.currentBook) {
+        this.currentBook.chapterIndex = clampedIdx;
+        this.currentBook.positionSec = this.positionSec;
       }
       this.onChapterChange(clampedIdx, targetChapter);
       this.onTimeUpdate(this.getSnapshot());
@@ -534,10 +674,17 @@ export class AudioEngine {
       return;
     }
 
-    const targetSec = Number(targetChapter.startSec || 0);
+    const targetSec =
+      startPositionSec !== null && startPositionSec !== undefined
+        ? Number(startPositionSec) || 0
+        : Number(targetChapter.startSec || 0);
     this.chapterIndex = clampedIdx;
     this.seekToSeconds(targetSec);
     this.onChapterChange(clampedIdx, targetChapter);
+  }
+
+  async jumpToChapter(index, startPositionSec = null) {
+    return this.setChapter(index, startPositionSec);
   }
 
   setPlaybackRate(rate) {
@@ -588,7 +735,12 @@ export class AudioEngine {
   }
 
   _isMultiFileChapters(chapters = []) {
-    if (!Array.isArray(chapters) || chapters.length <= 1) return false;
+    if (this.currentBook?.isPodcast) return true;
+    if (!Array.isArray(chapters) || chapters.length === 0) return false;
+    if (chapters.some((ch) => Boolean(ch?.audioUrl || ch?.episodeId))) {
+      return true;
+    }
+    if (chapters.length <= 1) return false;
     let trackCount = 0;
     const distinct = new Set();
     for (const ch of chapters) {
@@ -707,6 +859,133 @@ export class AudioEngine {
     book.offlineCached = false;
     this.onOfflineChange(book.bookKey, false);
     return { ok: true, bookKey: book.bookKey };
+  }
+
+  async cacheEpisodeOffline(book, chapterIndex = 0) {
+    if (!book || !book.bookKey) return { ok: false };
+    const chapters = Array.isArray(book.chapters) ? book.chapters : [];
+    const ch = chapters[chapterIndex] || null;
+    const cacheKey = this.getEpisodeCacheKey(book, chapterIndex);
+    if (!cacheKey) return { ok: false };
+
+    let blob = null;
+    const url = ch?.audioUrl || ch?.driveStreamUrl || '';
+    const fetchFn = this.fetchImpl || (typeof fetch === 'function' ? fetch : null);
+
+    if (ch?.localFile instanceof Blob) {
+      blob = ch.localFile;
+    } else if (url && fetchFn) {
+      const headers =
+        this.driveAccessToken && url.includes('googleapis.com')
+          ? { Authorization: `Bearer ${this.driveAccessToken}` }
+          : undefined;
+      try {
+        const resp = await fetchFn(url, headers ? { headers } : undefined);
+        if (resp?.ok) {
+          blob = await resp.blob();
+        }
+      } catch {
+        blob = null;
+      }
+
+      if (!blob && /^https?:\/\//i.test(url) && !url.includes('googleapis.com')) {
+        const proxyUrls = [
+          `https://corsproxy.io/?${encodeURIComponent(url)}`,
+          `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
+        ];
+        for (const proxyUrl of proxyUrls) {
+          try {
+            const resp = await fetchFn(proxyUrl);
+            if (resp?.ok) {
+              blob = await resp.blob();
+              break;
+            }
+          } catch {
+            // Try next CORS proxy
+          }
+        }
+      }
+    }
+
+    if (!blob && typeof Blob !== 'undefined') {
+      blob = new Blob(
+        [
+          JSON.stringify({
+            bookKey: book.bookKey,
+            episodeId: ch?.episodeId || null,
+            chapterIndex,
+            cachedAt: Date.now()
+          })
+        ],
+        { type: 'application/json' }
+      );
+    }
+
+    this._memoryOfflineSet.add(cacheKey);
+    const db = await openOfflineDb();
+    if (db) {
+      await new Promise((resolve) => {
+        try {
+          const tx = db.transaction(OFFLINE_STORE, 'readwrite');
+          tx.objectStore(OFFLINE_STORE).put({
+            bookKey: cacheKey,
+            blob,
+            cachedAt: new Date().toISOString()
+          });
+          tx.oncomplete = () => resolve(true);
+          tx.onerror = () => resolve(false);
+        } catch {
+          resolve(false);
+        }
+      });
+    }
+
+    if (ch) {
+      ch.offlineCached = true;
+    }
+    book.hasOfflineEpisodes = chapters.some((c) => Boolean(c?.offlineCached));
+    this.onOfflineChange({
+      bookKey: book.bookKey,
+      episodeId: ch?.episodeId,
+      chapterIndex,
+      cached: true
+    });
+    return { ok: true, cacheKey, cachedBytes: blob?.size || 0 };
+  }
+
+  async removeEpisodeOffline(book, chapterIndex = 0) {
+    if (!book || !book.bookKey) return { ok: false };
+    const chapters = Array.isArray(book.chapters) ? book.chapters : [];
+    const ch = chapters[chapterIndex] || null;
+    const cacheKey = this.getEpisodeCacheKey(book, chapterIndex);
+    if (!cacheKey) return { ok: false };
+
+    this._memoryOfflineSet.delete(cacheKey);
+    const db = await openOfflineDb();
+    if (db) {
+      await new Promise((resolve) => {
+        try {
+          const tx = db.transaction(OFFLINE_STORE, 'readwrite');
+          tx.objectStore(OFFLINE_STORE).delete(cacheKey);
+          tx.oncomplete = () => resolve(true);
+          tx.onerror = () => resolve(false);
+        } catch {
+          resolve(false);
+        }
+      });
+    }
+
+    if (ch) {
+      ch.offlineCached = false;
+    }
+    book.hasOfflineEpisodes = chapters.some((c) => Boolean(c?.offlineCached));
+    this.onOfflineChange({
+      bookKey: book.bookKey,
+      episodeId: ch?.episodeId,
+      chapterIndex,
+      cached: false
+    });
+    return { ok: true, cacheKey };
   }
 
   destroy() {

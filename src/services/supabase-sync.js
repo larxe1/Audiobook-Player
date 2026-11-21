@@ -188,6 +188,9 @@ function sanitizeMediaEntry(entry, index = 0) {
   const driveFileId = String(entry.driveFileId || entry.drive_file_id || '').trim();
   const rawStreamUrl = String(entry.driveStreamUrl || entry.drive_stream_url || '').trim();
   const driveStreamUrl = rawStreamUrl || (driveFileId ? buildDriveStreamUrl(driveFileId) : '');
+  const audioUrl = String(entry.audioUrl || entry.audio_url || '').trim();
+  const episodeId = String(entry.episodeId || entry.episode_id || '').trim();
+  const publishedAt = String(entry.publishedAt || entry.published_at || '').trim();
   const durationNum = Number(entry.durationSec ?? entry.duration_sec ?? entry.duration);
   const hasPositiveDuration = Number.isFinite(durationNum) && durationNum > 0;
   const hasExplicitZeroDuration = entry.duration !== undefined && durationNum === 0;
@@ -205,9 +208,47 @@ function sanitizeMediaEntry(entry, index = 0) {
       : {}),
     ...(mimeType ? { mimeType } : {}),
     ...(driveFileId ? { driveFileId } : {}),
-    ...(driveStreamUrl ? { driveStreamUrl } : {})
+    ...(driveStreamUrl ? { driveStreamUrl } : {}),
+    ...(episodeId ? { episodeId } : {}),
+    ...(audioUrl ? { audioUrl } : {}),
+    ...(publishedAt ? { publishedAt } : {}),
+    ...(typeof entry.description === 'string' && entry.description ? { description: entry.description } : {}),
+    ...(entry.offlineCached !== undefined ? { offlineCached: Boolean(entry.offlineCached) } : {})
   };
   return clean;
+}
+
+function mergeEpisodeProgressMaps(existingMap = {}, incomingMap = {}) {
+  const a = existingMap && typeof existingMap === 'object' && !Array.isArray(existingMap) ? existingMap : {};
+  const b = incomingMap && typeof incomingMap === 'object' && !Array.isArray(incomingMap) ? incomingMap : {};
+  const merged = {};
+  for (const epId of new Set([...Object.keys(a), ...Object.keys(b)])) {
+    const first = a[epId];
+    const second = b[epId];
+    if (!first) {
+      if (second && typeof second === 'object') merged[epId] = { ...second };
+      continue;
+    }
+    if (!second) {
+      if (first && typeof first === 'object') merged[epId] = { ...first };
+      continue;
+    }
+    const firstTs = toEpochMs(first.updatedAt);
+    const secondTs = toEpochMs(second.updatedAt);
+    const winner =
+      secondTs > firstTs
+        ? second
+        : firstTs > secondTs
+          ? first
+          : Number(second.positionSec || 0) >= Number(first.positionSec || 0)
+            ? second
+            : first;
+    merged[epId] = {
+      ...winner,
+      completed: Boolean(first.completed || second.completed || winner.completed)
+    };
+  }
+  return merged;
 }
 
 function sanitizeMediaList(list) {
@@ -248,18 +289,42 @@ function normalizeCloudBook(rawBook, fallbackDevice = {}) {
 
   const rawSources = [
     ...(Array.isArray(rawBook.sources) ? rawBook.sources : []),
+    ...(Array.isArray(meta.sources) ? meta.sources : []),
     ...(rawBook.source ? [rawBook.source] : []),
     ...(meta.source ? [meta.source] : [])
   ].filter(Boolean);
-  const hasDriveMedia = Boolean(
-    driveFileId ||
-      driveStreamUrl ||
-      tracks.some((t) => t.driveFileId || t.driveStreamUrl) ||
-      chapters.some((c) => c.driveFileId || c.driveStreamUrl)
+  const isPodcast = Boolean(
+    rawBook.isPodcast ||
+      meta.isPodcast ||
+      rawBook.mediaType === 'podcast' ||
+      meta.mediaType === 'podcast' ||
+      rawSources.includes('podcast') ||
+      bookKey.startsWith('podcast:')
   );
-  const sources = Array.from(new Set(hasDriveMedia && !rawSources.includes('drive') ? [...rawSources, 'drive'] : rawSources));
+  const mediaType = isPodcast ? 'podcast' : (rawBook.mediaType || meta.mediaType || 'audiobook');
+  const feedUrl = String(rawBook.feedUrl || meta.feedUrl || '').trim();
+  const lastFeedRefreshAt = String(rawBook.lastFeedRefreshAt || meta.lastFeedRefreshAt || '').trim();
+  const rawEpProgress = rawBook.episodeProgress || meta.episodeProgress;
+  const episodeProgress =
+    rawEpProgress && typeof rawEpProgress === 'object' && !Array.isArray(rawEpProgress)
+      ? rawEpProgress
+      : {};
+  const hasDriveMedia =
+    !isPodcast &&
+    Boolean(
+      driveFileId ||
+        driveStreamUrl ||
+        tracks.some((t) => t.driveFileId || t.driveStreamUrl) ||
+        chapters.some((c) => c.driveFileId || c.driveStreamUrl)
+    );
+  const sourceSet = new Set(rawSources);
+  if (hasDriveMedia) sourceSet.add('drive');
+  if (isPodcast) sourceSet.add('podcast');
+  const sources = Array.from(sourceSet);
   const source = String(
-    rawBook.source || meta.source || (sources.includes('drive') ? 'drive' : sources[0] || '')
+    rawBook.source ||
+      meta.source ||
+      (isPodcast ? 'podcast' : sources.includes('drive') ? 'drive' : sources[0] || '')
   ).trim();
 
   const durationSec = Number(
@@ -287,6 +352,11 @@ function normalizeCloudBook(rawBook, fallbackDevice = {}) {
     totalDurationSec: safeDurationSec,
     sources,
     ...(source ? { source } : {}),
+    isPodcast,
+    mediaType,
+    feedUrl,
+    lastFeedRefreshAt,
+    episodeProgress,
     driveFileId,
     driveStreamUrl,
     driveFolderId,
@@ -324,17 +394,21 @@ function mergeCloudBook(existingBook, incomingBook) {
   const driveStreamUrl = newer.driveStreamUrl || older.driveStreamUrl || (driveFileId ? buildDriveStreamUrl(driveFileId) : '');
   const driveFolderId = newer.driveFolderId || older.driveFolderId || '';
   const coverDriveFileId = newer.coverDriveFileId || older.coverDriveFileId || '';
-  const hasDriveMedia = Boolean(
-    driveFileId ||
-      driveStreamUrl ||
-      tracks.some((t) => t.driveFileId || t.driveStreamUrl) ||
-      chapters.some((c) => c.driveFileId || c.driveStreamUrl)
-  );
+  const isPodcast = Boolean(newer.isPodcast || older.isPodcast);
+  const hasDriveMedia =
+    !isPodcast &&
+    Boolean(
+      driveFileId ||
+        driveStreamUrl ||
+        tracks.some((t) => t.driveFileId || t.driveStreamUrl) ||
+        chapters.some((c) => c.driveFileId || c.driveStreamUrl)
+    );
   const combinedSources = Array.from(
     new Set([
       ...(Array.isArray(older.sources) ? older.sources : []),
       ...(Array.isArray(newer.sources) ? newer.sources : []),
-      ...(hasDriveMedia ? ['drive'] : [])
+      ...(hasDriveMedia ? ['drive'] : []),
+      ...(isPodcast ? ['podcast'] : [])
     ])
   );
 
@@ -349,6 +423,11 @@ function mergeCloudBook(existingBook, incomingBook) {
     tracks,
     chapters,
     sources: combinedSources,
+    isPodcast,
+    mediaType: isPodcast ? 'podcast' : (newer.mediaType || older.mediaType || 'audiobook'),
+    feedUrl: newer.feedUrl || older.feedUrl || '',
+    lastFeedRefreshAt: newer.lastFeedRefreshAt || older.lastFeedRefreshAt || '',
+    episodeProgress: mergeEpisodeProgressMaps(older.episodeProgress, newer.episodeProgress),
     totalDurationSec: Number(newer.totalDurationSec || older.totalDurationSec || 0),
     originDeviceId: newer.originDeviceId || older.originDeviceId || null,
     originDeviceName: newer.originDeviceName || older.originDeviceName || null,
@@ -3605,6 +3684,13 @@ export class SupabaseSyncService {
           coverDriveFileId: item.coverDriveFileId || '',
           driveFolderId: item.driveFolderId || '',
           ...(item.source ? { source: item.source } : {}),
+          isPodcast: Boolean(item.isPodcast),
+          mediaType: item.isPodcast ? 'podcast' : (item.mediaType || 'audiobook'),
+          ...(item.feedUrl ? { feedUrl: item.feedUrl } : {}),
+          ...(item.lastFeedRefreshAt ? { lastFeedRefreshAt: item.lastFeedRefreshAt } : {}),
+          ...(item.episodeProgress && Object.keys(item.episodeProgress).length > 0
+            ? { episodeProgress: item.episodeProgress }
+            : {}),
           seriesOrder:
             item.seriesOrder != null && Number.isFinite(Number(item.seriesOrder))
               ? Number(item.seriesOrder)

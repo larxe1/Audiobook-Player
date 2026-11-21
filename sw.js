@@ -16,7 +16,8 @@ const APP_SHELL_ASSETS = [
   './src/services/self-updater.js',
   './src/services/library-scanner.js',
   './src/services/metadata-enrichment.js',
-  './src/services/cover-search.js'
+  './src/services/cover-search.js',
+  './src/services/podcast-service.js'
 ];
 
 self.addEventListener('install', (event) => {
