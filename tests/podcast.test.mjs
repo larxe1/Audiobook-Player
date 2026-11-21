@@ -464,3 +464,37 @@ test('SupabaseSyncService and deduplicateBooks preserve podcast metadata without
   assert.ok(deduped.some((b) => !b.isPodcast));
 });
 
+test('parsePodcastRssXml and createPodcastBookItem retain > 50 episodes (120 episodes) without truncating', () => {
+  const itemsXml = Array.from({ length: 120 }, (_, idx) => {
+    const num = 120 - idx;
+    return `
+    <item>
+      <title>Episode ${num}</title>
+      <guid>ep-guid-${num}</guid>
+      <pubDate>Wed, 20 Nov 2026 12:00:00 GMT</pubDate>
+      <itunes:duration>30:00</itunes:duration>
+      <enclosure url="https://cdn.example.com/audio/ep-${num}.mp3" type="audio/mpeg" />
+    </item>`;
+  }).join('\n');
+
+  const largeRssXml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>Long Running Show</title>
+    <itunes:author>Host</itunes:author>
+    <description>120 episodes test</description>
+    ${itemsXml}
+  </channel>
+</rss>`;
+
+  const parsed = parsePodcastRssXml(largeRssXml, 'https://example.com/large-feed.xml');
+  assert.equal(parsed.episodes.length, 120);
+  assert.equal(parsed.episodes[0].episodeId, 'ep-guid-120');
+  assert.equal(parsed.episodes[119].episodeId, 'ep-guid-1');
+
+  const book = createPodcastBookItem(parsed);
+  assert.equal(book.chapters.length, 120);
+  assert.equal(book.chapters[0].episodeId, 'ep-guid-120');
+  assert.equal(book.chapters[119].episodeId, 'ep-guid-1');
+});
+

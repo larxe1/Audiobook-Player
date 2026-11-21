@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'multiplayer-v3';
+const CACHE_VERSION = 'multiplayer-v4';
 
 const APP_SHELL_ASSETS = [
   './',
@@ -60,6 +60,7 @@ function shouldBypassCache(request) {
 
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return true;
+  if (url.pathname.endsWith('/version.json')) return true;
   if (url.pathname.startsWith('/rest/v1/') || url.pathname.startsWith('/auth/')) return true;
 
   return false;
@@ -67,12 +68,17 @@ function shouldBypassCache(request) {
 
 self.addEventListener('fetch', (event) => {
   const { request } = event;
+  const url = new URL(request.url);
+  if (url.pathname.endsWith('/version.json')) {
+    return;
+  }
   if (shouldBypassCache(request)) {
     return;
   }
 
-  // Network-first for navigation and app module code; cache fallback when offline.
+  // Network-first on localhost (Capacitor WebView / Tauri) and for navigation/app module code; cache fallback when offline.
   if (
+    self.location.hostname === 'localhost' ||
     request.mode === 'navigate' ||
     request.destination === 'document' ||
     request.destination === 'script' ||

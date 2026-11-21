@@ -159,7 +159,14 @@ public class AudiobookUpdaterBridge {
                         () -> {
                             try {
                                 if (activity.getBridge() != null) {
+                                    WebView webView = activity.getBridge().getWebView();
+                                    if (webView != null) {
+                                        webView.clearCache(true);
+                                    }
                                     activity.getBridge().setServerBasePath(otaPath);
+                                    if (webView != null) {
+                                        webView.reload();
+                                    }
                                 }
                             } catch (Exception e) {
                                 dispatchProgress(

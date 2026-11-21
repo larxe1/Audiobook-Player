@@ -4361,7 +4361,7 @@ export class SupabaseSyncService {
 
     if (this.isAuthenticated()) {
       try {
-        const rows = await this._rest('audiobook_library_items?select=*&order=updated_at.desc');
+        const rows = await this._rest('audiobook_library_items?select=*&order=updated_at.desc&limit=10000');
         for (const row of Array.isArray(rows) ? rows : []) {
           const normalized = normalizeCloudBook(row);
           if (!normalized?.bookKey) continue;

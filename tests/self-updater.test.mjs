@@ -698,3 +698,116 @@ test('resolveReadyPackageUrl matches both MultiPlayer and Audiobook-Player relea
   assert.doesNotMatch(elementsById.get('mandatory-update-subtitle').textContent, /Audiobook Player/);
   service.destroy();
 });
+
+test('Android Web OTA clears WebView caches & SW registrations and never falls back to mismatched older release tags', async () => {
+  const deletedCaches = [];
+  let swUpdated = 0;
+  let swUnregistered = 0;
+  const webOtaCalls = [];
+
+  const windowObj = {
+    location: { origin: 'https://localhost', protocol: 'https:' },
+    Capacitor: { isNativePlatform: () => true },
+    AudiobookUpdaterNative: {
+      getNativeBuild: () => 21,
+      startWebOtaUpdate: (url) => webOtaCalls.push(url),
+      startApkUpdate: () => {}
+    }
+  };
+
+  const service = new SelfUpdaterService({
+    currentVersion: '1.0.20',
+    currentBuild: 21,
+    windowObj,
+    navigatorObj: {
+      userAgent: 'Mozilla/5.0 (Linux; Android 14)',
+      serviceWorker: {
+        async getRegistrations() {
+          return [
+            {
+              async update() {
+                swUpdated += 1;
+              },
+              async unregister() {
+                swUnregistered += 1;
+                return true;
+              }
+            }
+          ];
+        }
+      }
+    },
+    cachesObj: {
+      async keys() {
+        return ['multiplayer-v3', 'multiplayer-v4'];
+      },
+      async delete(key) {
+        deletedCaches.push(key);
+        return true;
+      }
+    },
+    storage: null
+  });
+
+  // 1. Mismatched older tag_name while new release v1.0.21 is still building must return ready: false
+  const mismatchedRes = await service.resolveReadyPackageUrl(
+    'android-apk',
+    {
+      version: '1.0.21',
+      build: 22,
+      minNativeBuild: 21,
+      webBundleUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip'
+    },
+    async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        tag_name: 'v1.0.20',
+        assets: [
+          {
+            name: 'web-bundle.zip',
+            browser_download_url: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.20/web-bundle.zip'
+          }
+        ]
+      })
+    })
+  );
+  assert.equal(mismatchedRes.ready, false);
+  assert.equal(mismatchedRes.reason, 'release-not-published-yet');
+  assert.doesNotMatch(mismatchedRes.url, /\/releases\/latest\/download\//);
+
+  // 2. GitHub API 403 + blocked HEAD must return ready: false (not github-release-fallback ready: true)
+  const rateLimitedRes = await service.resolveReadyPackageUrl(
+    'android-apk',
+    {
+      version: '1.0.21',
+      build: 22,
+      minNativeBuild: 21,
+      webBundleUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip'
+    },
+    async (_url, init) => {
+      if (init?.method === 'HEAD') {
+        throw new TypeError('CORS blocked');
+      }
+      return { ok: false, status: 403 };
+    }
+  );
+  assert.equal(rateLimitedRes.ready, false);
+  assert.equal(rateLimitedRes.reason, 'release-not-published-yet');
+
+  // 3. installNativeUpdate on Android Web OTA clears caches & SW registrations before calling startWebOtaUpdate
+  const installRes = await service.installNativeUpdate('android-apk', {
+    version: '1.0.21',
+    build: 22,
+    minNativeBuild: 21,
+    webBundleUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip'
+  });
+  assert.equal(installRes.ok, true);
+  assert.equal(installRes.deliveryMode, 'web-ota');
+  assert.deepEqual(deletedCaches, ['multiplayer-v3', 'multiplayer-v4']);
+  assert.equal(swUpdated, 1);
+  assert.equal(swUnregistered, 1);
+  assert.deepEqual(webOtaCalls, [
+    'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.21/web-bundle.zip'
+  ]);
+});

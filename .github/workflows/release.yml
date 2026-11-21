@@ -117,17 +117,31 @@ jobs:
           npx cap add android
           npx cap sync android
           rm -rf android/app/src/main/res/mipmap-anydpi-v26
-          for density in mdpi hdpi xhdpi; do
-            mkdir -p "android/app/src/main/res/mipmap-${density}"
-            cp public/icon-192.png "android/app/src/main/res/mipmap-${density}/ic_launcher.png"
-            cp public/icon-192.png "android/app/src/main/res/mipmap-${density}/ic_launcher_round.png"
-            cp public/icon-192.png "android/app/src/main/res/mipmap-${density}/ic_launcher_foreground.png"
-          done
-          for density in xxhdpi xxxhdpi; do
-            mkdir -p "android/app/src/main/res/mipmap-${density}"
-            cp public/icon-512.png "android/app/src/main/res/mipmap-${density}/ic_launcher.png"
-            cp public/icon-512.png "android/app/src/main/res/mipmap-${density}/ic_launcher_round.png"
-            cp public/icon-512.png "android/app/src/main/res/mipmap-${density}/ic_launcher_foreground.png"
+          rm -f android/app/src/main/res/drawable/ic_launcher* android/app/src/main/res/drawable-v24/ic_launcher*
+          resize_icon() {
+            local size="$1"
+            local out="$2"
+            if command -v convert >/dev/null 2>&1; then
+              convert public/icon-512.png -resize "${size}x${size}!" "$out"
+            elif command -v magick >/dev/null 2>&1; then
+              magick public/icon-512.png -resize "${size}x${size}!" "$out"
+            elif command -v ffmpeg >/dev/null 2>&1; then
+              ffmpeg -y -loglevel error -i public/icon-512.png -vf "scale=${size}:${size}:flags=lanczos" "$out"
+            else
+              python3 -c "from PIL import Image; Image.open('public/icon-512.png').resize((${size},${size}), Image.Resampling.LANCZOS).save('${out}')"
+            fi
+          }
+          for spec in "mdpi:48" "hdpi:72" "xhdpi:96" "xxhdpi:144" "xxxhdpi:192"; do
+            density="${spec%%:*}"
+            px="${spec##*:}"
+            for dir in "android/app/src/main/res/mipmap-${density}" "android/app/src/main/res/mipmap-${density}-v4"; do
+              if [ "$dir" = "android/app/src/main/res/mipmap-${density}" ] || [ -d "$dir" ]; then
+                mkdir -p "$dir"
+                resize_icon "$px" "${dir}/ic_launcher.png"
+                cp "${dir}/ic_launcher.png" "${dir}/ic_launcher_round.png"
+                cp "${dir}/ic_launcher.png" "${dir}/ic_launcher_foreground.png"
+              fi
+            done
           done
           mkdir -p android/app/src/main/java/com/audiobook/player
           mkdir -p android/app/src/main/res/xml
@@ -253,6 +267,9 @@ jobs:
                               bundledBuild = 0;
                           }
                           if (otaBuild > bundledBuild && getBridge() != null) {
+                              if (getBridge().getWebView() != null) {
+                                  getBridge().getWebView().clearCache(true);
+                              }
                               getBridge().setServerBasePath(otaDir.getAbsolutePath());
                           } else if (bundledBuild >= otaBuild) {
                               deleteRecursive(otaDir);

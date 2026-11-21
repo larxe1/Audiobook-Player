@@ -724,6 +724,7 @@ fn build_main_window(
     label: &str,
     data_directory: Option<PathBuf>,
 ) -> tauri::Result<WebviewWindow> {
+    let window_icon = tauri::include_image!("icons/icon.ico");
     let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
         .title("MultiPlayer")
         .inner_size(1280.0, 820.0)
@@ -731,14 +732,17 @@ fn build_main_window(
         .resizable(true)
         .background_color(Color(0, 0, 0, 255))
         .visible(true)
-        .focused(true);
+        .focused(true)
+        .icon(window_icon.clone())?;
 
     if let Some(dir) = data_directory {
         let _ = fs::create_dir_all(&dir);
         builder = builder.data_directory(dir);
     }
 
-    builder.build()
+    let win = builder.build()?;
+    let _ = win.set_icon(window_icon);
+    Ok(win)
 }
 
 fn create_main_window_with_fallback(app: &App) -> tauri::Result<WebviewWindow> {

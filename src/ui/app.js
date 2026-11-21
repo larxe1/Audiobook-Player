@@ -3506,14 +3506,14 @@ class AudiobookApp {
     return results.filter(Boolean);
   }
 
-  getRecentPodcastEpisodes(limit = 8) {
+  getRecentPodcastEpisodes(limit = 20) {
     const podcasts = (this.books || []).filter(
       (b) => b && (b.isPodcast || b.sources?.includes('podcast'))
     );
     const episodes = [];
     for (const podcast of podcasts) {
       const chapters = Array.isArray(podcast.chapters) ? podcast.chapters : [];
-      chapters.slice(0, 10).forEach((ch, idx) => {
+      chapters.slice(0, 50).forEach((ch, idx) => {
         const chapterIndex = typeof ch?.index === 'number' ? ch.index : idx;
         const pubMs = ch?.publishedAt ? Date.parse(ch.publishedAt) || 0 : 0;
         const epProg = ch?.episodeId ? podcast.episodeProgress?.[ch.episodeId] : null;
@@ -3541,7 +3541,7 @@ class AudiobookApp {
       if (b.publishedAtMs !== a.publishedAtMs) return b.publishedAtMs - a.publishedAtMs;
       return a.chapterIndex - b.chapterIndex;
     });
-    return episodes.slice(0, Math.max(1, Number(limit) || 8));
+    return episodes.slice(0, Math.max(1, Number(limit) || 20));
   }
 
   async playPodcastEpisode(bookKey, chapterIndex = 0) {
@@ -5545,12 +5545,8 @@ class AudiobookApp {
     return `
       <main id="authRestoringView" class="min-h-screen w-full flex items-center justify-center p-4 sm:p-6 bg-[var(--bg-canvas)]">
         <div class="flex flex-col items-center gap-3 text-center">
-          <div class="w-12 h-12 rounded-2xl bg-[#1ed760]/15 border border-[#1ed760]/35 flex items-center justify-center text-[#1ed760] shadow-lg">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
-              <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"/>
-              <path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
-            </svg>
+          <div class="w-12 h-12 rounded-2xl overflow-hidden border border-white/15 shadow-lg">
+            <img src="./public/icon-192.png" alt="MultiPlayer" style="width:100%;height:100%;object-fit:cover;border-radius:inherit;display:block;" />
           </div>
           <p class="text-sm font-medium text-[var(--text-secondary)]">Restoring your session…</p>
         </div>
@@ -5564,12 +5560,8 @@ class AudiobookApp {
       <main class="min-h-screen w-full flex items-center justify-center p-4 sm:p-6 bg-[var(--bg-canvas)]">
         <div class="w-full max-w-sm surface-panel rounded-3xl p-6 sm:p-8 border border-[var(--border-subtle)] shadow-2xl space-y-6 text-center">
           <div class="flex flex-col items-center gap-4">
-            <div class="w-16 h-16 rounded-2xl bg-[#1ed760]/15 border border-[#1ed760]/35 flex items-center justify-center text-[#1ed760] shadow-lg">
-              <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
-                <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"/>
-                <path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
-              </svg>
+            <div class="w-16 h-16 rounded-2xl overflow-hidden border border-white/15 shadow-lg">
+              <img src="./public/icon-192.png" alt="MultiPlayer" style="width:100%;height:100%;object-fit:cover;border-radius:inherit;display:block;" />
             </div>
             <div class="space-y-1">
               <h1 class="text-2xl font-bold tracking-tight text-white">MultiPlayer</h1>
@@ -6336,7 +6328,7 @@ class AudiobookApp {
     if (this.state.filterSource !== 'podcasts') {
       return '';
     }
-    const recentEpisodes = this.getRecentPodcastEpisodes(8);
+    const recentEpisodes = this.getRecentPodcastEpisodes(20);
     if (recentEpisodes.length === 0) return '';
     const activeBook = this.getActiveBook();
 
@@ -6562,6 +6554,10 @@ class AudiobookApp {
         <!-- Mobile Top Header -->
         <div class="px-4 pb-2 mobile-safe-top flex items-center justify-between gap-2">
           <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar min-w-0">
+            <div class="flex items-center gap-1.5 shrink-0 pr-1">
+              <img src="./public/icon-192.png" alt="" class="app-brand-icon" style="width:22px;height:22px;border-radius:6px;object-fit:cover;flex-shrink:0;" />
+              <span class="text-xs font-bold tracking-tight text-white">MultiPlayer</span>
+            </div>
             ${chip('audiobooks', 'Audiobooks', !isPodcastTab)}
             ${chip('podcasts', 'Podcasts', isPodcastTab)}
           </div>
@@ -6842,6 +6838,10 @@ class AudiobookApp {
           <!-- Left Collapsible Library Sidebar -->
           <aside class="${sidebarCollapsed ? 'w-[72px]' : 'w-64 lg:w-72'} shrink-0 surface-panel rounded-2xl flex flex-col overflow-hidden transition-all duration-300">
             <div class="p-3 space-y-2 border-b border-[var(--border-subtle)]">
+              <div class="flex items-center ${sidebarCollapsed ? 'justify-center' : 'gap-2.5 px-2.5'} py-1">
+                <img src="./public/icon-192.png" alt="" class="app-brand-icon" style="width:22px;height:22px;border-radius:6px;object-fit:cover;flex-shrink:0;" />
+                ${sidebarCollapsed ? '' : '<span class="text-sm font-bold tracking-tight text-white truncate">MultiPlayer</span>'}
+              </div>
               <button data-action="desktop-home" class="btn-press w-full flex items-center gap-3 px-2.5 py-2 rounded-xl text-sm font-semibold ${
                 desktopView === 'home' ? 'bg-white/10 text-white' : 'text-[var(--text-secondary)] hover:text-white'
               }">
@@ -7329,8 +7329,8 @@ class AudiobookApp {
 
     const displayedAudiobooks =
       searchFilter === 'audiobooks' || q
-        ? matchingAudiobooks
-        : matchingAudiobooks.slice(0, 6);
+        ? matchingAudiobooks.slice(0, 200)
+        : matchingAudiobooks.slice(0, 12);
 
     const matchingFollowedPodcasts =
       showPodcasts && q

@@ -1,6 +1,6 @@
-export const LOCAL_VERSION = '1.0.20';
-export const LOCAL_BUILD = 21;
-const LOCAL_BUILD_VERSION = '1.0.20';
+export const LOCAL_VERSION = '1.0.21';
+export const LOCAL_BUILD = 22;
+const LOCAL_BUILD_VERSION = '1.0.21';
 
 /**
  * Detect the runtime platform for update delivery.
@@ -509,6 +509,39 @@ export class SelfUpdaterService {
   }
 
   /**
+   * Clear WebView CacheStorage entries and update/unregister Service Workers before applying an OTA update.
+   * Ensures Capacitor `setServerBasePath(otaPath)` or Web PWA reloads are never shadowed by stale caches.
+   * @param {Object} [overrides]
+   */
+  async _clearWebViewCachesForOta(overrides = {}) {
+    const { win, nav, cachesApi } = this._getEnv(overrides);
+    const cacheStorage =
+      cachesApi || win?.caches || (typeof globalThis.caches !== 'undefined' ? globalThis.caches : null);
+    try {
+      if (cacheStorage && typeof cacheStorage.keys === 'function') {
+        const keys = await cacheStorage.keys();
+        await Promise.all(keys.map((k) => cacheStorage.delete(k)));
+      }
+    } catch {}
+
+    try {
+      if (nav?.serviceWorker && typeof nav.serviceWorker.getRegistrations === 'function') {
+        const regs = await nav.serviceWorker.getRegistrations();
+        await Promise.all(
+          regs.map(async (reg) => {
+            try {
+              await reg?.update?.();
+            } catch {}
+            try {
+              await reg?.unregister?.();
+            } catch {}
+          })
+        );
+      }
+    } catch {}
+  }
+
+  /**
    * Verify that the release package (.apk, web-bundle.zip, or .exe) for `manifest.version` is actually
    * built and published before starting download, preventing downloading an older `releases/latest` asset
    * while GitHub Actions CI is still compiling the new release.
@@ -547,9 +580,13 @@ export class SelfUpdaterService {
     }
 
     if (!isRepoReleaseDownloadUrl(rawUrl) || !remoteVersion || typeof fetchImpl !== 'function') {
+      const safeUrl =
+        remoteVersion && /\/releases\/latest\/download\//i.test(rawUrl)
+          ? `${GITHUB_RELEASES_TAG_DOWNLOAD_PREFIX}${encodeURIComponent(`v${remoteVersion}`)}/${expectedAssetFilename}`
+          : rawUrl;
       return {
         ready: true,
-        url: appendCacheBustParam(rawUrl, remoteVersion || this.currentVersion, remoteBuild),
+        url: appendCacheBustParam(safeUrl, remoteVersion || this.currentVersion, remoteBuild),
         deliveryMode,
         source: 'manifest'
       };
@@ -567,6 +604,15 @@ export class SelfUpdaterService {
 
       if (res && res.ok) {
         const releaseData = await res.json();
+        const releaseTag = String(releaseData?.tag_name || '').trim().replace(/^v/i, '');
+        if (releaseTag && releaseTag !== remoteVersion) {
+          return {
+            ready: false,
+            url: appendCacheBustParam(versionedDownloadUrl, remoteVersion, remoteBuild),
+            deliveryMode,
+            reason: 'release-not-published-yet'
+          };
+        }
         const assets = Array.isArray(releaseData?.assets) ? releaseData.assets : [];
         const matchedAsset = useWebOta
           ? assets.find((a) => String(a?.name || '').toLowerCase() === 'web-bundle.zip') ||
@@ -587,9 +633,14 @@ export class SelfUpdaterService {
                 .endsWith(expectedExt)
             );
         if (matchedAsset?.browser_download_url) {
+          const rawMatchedUrl = String(matchedAsset.browser_download_url);
+          const pinnedAssetName = matchedAsset.name || expectedAssetFilename;
+          const preferredUrl = /\/releases\/latest\/download\//i.test(rawMatchedUrl)
+            ? `${GITHUB_RELEASES_TAG_DOWNLOAD_PREFIX}${encodeURIComponent(tagName)}/${pinnedAssetName}`
+            : rawMatchedUrl;
           return {
             ready: true,
-            url: appendCacheBustParam(matchedAsset.browser_download_url, remoteVersion, remoteBuild),
+            url: appendCacheBustParam(preferredUrl, remoteVersion, remoteBuild),
             deliveryMode,
             source: 'github-release-api'
           };
@@ -598,7 +649,7 @@ export class SelfUpdaterService {
           ready: false,
           url: appendCacheBustParam(versionedDownloadUrl, remoteVersion, remoteBuild),
           deliveryMode,
-          reason: 'ci-building'
+          reason: 'release-not-published-yet'
         };
       }
 
@@ -615,7 +666,11 @@ export class SelfUpdaterService {
     }
 
     try {
-      const headRes = await fetchImpl(versionedDownloadUrl, { method: 'HEAD', cache: 'no-store' });
+      const headRes = await fetchImpl(versionedDownloadUrl, {
+        method: 'HEAD',
+        cache: 'no-store',
+        redirect: 'manual'
+      });
       if (headRes && (headRes.ok || headRes.status === 302 || headRes.type === 'opaqueredirect')) {
         return {
           ready: true,
@@ -629,18 +684,18 @@ export class SelfUpdaterService {
           ready: false,
           url: appendCacheBustParam(versionedDownloadUrl, remoteVersion, remoteBuild),
           deliveryMode,
-          reason: 'ci-building'
+          reason: 'release-not-published-yet'
         };
       }
     } catch {
-      // Cross-origin redirect HEAD can fail in WebView; fall back to versioned tag URL directly.
+      // Cross-origin redirect HEAD failed or network unavailable; wait for release instead of downloading stale /releases/latest.
     }
 
     return {
-      ready: true,
+      ready: false,
       url: appendCacheBustParam(versionedDownloadUrl, remoteVersion, remoteBuild),
       deliveryMode,
-      source: 'github-release-fallback'
+      reason: 'release-not-published-yet'
     };
   }
 
@@ -908,19 +963,7 @@ export class SelfUpdaterService {
         gate?.updateStatus('Clearing cached app files and applying update...', 35);
         gate?.setActionButton({ visible: false });
 
-        try {
-          if (cachesApi && typeof cachesApi.keys === 'function') {
-            const keys = await cachesApi.keys();
-            await Promise.all(keys.map((k) => cachesApi.delete(k)));
-          }
-        } catch {}
-
-        try {
-          if (nav?.serviceWorker && typeof nav.serviceWorker.getRegistrations === 'function') {
-            const regs = await nav.serviceWorker.getRegistrations();
-            await Promise.all(regs.map((r) => r.unregister?.()));
-          }
-        } catch {}
+        await this._clearWebViewCachesForOta({ windowObj: win, navigatorObj: nav, cachesObj: cachesApi });
 
         try {
           sessionStore?.setItem?.(SESSION_UPDATED_BUILD_KEY, String(remoteBuild));
@@ -1574,7 +1617,13 @@ export class SelfUpdaterService {
       }
 
       if (useWebOta && typeof win?.AudiobookUpdaterNative?.startWebOtaUpdate === 'function') {
-        const webUrl = activeManifest.webBundleUrl || this.webBundleUrl || DEFAULT_WEB_BUNDLE_URL;
+        let webUrl = activeManifest.webBundleUrl || this.webBundleUrl || DEFAULT_WEB_BUNDLE_URL;
+        const manifestVersion = String(activeManifest.version || activeManifest.latestVersion || '')
+          .trim()
+          .replace(/^v/i, '');
+        if (manifestVersion && /\/releases\/latest\/download\/web-bundle\.zip/i.test(webUrl)) {
+          webUrl = `${GITHUB_RELEASES_TAG_DOWNLOAD_PREFIX}${encodeURIComponent(`v${manifestVersion}`)}/web-bundle.zip`;
+        }
         if (!webUrl) {
           return {
             ok: false,
@@ -1586,6 +1635,11 @@ export class SelfUpdaterService {
           };
         }
         try {
+          await this._clearWebViewCachesForOta({
+            windowObj: win,
+            navigatorObj: nav,
+            cachesObj: callbacks.cachesObj
+          });
           win.AudiobookUpdaterNative.startWebOtaUpdate(webUrl);
           return {
             ok: true,

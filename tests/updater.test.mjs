@@ -158,8 +158,8 @@ test('applyOtaUpdate posts SKIP_WAITING to service worker and reloads', async ()
 });
 
 
-test('LOCAL_VERSION is 1.0.20 and detectPlatform distinguishes windows-tauri, android-apk, and web/PWA', () => {
-  assert.equal(LOCAL_VERSION, '1.0.20');
+test('LOCAL_VERSION is 1.0.21 and detectPlatform distinguishes windows-tauri, android-apk, and web/PWA', () => {
+  assert.equal(LOCAL_VERSION, '1.0.21');
   const service = new SelfUpdaterService({ storage: null });
 
   assert.equal(

@@ -6,6 +6,8 @@
 
 import { buildCuratedSvgCover } from './cover-search.js';
 
+export const MAX_PODCAST_EPISODES = 5000;
+
 export const PODCAST_CATEGORIES = [
   { id: 'trending', label: 'Trending', query: 'top podcasts' },
   { id: 'tech', label: 'Tech & AI', query: 'technology ai podcast' },
@@ -322,7 +324,7 @@ function filterCuratedPodcasts(query = '') {
  */
 export async function searchPodcasts(query = '', options = {}) {
   const trimmed = String(query || '').trim();
-  const limit = Number(options.limit) > 0 ? Math.min(Number(options.limit), 50) : 15;
+  const limit = Number(options.limit) > 0 ? Math.min(Number(options.limit), 200) : 30;
   const fetchImpl = options.fetchImpl || globalThis.fetch;
 
   // 1. Direct RSS URL pasted into search box
@@ -713,17 +715,17 @@ export function parsePodcastRssXml(xmlText = '', feedUrl = '') {
     extractTagAttribute(headerWithoutImage, 'atom:link', 'href') ||
     '';
 
-  // Extract up to 50 <item> or <entry> blocks
+  // Extract up to MAX_PODCAST_EPISODES (5000) <item> or <entry> blocks
   const itemBlocks = [];
   const itemRe = /<(item|entry)(?:\s[^>]*)?>([\s\S]*?)<\/\1>/gi;
   let itemMatch = itemRe.exec(xml);
-  while (itemMatch && itemBlocks.length < 60) {
+  while (itemMatch && itemBlocks.length < MAX_PODCAST_EPISODES) {
     itemBlocks.push(itemMatch[2]);
     itemMatch = itemRe.exec(xml);
   }
 
   const episodes = [];
-  for (let i = 0; i < itemBlocks.length && episodes.length < 50; i += 1) {
+  for (let i = 0; i < itemBlocks.length && episodes.length < MAX_PODCAST_EPISODES; i += 1) {
     const block = itemBlocks[i];
     let audioUrl =
       extractTagAttribute(block, 'enclosure', 'url') ||
@@ -848,7 +850,7 @@ export function createPodcastBookItem(parsedFeed = {}, existingBook = null) {
       ? parsedFeed.episodes
       : prevChapters;
 
-  const chapters = incomingEpisodes.slice(0, 50).map((ep, idx) => {
+  const chapters = incomingEpisodes.slice(0, MAX_PODCAST_EPISODES).map((ep, idx) => {
     const rawEpisodeId = String(ep?.episodeId || ep?.audioUrl || `${bookKey}-ep-${idx}`);
     const prevCh = prevByEpisodeId.get(rawEpisodeId) || (ep?.audioUrl ? prevByAudioUrl.get(String(ep.audioUrl)) : null);
     const audioUrl = String(ep?.audioUrl || ep?.driveStreamUrl || prevCh?.audioUrl || '');

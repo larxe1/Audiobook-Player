@@ -1252,7 +1252,7 @@ async function listDriveQueryPages(accessToken, q, fetchImpl, options = {}) {
     allFiles.push(...files);
     pageToken = data?.nextPageToken || '';
     guard += 1;
-  } while (pageToken && guard < 20);
+  } while (pageToken && guard < 100);
 
   return allFiles;
 }
@@ -1451,7 +1451,7 @@ export async function scanGoogleDriveFolder(
   if (!accessToken || typeof fetchImpl !== 'function') return [];
 
   const rootFolderId = extractGoogleDriveFolderId(folderIdOrUrl);
-  const maxDepth = Number.isFinite(options.maxDepth) ? options.maxDepth : 5;
+  const maxDepth = Number.isFinite(options.maxDepth) ? options.maxDepth : 12;
   const concurrency = Math.max(1, Math.min(8, Number(options.concurrency) || 4));
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
   const signal = options.signal || null;
