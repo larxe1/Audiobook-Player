@@ -1,5 +1,6 @@
 package com.audiobook.player;
 
+import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
 import android.net.Uri;
@@ -31,6 +32,8 @@ public class AudiobookOAuthBridge {
     private static final String DEEP_LINK_SCHEME = "com.audiobook.player";
     private static final String DEEP_LINK_HOST = "oauth";
     private static final String DEFAULT_PROMPT = "select_account";
+    private static final String PREFS_NAME = "audiobook_auth_prefs";
+    private static final String KEY_AUTH_SESSION = "auth_session_v1";
 
     private final BridgeActivity activity;
     private String pendingResultJson;
@@ -125,6 +128,47 @@ public class AudiobookOAuthBridge {
         String result = pendingResultJson;
         pendingResultJson = null;
         return result;
+    }
+
+    @JavascriptInterface
+    public boolean saveAuthSession(String sessionJson) {
+        if (sessionJson == null || sessionJson.trim().isEmpty()) {
+            clearAuthSession();
+            return true;
+        }
+        try {
+            return activity
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_AUTH_SESSION, sessionJson)
+                .commit();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    @JavascriptInterface
+    public String loadAuthSession() {
+        try {
+            return activity
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_AUTH_SESSION, null);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    @JavascriptInterface
+    public boolean clearAuthSession() {
+        try {
+            return activity
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_AUTH_SESSION)
+                .commit();
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     public boolean handleRedirectIntent(Intent intent) {

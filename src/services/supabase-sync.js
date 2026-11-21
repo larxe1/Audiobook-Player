@@ -609,6 +609,8 @@ export class SupabaseSyncService {
     this._remoteListeners = new Set();
     /** @type {Set<Function>} */
     this._flushListeners = new Set();
+    /** @type {Set<Function>} */
+    this._googleTokenListeners = new Set();
     this._channel = null;
     this._ws = null;
     this._heartbeatTimer = null;
@@ -658,25 +660,157 @@ export class SupabaseSyncService {
     return generateId('dev');
   }
 
+  _getTauriInvoke() {
+    const fn =
+      this.windowObj?.__TAURI_INTERNALS__?.invoke ||
+      this.windowObj?.__TAURI__?.core?.invoke;
+    return typeof fn === 'function' ? fn : null;
+  }
+
+  _parseAuthSessionJson(raw) {
+    if (!raw) return null;
+    try {
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        if (parsed.user || parsed.access_token || parsed.provider_token || parsed.auth_mode) {
+          return parsed;
+        }
+      }
+    } catch {
+      // Ignore corrupt session payloads
+    }
+    return null;
+  }
+
+  _loadAndroidNativeAuthSessionSync() {
+    if (!this._isCapacitorEnvironment()) return null;
+    const nativeBridge = this.windowObj?.AudiobookOAuthNative;
+    if (typeof nativeBridge?.loadAuthSession !== 'function') return null;
+    try {
+      return this._parseAuthSessionJson(nativeBridge.loadAuthSession());
+    } catch {
+      return null;
+    }
+  }
+
+  async _loadNativeAuthSession() {
+    if (this._isTauriEnvironment()) {
+      const tauriInvoke = this._getTauriInvoke();
+      if (tauriInvoke) {
+        try {
+          const raw = await tauriInvoke('desktop_load_auth_session', {});
+          const parsed = this._parseAuthSessionJson(raw);
+          if (parsed) return parsed;
+        } catch {
+          // Ignore native desktop session read errors
+        }
+      }
+    }
+    if (this._isCapacitorEnvironment()) {
+      const androidSession = this._loadAndroidNativeAuthSessionSync();
+      if (androidSession) return androidSession;
+    }
+    return null;
+  }
+
+  _persistNativeAuthSession(session) {
+    if (!session) {
+      void this._clearNativeAuthSession();
+      return;
+    }
+    let sessionJson;
+    try {
+      sessionJson = JSON.stringify(session);
+    } catch {
+      return;
+    }
+    if (this._isTauriEnvironment()) {
+      const tauriInvoke = this._getTauriInvoke();
+      if (tauriInvoke) {
+        try {
+          Promise.resolve(tauriInvoke('desktop_save_auth_session', { sessionJson })).catch(() => {});
+        } catch {
+          // Ignore native desktop save errors
+        }
+      }
+    }
+    if (this._isCapacitorEnvironment()) {
+      try {
+        this.windowObj?.AudiobookOAuthNative?.saveAuthSession?.(sessionJson);
+      } catch {
+        // Ignore native Android save errors
+      }
+    }
+  }
+
+  async _clearNativeAuthSession() {
+    if (this._isTauriEnvironment()) {
+      const tauriInvoke = this._getTauriInvoke();
+      if (tauriInvoke) {
+        try {
+          await tauriInvoke('desktop_clear_auth_session', {});
+        } catch {
+          // Ignore native desktop clear errors
+        }
+      }
+    }
+    if (this._isCapacitorEnvironment()) {
+      try {
+        this.windowObj?.AudiobookOAuthNative?.clearAuthSession?.();
+      } catch {
+        // Ignore native Android clear errors
+      }
+    }
+  }
+
+  async _fetchWithTimeout(url, init = {}, timeoutMs = 8000) {
+    if (!this.fetchImpl) {
+      throw new Error('fetch implementation is not available');
+    }
+    if (
+      typeof AbortController !== 'function' ||
+      init?.signal ||
+      !Number.isFinite(timeoutMs) ||
+      timeoutMs <= 0
+    ) {
+      return this.fetchImpl(url, init);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      try {
+        controller.abort();
+      } catch {
+        // ignore
+      }
+    }, timeoutMs);
+    timer?.unref?.();
+    try {
+      return await this.fetchImpl(url, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   _loadSession() {
     if (this.storage) {
       try {
         const raw = this.storage.getItem(SESSION_STORAGE_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed === 'object') {
-            return parsed;
-          }
+        const parsed = this._parseAuthSessionJson(raw);
+        if (parsed) {
+          return parsed;
         }
       } catch {
-        // Fall back to durable OfflineSyncQueue backup
+        // Fall back to durable OfflineSyncQueue / native backup
       }
     }
     const backup = this.offlineQueue?.getAuthSession?.();
-    return backup && typeof backup === 'object' ? backup : null;
+    if (backup && typeof backup === 'object') {
+      return backup;
+    }
+    return this._loadAndroidNativeAuthSessionSync();
   }
 
-  _saveSession(session) {
+  _saveSession(session, { skipNativeWrite = false } = {}) {
     this.session = session || null;
     if (this.storage) {
       try {
@@ -694,6 +828,68 @@ export class SupabaseSyncService {
     } else {
       this.offlineQueue?.clearAuthSession?.();
     }
+    if (!skipNativeWrite) {
+      this._persistNativeAuthSession(this.session);
+    }
+  }
+
+  /**
+   * Fast, zero-network hydration of persisted session across localStorage,
+   * IndexedDB (OfflineSyncQueue), and native OS storage (Tauri disk / Android SharedPreferences).
+   * Re-persists any recovered session back across all layers.
+   * @returns {Promise<object|null>}
+   */
+  async hydratePersistedSession() {
+    await this.offlineQueue?.ready?.();
+    let parsedLocal = null;
+    if (this.storage) {
+      try {
+        const raw = this.storage.getItem(SESSION_STORAGE_KEY);
+        parsedLocal = this._parseAuthSessionJson(raw);
+      } catch {
+        parsedLocal = null;
+      }
+    }
+
+    let session = parsedLocal;
+    let recoveredFromBackup = false;
+
+    if (!session) {
+      const idbBackup = this.offlineQueue?.getAuthSession?.();
+      if (idbBackup && typeof idbBackup === 'object') {
+        session = idbBackup;
+        recoveredFromBackup = true;
+      }
+    }
+
+    if (!session) {
+      const nativeSession = await this._loadNativeAuthSession();
+      if (nativeSession) {
+        session = nativeSession;
+        recoveredFromBackup = true;
+      }
+    }
+
+    if (!session && this.session && typeof this.session === 'object') {
+      session = this.session;
+    }
+
+    this.session = session || null;
+
+    if (this.session) {
+      if (recoveredFromBackup || !parsedLocal) {
+        this._saveSession(this.session, { skipNativeWrite: false });
+      }
+      this.googleAccessToken =
+        this.session?.provider_token ||
+        this.session?.googleAccessToken ||
+        this._loadManualGoogleToken() ||
+        null;
+    } else {
+      this.googleAccessToken = this._loadManualGoogleToken() || null;
+    }
+
+    return this.session?.user ? this.session : null;
   }
 
   _isOnline() {
@@ -874,11 +1070,38 @@ export class SupabaseSyncService {
   }
 
   /**
+   * Subscribes to Google access token updates (e.g., silent refresh, OAuth completion, or token expiry).
+   * Returns an unsubscribe function.
+   * @param {(token: string|null) => void} callback
+   * @returns {() => void}
+   */
+  onGoogleTokenChange(callback) {
+    if (typeof callback !== 'function') {
+      throw new Error('Callback must be a function');
+    }
+    this._googleTokenListeners.add(callback);
+    return () => {
+      this._googleTokenListeners.delete(callback);
+    };
+  }
+
+  _emitGoogleTokenChange(token) {
+    for (const listener of this._googleTokenListeners) {
+      try {
+        listener(token || null);
+      } catch {
+        // Isolate subscriber errors
+      }
+    }
+  }
+
+  /**
    * Persists a Google OAuth provider token for Google Drive API v3 calls.
    * @param {string|null} token
    */
   setGoogleAccessToken(token) {
     const clean = typeof token === 'string' ? token.trim() : '';
+    const obtainedAt = clean ? Date.now() : null;
     this.googleAccessToken = clean || null;
     if (clean) {
       this.needsDriveSyncReauth = false;
@@ -904,9 +1127,11 @@ export class SupabaseSyncService {
       this._saveSession({
         ...this.session,
         provider_token: clean || null,
-        ...(clean ? { googleAccessToken: clean } : { googleAccessToken: null })
+        googleAccessToken: clean || null,
+        googleTokenObtainedAt: obtainedAt
       });
     }
+    this._emitGoogleTokenChange(this.googleAccessToken);
   }
 
   /**
@@ -972,6 +1197,7 @@ export class SupabaseSyncService {
     const ua = this.navigatorObj?.userAgent || '';
     return Boolean(
       this.windowObj?.Capacitor ||
+        this.windowObj?.AudiobookOAuthNative ||
         protocol === 'capacitor:' ||
         /^capacitor:\/\//i.test(origin) ||
         (/Android/i.test(ua) && /^https?:\/\/localhost(?::\d+)?$/i.test(origin))
@@ -1011,35 +1237,16 @@ export class SupabaseSyncService {
    * @returns {Promise<object|null>}
    */
   async restoreSession() {
-    await this.offlineQueue?.ready?.();
-    let parsedLocal = null;
-    if (this.storage) {
-      try {
-        const raw = this.storage.getItem(SESSION_STORAGE_KEY);
-        parsedLocal = raw ? JSON.parse(raw) : null;
-      } catch {
-        parsedLocal = null;
-      }
-    }
-    this.session = this._loadSession();
+    await this.hydratePersistedSession();
     if (!this.session) {
       return null;
     }
-    if (!parsedLocal || typeof parsedLocal !== 'object') {
-      // Re-persist session recovered from IndexedDB backup into localStorage
-      this._saveSession(this.session);
-    }
-    this.googleAccessToken =
-      this.session?.provider_token ||
-      this.session?.googleAccessToken ||
-      this._loadManualGoogleToken() ||
-      null;
 
     if (this.session.auth_mode === 'google_oauth') {
       const googleToken = this.getGoogleAccessToken();
       if (googleToken && this._isOnline() && this.fetchImpl) {
         try {
-          const res = await this.fetchImpl('https://www.googleapis.com/oauth2/v3/userinfo', {
+          const res = await this._fetchWithTimeout('https://www.googleapis.com/oauth2/v3/userinfo', {
             headers: { Authorization: `Bearer ${googleToken}` }
           });
           if (res.ok) {
@@ -1062,7 +1269,9 @@ export class SupabaseSyncService {
             this._saveSession({ ...this.session, user: updatedUser });
           } else if (res.status === 401) {
             this.setGoogleAccessToken(null);
-            this.needsDriveSyncReauth = true;
+            if (!this._isTauriEnvironment()) {
+              this.needsDriveSyncReauth = true;
+            }
           } else if (res.status === 403) {
             this.setGoogleAccessToken(null);
             this.needsDriveSyncReauth = true;
@@ -1076,7 +1285,7 @@ export class SupabaseSyncService {
 
     if (this.session?.access_token && this._isOnline() && this.fetchImpl) {
       try {
-        const res = await this.fetchImpl(`${this.config.url}/auth/v1/user`, {
+        const res = await this._fetchWithTimeout(`${this.config.url}/auth/v1/user`, {
           headers: {
             apikey: this.config.publishableKey,
             Authorization: `Bearer ${this.session.access_token}`
@@ -1139,6 +1348,7 @@ export class SupabaseSyncService {
     if (
       this.session?.auth_mode === 'google_oauth' &&
       !this.getGoogleAccessToken() &&
+      !this.needsDriveConsent &&
       this._isTauriEnvironment()
     ) {
       const refreshed = await this._trySilentGoogleRefresh().catch(() => false);
@@ -1566,12 +1776,14 @@ export class SupabaseSyncService {
       this.session?.user?.user_metadata?.avatar_url ||
       (email ? await computeGravatarUrl(email) : '');
 
+    const tokenObtainedAt = Date.now();
     if (this.isAuthenticated()) {
       const updated = {
         ...this.session,
         auth_mode: 'google_oauth',
         provider_token: cleanToken,
         googleAccessToken: cleanToken,
+        googleTokenObtainedAt: tokenObtainedAt,
         user: {
           ...this.session.user,
           email: this.session.user.email || email,
@@ -1593,6 +1805,7 @@ export class SupabaseSyncService {
       access_token: null,
       provider_token: cleanToken,
       googleAccessToken: cleanToken,
+      googleTokenObtainedAt: tokenObtainedAt,
       auth_mode: 'google_oauth',
       user: {
         id: info.sub ? `google_${info.sub}` : 'google_user',
@@ -1681,7 +1894,7 @@ export class SupabaseSyncService {
     const promptValue = options.forceConsent ? 'select_account consent' : (options.prompt || 'select_account');
 
     // 1. Native Tauri Desktop Google Sign-In Popup (opens dedicated WebviewWindow to accounts.google.com)
-    const tauriInvoke = this.windowObj?.__TAURI_INTERNALS__?.invoke || this.windowObj?.__TAURI__?.core?.invoke;
+    const tauriInvoke = this._getTauriInvoke();
     if (!options.forceBrowserPopup && this._isTauriEnvironment() && typeof tauriInvoke === 'function') {
       try {
         const startRes = await tauriInvoke('desktop_start_google_oauth', {
@@ -1693,6 +1906,13 @@ export class SupabaseSyncService {
         if (startRes?.status === 'success' && startRes?.accessToken) {
           return await this.completeGoogleOAuthToken(startRes.accessToken);
         }
+        if (startRes?.status === 'superseded') {
+          return {
+            ok: false,
+            reason: 'superseded',
+            error: 'Sign-in superseded by a newer request.'
+          };
+        }
         if (startRes?.status === 'needs_interactive' && options.silent) {
           if (options.autoInteractiveOnSilentFail !== false) {
             return this.signInWithGooglePopup({ ...options, silent: false });
@@ -1703,12 +1923,24 @@ export class SupabaseSyncService {
             error: 'Interactive Google sign-in required.'
           };
         }
+        const attemptId = startRes?.attemptId ?? null;
+        const pollTimeoutMs = options.silent ? 15000 : 180000;
         const startedAt = Date.now();
-        while (Date.now() - startedAt < 180000) {
+        while (Date.now() - startedAt < pollTimeoutMs) {
           await new Promise((r) => setTimeout(r, 350));
-          const pollRes = await tauriInvoke('desktop_poll_google_oauth', {});
+          const pollRes = await tauriInvoke(
+            'desktop_poll_google_oauth',
+            attemptId != null ? { attemptId } : {}
+          );
           if (pollRes?.status === 'success' && pollRes?.accessToken) {
             return await this.completeGoogleOAuthToken(pollRes.accessToken);
+          }
+          if (pollRes?.status === 'superseded') {
+            return {
+              ok: false,
+              reason: 'superseded',
+              error: 'Sign-in superseded by a newer request.'
+            };
           }
           if (pollRes?.status === 'closed') {
             return {
@@ -2323,10 +2555,11 @@ export class SupabaseSyncService {
     this._bridgeInFlight?.clear();
     this._silentGoogleRefreshInFlight = null;
     this._lastSilentGoogleRefreshFailAt = 0;
+    this._saveSession(null, { skipNativeWrite: true });
     this.setGoogleAccessToken(null);
-    this._saveSession(null);
     this.disconnectRealtime();
-    const tauriInvoke = this.windowObj?.__TAURI_INTERNALS__?.invoke || this.windowObj?.__TAURI__?.core?.invoke;
+    await this._clearNativeAuthSession();
+    const tauriInvoke = this._getTauriInvoke();
     if (this._isTauriEnvironment() && typeof tauriInvoke === 'function') {
       try {
         await tauriInvoke('desktop_clear_google_oauth', {});
@@ -2334,6 +2567,29 @@ export class SupabaseSyncService {
         // Ignore cleanup errors
       }
     }
+  }
+
+  /**
+   * Proactively refreshes the 1-hour Google Drive access token on Windows Tauri
+   * before expiry (default: 45 minutes) or whenever missing, without prompting.
+   * @param {{ maxAgeMs?: number }} [options]
+   * @returns {Promise<boolean>}
+   */
+  async ensureFreshGoogleToken({ maxAgeMs = 45 * 60 * 1000 } = {}) {
+    if (
+      this._isTauriEnvironment() &&
+      this.session?.auth_mode === 'google_oauth' &&
+      this._isOnline() &&
+      !this.needsDriveConsent
+    ) {
+      const currentToken = this.getGoogleAccessToken();
+      const obtainedAt = Number(this.session?.googleTokenObtainedAt || 0);
+      const isStale = obtainedAt > 0 && Date.now() - obtainedAt >= maxAgeMs;
+      if (!currentToken || isStale) {
+        await this._trySilentGoogleRefresh().catch(() => false);
+      }
+    }
+    return Boolean(this.getGoogleAccessToken());
   }
 
   /**

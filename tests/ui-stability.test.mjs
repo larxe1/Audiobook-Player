@@ -1019,3 +1019,242 @@ test('returning via focus or visibilitychange after Android installing resets in
     env.restore();
   }
 });
+
+test('startup never flashes Login Screen when persisted session exists in localStorage or native/IDB while restoreSession is pending', async () => {
+  // Part 1: Persisted Google session in localStorage -> immediate workspace, NEVER login view
+  const env1 = createDomEnv({ innerWidth: 1280 });
+  let app1 = null;
+  try {
+    globalThis.localStorage.setItem(
+      'audiobook_player_supabase_session_v1',
+      JSON.stringify({
+        access_token: 'supa-jwt-1',
+        provider_token: 'ya29.expired_1h',
+        auth_mode: 'google_oauth',
+        user: {
+          id: 'user-1',
+          email: 'reader@gmail.com',
+          user_metadata: { full_name: 'Reader One' }
+        }
+      })
+    );
+    const cachedBook = makeBook(1, { title: 'Dune', author: 'Frank Herbert', series: 'Dune' });
+    globalThis.localStorage.setItem('audiobook_user_library_v1', JSON.stringify([cachedBook]));
+    globalThis.localStorage.setItem('audiobook_player_active_book_v1', cachedBook.bookKey);
+
+    app1 = new AudiobookApp(env1.rootEl);
+    app1._enrichSingleBookInBackground = async () => {};
+    app1._runBackgroundMetadataEnrichment = async () => {};
+    app1.handleCheckForUpdate = async () => {};
+    const loadedBooks = [];
+    app1.audioEngine.loadBook = async (book, startPos) => {
+      loadedBooks.push({ bookKey: book.bookKey, startPos });
+      app1.audioEngine.currentBook = book;
+      app1.audioEngine.durationSec = book.totalDurationSec || 3600;
+    };
+    app1.syncService.fetchImpl = async () => ({ ok: false, status: 500, async text() { return ''; } });
+    app1.syncService.syncLibraryItems = async () => null;
+    app1.syncService.fetchLibraryItems = async () => [];
+    app1.syncService.fetchAllProgress = async () => ({});
+    app1.syncService.fetchBookmarks = async () => [];
+    app1.syncService.fetchDevices = async () => [];
+    app1.syncService.fetchDriveFolderConfig = async () => null;
+    app1.syncService.pullCloudSnapshot = async () => ({
+      changed: true,
+      library: [],
+      progress: {
+        [cachedBook.bookKey]: {
+          bookKey: cachedBook.bookKey,
+          chapterIndex: 0,
+          positionSec: 320,
+          clientUpdatedAt: '2026-11-21T12:00:00.000Z'
+        }
+      },
+      devices: [],
+      driveFolder: null,
+      latestActivePlayback: {
+        bookKey: cachedBook.bookKey,
+        bookTitle: cachedBook.title,
+        chapterIndex: 0,
+        positionSec: 320,
+        isPlaying: false,
+        updatedAt: '2026-11-21T12:00:00.000Z',
+        deviceId: 'other-dev',
+        deviceName: 'Other Device'
+      }
+    });
+    app1.syncService.registerDevice = async () => null;
+
+    // Constructor eagerly hydrates user synchronously
+    assert.equal(app1.user?.email, 'reader@gmail.com');
+
+    let resolveRestore;
+    const restoreGate = new Promise((r) => {
+      resolveRestore = r;
+    });
+    app1.syncService.restoreSession = async () => {
+      await restoreGate;
+      app1.syncService.setGoogleAccessToken('ya29.silently_refreshed');
+      return app1.syncService.session;
+    };
+
+    const initPromise = app1.init();
+    // Simulate MediaSessionBridge firing onAudioOutputChange ~10ms into startup while restoreSession() is still pending
+    await new Promise((r) => setTimeout(r, 10));
+    app1.mediaBridge.onAudioOutputChange({
+      activeLabel: 'Headphones',
+      activeDeviceId: 'dev-1',
+      devices: [{ deviceId: 'dev-1', label: 'Headphones' }]
+    });
+
+    assert.equal(
+      env1.rootEl.querySelector('[data-action="login-google"]'),
+      null,
+      'Login screen must NEVER render while restoreSession() is pending'
+    );
+    assert.ok(
+      env1.rootEl.querySelector('#book-list') || env1.rootEl.querySelector('#appMainLayer'),
+      'Signed-in workspace must render immediately with cached local books'
+    );
+    assert.equal(app1.books.length, 1);
+
+    resolveRestore();
+    await initPromise;
+    assert.equal(app1.audioEngine.driveAccessToken, 'ya29.silently_refreshed');
+    assert.equal(env1.rootEl.querySelector('[data-action="login-google"]'), null);
+    assert.equal(
+      loadedBooks.length,
+      1,
+      'startup must still call audioEngine.loadBook even when fast hydration pre-set matching activeBookKey'
+    );
+    assert.equal(loadedBooks[0].bookKey, cachedBook.bookKey);
+    assert.equal(loadedBooks[0].startPos, 320);
+    assert.equal(app1.audioEngine.currentBook?.bookKey, cachedBook.bookKey);
+  } finally {
+    app1?.destroy?.();
+    env1.restore();
+  }
+
+  // Part 2: localStorage wiped, session recovered async from native/IDB -> shows #authRestoringView (NEVER Login Screen) while hydrating
+  const env2 = createDomEnv({ innerWidth: 390 });
+  let app2 = null;
+  try {
+    app2 = new AudiobookApp(env2.rootEl);
+    app2._enrichSingleBookInBackground = async () => {};
+    app2._runBackgroundMetadataEnrichment = async () => {};
+    app2.handleCheckForUpdate = async () => {};
+    app2.audioEngine.loadBook = async () => {};
+    app2.syncService.fetchImpl = async () => ({ ok: false, status: 500, async text() { return ''; } });
+    app2.syncService.syncLibraryItems = async () => null;
+    app2.syncService.fetchLibraryItems = async () => [];
+    app2.syncService.fetchAllProgress = async () => ({});
+    app2.syncService.fetchBookmarks = async () => [];
+    app2.syncService.fetchDevices = async () => [];
+    app2.syncService.fetchDriveFolderConfig = async () => null;
+    app2.syncService.pullCloudSnapshot = async () => ({
+      changed: false,
+      library: [],
+      progress: {},
+      devices: [],
+      driveFolder: null,
+      latestActivePlayback: null
+    });
+    app2.syncService.registerDevice = async () => null;
+
+    let resolveHydrate;
+    let resolveRestore;
+    const hydrateGate = new Promise((r) => {
+      resolveHydrate = r;
+    });
+    const restoreGate = new Promise((r) => {
+      resolveRestore = r;
+    });
+
+    app2.syncService.hydratePersistedSession = async () => {
+      await hydrateGate;
+      app2.syncService.setSession({
+        access_token: 'supa-recovered',
+        auth_mode: 'google_oauth',
+        provider_token: 'ya29.recovered_tok',
+        user: { id: 'u-rec', email: 'recovered@gmail.com', user_metadata: { full_name: 'Recovered User' } }
+      });
+      return app2.syncService.session;
+    };
+    app2.syncService.restoreSession = async () => {
+      await restoreGate;
+      return app2.syncService.session;
+    };
+
+    const initPromise = app2.init();
+    // While hydratePersistedSession() is still awaiting native disk / IDB, fire MediaSessionBridge render
+    app2.mediaBridge.onAudioOutputChange({
+      activeLabel: 'Speaker',
+      activeDeviceId: 'default',
+      devices: []
+    });
+
+    assert.equal(
+      env2.rootEl.querySelector('[data-action="login-google"]'),
+      null,
+      'Login screen must NEVER flash while hydratePersistedSession() is pending'
+    );
+    assert.ok(
+      env2.rootEl.querySelector('#authRestoringView'),
+      'Minimal restoring view must render while async native/IDB hydration is in flight'
+    );
+
+    // Finish fast hydration while slow network restoreSession() is still pending
+    resolveHydrate();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(app2.user?.email, 'recovered@gmail.com');
+    assert.equal(env2.rootEl.querySelector('[data-action="login-google"]'), null);
+    assert.equal(env2.rootEl.querySelector('#authRestoringView'), null);
+
+    resolveRestore();
+    await initPromise;
+    assert.equal(env2.rootEl.querySelector('[data-action="login-google"]'), null);
+  } finally {
+    app2?.destroy?.();
+    env2.restore();
+  }
+});
+
+test('guestLocalMode persists across AudiobookApp restart and clears on handleSignOut', async () => {
+  const env = createDomEnv({ innerWidth: 1280 });
+  let app1 = null;
+  let app2 = null;
+  try {
+    app1 = new AudiobookApp(env.rootEl);
+    app1._enrichSingleBookInBackground = async () => {};
+    app1._runBackgroundMetadataEnrichment = async () => {};
+    app1.audioEngine.loadBook = async () => {};
+
+    assert.equal(app1.guestLocalMode, false);
+    await app1.enterLocalMode();
+    assert.equal(app1.guestLocalMode, true);
+    assert.equal(globalThis.localStorage.getItem('audiobook_player_guest_mode_v1'), '1');
+
+    // Simulate full app restart -> new AudiobookApp immediately restores guestLocalMode without login screen
+    app1.destroy();
+    app1 = null;
+
+    app2 = new AudiobookApp(env.rootEl);
+    app2._enrichSingleBookInBackground = async () => {};
+    app2._runBackgroundMetadataEnrichment = async () => {};
+    app2.audioEngine.loadBook = async () => {};
+
+    assert.equal(app2.guestLocalMode, true);
+    app2.render();
+    assert.equal(env.rootEl.querySelector('[data-action="login-google"]'), null);
+
+    // Explicit sign-out clears persisted guestLocalMode and returns to Login Screen
+    await app2.handleSignOut();
+    assert.equal(app2.guestLocalMode, false);
+    assert.equal(globalThis.localStorage.getItem('audiobook_player_guest_mode_v1'), null);
+    assert.ok(env.rootEl.querySelector('[data-action="login-google"]'));
+  } finally {
+    app1?.destroy?.();
+    app2?.destroy?.();
+    env.restore();
+  }
+});

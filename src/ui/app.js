@@ -120,6 +120,7 @@ const STORAGE_THEME_KEY = 'audiobook_player_theme_v1';
 const STORAGE_LIBRARY_KEY = 'audiobook_user_library_v1';
 const STORAGE_ACTIVE_BOOK_KEY = 'audiobook_player_active_book_v1';
 const STORAGE_LAST_EMAIL_KEY = 'audiobook_player_last_email_v1';
+const STORAGE_GUEST_MODE_KEY = 'audiobook_player_guest_mode_v1';
 
 const PLAYBACK_RATES = [1.0, 1.25, 1.5, 1.75, 2.0];
 
@@ -177,6 +178,10 @@ class AudiobookApp {
       onOfflineChange: (bookKey, cached) => this._handleOfflineChange(bookKey, cached),
       onError: (errMsg) => {
         if (errMsg) this.showError('Playback Error', errMsg);
+      },
+      onDriveTokenExpired: async () => {
+        const refreshed = await this.syncService?._trySilentGoogleRefresh?.().catch(() => false);
+        return refreshed ? (this.syncService?.getGoogleAccessToken?.() || null) : null;
       }
     });
 
@@ -207,8 +212,21 @@ class AudiobookApp {
     const initialAudioOutput = this.mediaBridge.getAudioOutputState();
     const initialAndroidAuto = this.mediaBridge.isAndroidAutoConnected();
 
-    this.user = null;
-    this.guestLocalMode = false;
+    this.user = this.syncService.getUserProfile();
+    this.guestLocalMode = !this.user && this._loadGuestLocalMode();
+    this._initializingAuth = false;
+    const initialGoogleToken = this.syncService.getGoogleAccessToken?.();
+    if (initialGoogleToken) {
+      this.audioEngine.setDriveAccessToken(initialGoogleToken);
+    }
+    this._unsubGoogleToken =
+      this.syncService.onGoogleTokenChange?.((token) => {
+        this.audioEngine.setDriveAccessToken(token);
+        if (token && this.state) {
+          this.state.needsDriveSyncReauth = false;
+        }
+      }) || null;
+    this._unsubRemotePlayback = null;
 
     this.state = {
       theme: this._loadTheme(),
@@ -1157,8 +1175,14 @@ class AudiobookApp {
 
     const sig = `${chosen.deviceId || 'cloud'}:${matchedBook.bookKey}:${chosen.updatedAt || Math.round(targetPos)}:${targetChapter}:${chosen.isPlaying ? 1 : 0}`;
     const isRemoteNewer = chosen.updatedAtMs > 0 && chosen.updatedAtMs > (this._lastLocalPlayAt || 0);
+    const engineMissingActiveBook =
+      !this.audioEngine?.currentBook ||
+      this.audioEngine.currentBook.bookKey !== matchedBook.bookKey;
     const shouldSelectBook =
       !this.state.activeBookKey ||
+      (this.state.activeBookKey === matchedBook.bookKey &&
+        engineMissingActiveBook &&
+        (isStartup || this._lastHydratedRemoteSig !== sig)) ||
       (this.state.activeBookKey !== matchedBook.bookKey &&
         this._lastHydratedRemoteSig !== sig &&
         (isStartup || chosen.isPlaying || isRemoteNewer));
@@ -1217,6 +1241,14 @@ class AudiobookApp {
       clearTimeout(this._statusToastTimer);
       this._statusToastTimer = null;
     }
+    if (typeof this._unsubGoogleToken === 'function') {
+      this._unsubGoogleToken();
+      this._unsubGoogleToken = null;
+    }
+    if (typeof this._unsubRemotePlayback === 'function') {
+      this._unsubRemotePlayback();
+      this._unsubRemotePlayback = null;
+    }
     this._clearAndroidUpdateReturnListener();
     this.syncService?.destroy?.();
     this.audioEngine?.destroy?.();
@@ -1229,6 +1261,13 @@ class AudiobookApp {
 
     this._syncInFlight = (async () => {
       try {
+        if (
+          this.user &&
+          this.syncService?.session?.auth_mode === 'google_oauth' &&
+          this.syncService?._isTauriEnvironment?.()
+        ) {
+          await this.syncService.ensureFreshGoogleToken?.().catch(() => false);
+        }
         const snapshot = await this._pullCloudSnapshotUnified({ force: force || true });
 
         const prevReauth = this.state.needsDriveSyncReauth;
@@ -1475,10 +1514,59 @@ class AudiobookApp {
     if (!this._destroyed) {
       void this.handleCheckForUpdate({ silent: true });
     }
-    await this.offlineQueue.ready();
+
+    this._initializingAuth = true;
+    const hasOAuthHash = Boolean(
+      typeof window !== 'undefined' && window.location?.hash?.includes('access_token=')
+    );
+
+    if (typeof this.syncService.hydratePersistedSession === 'function') {
+      await this.syncService.hydratePersistedSession().catch(() => null);
+    } else {
+      await this.offlineQueue.ready();
+    }
+
+    this.user = this.syncService.getUserProfile();
+    this.guestLocalMode = !this.user && this._loadGuestLocalMode();
+
+    const hydratedToken = this.syncService.getGoogleAccessToken?.();
+    if (hydratedToken) {
+      this.audioEngine.setDriveAccessToken(hydratedToken);
+    }
+
+    if (!hasOAuthHash) {
+      this._initializingAuth = false;
+    }
+
+    if (this.user || this.guestLocalMode) {
+      if (this.books.length === 0) {
+        this.books = this._loadBooks();
+        if (this.books.length > 0 && !this.state.activeBookKey) {
+          let savedActiveKey = null;
+          try {
+            savedActiveKey = localStorage.getItem(STORAGE_ACTIVE_BOOK_KEY);
+          } catch {
+            // ignore
+          }
+          const initialLocalBook =
+            this.books.find(
+              (b) =>
+                b.bookKey === savedActiveKey ||
+                (savedActiveKey && this._legacyBookKeyMap?.get(b.bookKey)?.has(savedActiveKey))
+            ) || this.books[0];
+          if (initialLocalBook) {
+            this.state.activeBookKey = initialLocalBook.bookKey;
+          }
+        }
+      }
+      this._bindGlobalInputs();
+      this.render();
+    } else if (hasOAuthHash) {
+      this.render();
+    }
 
     // Handle OAuth callback if returning from Google login
-    if (typeof window !== 'undefined' && window.location.hash.includes('access_token=')) {
+    if (hasOAuthHash) {
       const callbackSession = await this.syncService
         .handleAuthCallback(window.location.hash)
         .catch(() => null);
@@ -1488,16 +1576,21 @@ class AudiobookApp {
       if (!callbackSession) {
         this.state.authError = 'Google sign-in could not be completed.';
       }
+      this._initializingAuth = false;
     } else {
       await this.syncService.restoreSession().catch(() => null);
     }
 
     this.user = this.syncService.getUserProfile();
+    if (this.user) {
+      this._saveGuestLocalMode(false);
+    } else {
+      this.guestLocalMode = this._loadGuestLocalMode();
+    }
 
     const token = this.syncService.getGoogleAccessToken();
-    if (token) {
-      this.audioEngine.setDriveAccessToken(token);
-    }
+    this.audioEngine.setDriveAccessToken(token || null);
+    this.state.needsDriveSyncReauth = Boolean(this.syncService?.needsDriveSyncReauth);
 
     if (this.user || this.guestLocalMode) {
       await this._loadUserLibraryAndSync();
@@ -1506,7 +1599,10 @@ class AudiobookApp {
     }
 
     // Subscribe to remote playback handoff
-    this.syncService.onRemotePlaybackEvent((remoteEvent) => {
+    if (typeof this._unsubRemotePlayback === 'function') {
+      this._unsubRemotePlayback();
+    }
+    this._unsubRemotePlayback = this.syncService.onRemotePlaybackEvent((remoteEvent) => {
       const activeBook = this.getActiveBook();
       const decision = handleRemoteEvent(
         {
@@ -1711,6 +1807,20 @@ class AudiobookApp {
       });
     }
 
+    const triggerResumeSync = (reason) => {
+      if (!((this.user || this.guestLocalMode) && this._hasCloudSyncAuth())) return;
+      void (async () => {
+        if (
+          this.user &&
+          this.syncService?.session?.auth_mode === 'google_oauth' &&
+          this.syncService?._isTauriEnvironment?.()
+        ) {
+          await this.syncService.ensureFreshGoogleToken?.().catch(() => false);
+        }
+        await this._runPeriodicCloudSync({ force: true, reason });
+      })();
+    };
+
     if (typeof document !== 'undefined') {
       document.addEventListener('click', (e) => {
         if (!this.state.profileOpen) return;
@@ -1723,8 +1833,8 @@ class AudiobookApp {
       });
 
       document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible' && (this.user || this.guestLocalMode) && this._hasCloudSyncAuth()) {
-          void this._runPeriodicCloudSync({ force: true, reason: 'visibility' });
+        if (document.visibilityState === 'visible') {
+          triggerResumeSync('visibility');
         }
       });
     }
@@ -1740,14 +1850,10 @@ class AudiobookApp {
       };
       window.addEventListener('resize', handleViewportChange);
       window.addEventListener('focus', () => {
-        if ((this.user || this.guestLocalMode) && this._hasCloudSyncAuth()) {
-          void this._runPeriodicCloudSync({ force: true, reason: 'focus' });
-        }
+        triggerResumeSync('focus');
       });
       window.addEventListener('online', () => {
-        if ((this.user || this.guestLocalMode) && this._hasCloudSyncAuth()) {
-          void this._runPeriodicCloudSync({ force: true, reason: 'online' });
-        }
+        triggerResumeSync('online');
       });
       window.addEventListener('pagehide', () => {
         this._persistProgressCheckpoint(true);
@@ -2821,8 +2927,29 @@ class AudiobookApp {
     }
   }
 
+  _loadGuestLocalMode() {
+    try {
+      return localStorage.getItem(STORAGE_GUEST_MODE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  }
+
+  _saveGuestLocalMode(enabled) {
+    this.guestLocalMode = Boolean(enabled);
+    try {
+      if (this.guestLocalMode) {
+        localStorage.setItem(STORAGE_GUEST_MODE_KEY, '1');
+      } else {
+        localStorage.removeItem(STORAGE_GUEST_MODE_KEY);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   async enterLocalMode() {
-    this.guestLocalMode = true;
+    this._saveGuestLocalMode(true);
     this.state.authError = '';
     this.state.authNotice = '';
     await this._loadUserLibraryAndSync();
@@ -2845,7 +2972,7 @@ class AudiobookApp {
 
       if (result?.ok) {
         this.user = this.syncService.getUserProfile();
-        this.guestLocalMode = false;
+        this._saveGuestLocalMode(false);
         const token = this.syncService.getGoogleAccessToken();
         if (token) {
           this.audioEngine.setDriveAccessToken(token);
@@ -2899,7 +3026,7 @@ class AudiobookApp {
 
       if (result?.ok && (result.session || this.syncService.getUserProfile())) {
         this.user = this.syncService.getUserProfile();
-        this.guestLocalMode = false;
+        this._saveGuestLocalMode(false);
         this.syncService.needsDriveSyncReauth = false;
         this.syncService.needsDriveConsent = false;
         this.state.needsDriveSyncReauth = false;
@@ -2956,7 +3083,7 @@ class AudiobookApp {
     this._stopBackgroundSync();
     await this.syncService.signOut();
     this.user = null;
-    this.guestLocalMode = false;
+    this._saveGuestLocalMode(false);
     this.books = [];
     this.state.devices = [];
     this.state.remotePlaybackPrompt = null;
@@ -3683,6 +3810,23 @@ class AudiobookApp {
           </div>
         </div>
       </div>
+    `;
+  }
+
+  _renderAuthRestoringView() {
+    return `
+      <main id="authRestoringView" class="min-h-screen w-full flex items-center justify-center p-4 sm:p-6 bg-[var(--bg-canvas)]">
+        <div class="flex flex-col items-center gap-3 text-center">
+          <div class="w-12 h-12 rounded-2xl bg-[#1ed760]/15 border border-[#1ed760]/35 flex items-center justify-center text-[#1ed760] shadow-lg">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
+              <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"/>
+              <path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
+            </svg>
+          </div>
+          <p class="text-sm font-medium text-[var(--text-secondary)]">Restoring your session…</p>
+        </div>
+      </main>
     `;
   }
 
@@ -5464,9 +5608,12 @@ class AudiobookApp {
     const shell = this._ensureRootShell();
     if (!shell || !shell.main) {
       if (!isLoggedIn) {
+        const unauthView = this._initializingAuth
+          ? this._renderAuthRestoringView()
+          : this._renderLoginView();
         this.rootEl.innerHTML = `
           <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
-            ${this._renderLoginView()}
+            ${unauthView}
             ${this._renderWipeSyncedModal()}
             ${this._renderStatusToast()}
             ${this._renderErrorModal()}
@@ -5509,7 +5656,9 @@ class AudiobookApp {
     let nextViewMeta;
 
     if (!isLoggedIn) {
-      bodyView = this._renderLoginView();
+      bodyView = this._initializingAuth
+        ? this._renderAuthRestoringView()
+        : this._renderLoginView();
       nextViewMeta = {
         isLoggedIn: false,
         layoutMode: this.state.layoutMode,

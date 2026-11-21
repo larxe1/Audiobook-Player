@@ -1,5 +1,6 @@
 package com.audiobook.player
 
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
@@ -30,6 +31,8 @@ class AudiobookOAuthBridge(private val activity: BridgeActivity) {
         private const val DEEP_LINK_SCHEME = "com.audiobook.player"
         private const val DEEP_LINK_HOST = "oauth"
         private const val DEFAULT_PROMPT = "select_account"
+        private const val PREFS_NAME = "audiobook_auth_prefs"
+        private const val KEY_AUTH_SESSION = "auth_session_v1"
     }
 
     @JavascriptInterface
@@ -108,6 +111,47 @@ class AudiobookOAuthBridge(private val activity: BridgeActivity) {
         val result = pendingResultJson
         pendingResultJson = null
         return result
+    }
+
+    @JavascriptInterface
+    fun saveAuthSession(sessionJson: String?): Boolean {
+        if (sessionJson.isNullOrBlank()) {
+            clearAuthSession()
+            return true
+        }
+        return try {
+            activity
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_AUTH_SESSION, sessionJson)
+                .commit()
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    @JavascriptInterface
+    fun loadAuthSession(): String? {
+        return try {
+            activity
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_AUTH_SESSION, null)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    @JavascriptInterface
+    fun clearAuthSession(): Boolean {
+        return try {
+            activity
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_AUTH_SESSION)
+                .commit()
+        } catch (_: Exception) {
+            false
+        }
     }
 
     fun handleRedirectIntent(intent: Intent?): Boolean {

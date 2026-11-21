@@ -1,13 +1,13 @@
 {
-  "version": "1.0.15",
-  "build": 16,
+  "version": "1.0.16",
+  "build": 17,
   "minNativeBuild": 15,
   "channel": "stable",
-  "publishedAt": "2026-11-18T15:06:00Z",
+  "publishedAt": "2026-11-21T11:30:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "webBundleUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Persist Google Sign-In reliably across restarts and storage eviction with IndexedDB backup, silent token refresh, and non-blocking Drive reconnect banner"
+  "releaseNotes": "Persist Google and local logins reliably across shutdowns and restarts with instant session hydration, native Windows and Android session backups, and proactive Google Drive token refresh"
 }

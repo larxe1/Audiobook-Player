@@ -4,7 +4,10 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use serde::Serialize;
@@ -19,8 +22,10 @@ const GOOGLE_OAUTH_SCOPE: &str =
 
 struct AppState {
     oauth_path: PathBuf,
+    session_path: PathBuf,
     oauth_token: Arc<Mutex<Option<String>>>,
     oauth_status: Arc<Mutex<String>>,
+    oauth_attempt_id: Arc<AtomicU64>,
 }
 
 #[derive(Serialize)]
@@ -28,6 +33,8 @@ struct OAuthPollResponse {
     status: String,
     #[serde(rename = "accessToken")]
     access_token: Option<String>,
+    #[serde(rename = "attemptId")]
+    attempt_id: Option<u64>,
 }
 
 fn app_local_dir() -> PathBuf {
@@ -241,6 +248,7 @@ async fn desktop_start_google_oauth(
     let is_consent = force_consent.unwrap_or(false);
     let is_silent = silent.unwrap_or(false) && !is_consent;
     let is_force = force_refresh.unwrap_or(false);
+    let my_attempt_id = state.oauth_attempt_id.fetch_add(1, Ordering::SeqCst) + 1;
 
     if is_silent && !is_force {
         if let Some(saved) = load_saved_oauth_token(&state.oauth_path) {
@@ -253,6 +261,7 @@ async fn desktop_start_google_oauth(
             return Ok(OAuthPollResponse {
                 status: "success".into(),
                 access_token: Some(saved),
+                attempt_id: Some(my_attempt_id),
             });
         }
     }
@@ -302,6 +311,7 @@ async fn desktop_start_google_oauth(
 
     let token_arc = Arc::clone(&state.oauth_token);
     let status_arc = Arc::clone(&state.oauth_status);
+    let attempt_arc = Arc::clone(&state.oauth_attempt_id);
     let oauth_path = state.oauth_path.clone();
     let app_for_nav = app.clone();
 
@@ -315,8 +325,14 @@ async fn desktop_start_google_oauth(
         .initialization_script(OAUTH_INIT_SCRIPT);
 
     builder = builder.on_navigation(move |url| {
+        if attempt_arc.load(Ordering::SeqCst) != my_attempt_id {
+            return false;
+        }
         let url_str = url.as_str();
         if let Some(tok) = extract_ya29_token(url_str) {
+            if attempt_arc.load(Ordering::SeqCst) != my_attempt_id {
+                return false;
+            }
             save_oauth_token(&oauth_path, &tok);
             if let Ok(mut g) = token_arc.lock() {
                 *g = Some(tok);
@@ -325,10 +341,13 @@ async fn desktop_start_google_oauth(
                 *st = "success".into();
             }
             let app_clone = app_for_nav.clone();
+            let attempt_arc_close = Arc::clone(&attempt_arc);
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(80));
-                if let Some(w) = app_clone.get_webview_window("google-auth") {
-                    let _ = w.close();
+                if attempt_arc_close.load(Ordering::SeqCst) == my_attempt_id {
+                    if let Some(w) = app_clone.get_webview_window("google-auth") {
+                        let _ = w.close();
+                    }
                 }
             });
             return false;
@@ -339,14 +358,20 @@ async fn desktop_start_google_oauth(
                 || url_str.contains("ServiceLogin")
                 || url_str.contains("AccountChooser"))
         {
+            if attempt_arc.load(Ordering::SeqCst) != my_attempt_id {
+                return false;
+            }
             if let Ok(mut st) = status_arc.lock() {
                 *st = "needs_interactive".into();
             }
             let app_clone = app_for_nav.clone();
+            let attempt_arc_close = Arc::clone(&attempt_arc);
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                if let Some(w) = app_clone.get_webview_window("google-auth") {
-                    let _ = w.close();
+                if attempt_arc_close.load(Ordering::SeqCst) == my_attempt_id {
+                    if let Some(w) = app_clone.get_webview_window("google-auth") {
+                        let _ = w.close();
+                    }
                 }
             });
             return false;
@@ -362,6 +387,7 @@ async fn desktop_start_google_oauth(
     Ok(OAuthPollResponse {
         status: "pending".into(),
         access_token: None,
+        attempt_id: Some(my_attempt_id),
     })
 }
 
@@ -369,7 +395,19 @@ async fn desktop_start_google_oauth(
 async fn desktop_poll_google_oauth(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
+    attempt_id: Option<u64>,
 ) -> Result<OAuthPollResponse, String> {
+    let current_attempt = state.oauth_attempt_id.load(Ordering::SeqCst);
+    if let Some(req_id) = attempt_id {
+        if current_attempt != req_id {
+            return Ok(OAuthPollResponse {
+                status: "superseded".into(),
+                access_token: None,
+                attempt_id: Some(current_attempt),
+            });
+        }
+    }
+
     let tok_opt = state.oauth_token.lock().ok().and_then(|g| g.clone());
     if let Some(tok) = tok_opt {
         if let Some(w) = app.get_webview_window("google-auth") {
@@ -378,6 +416,7 @@ async fn desktop_poll_google_oauth(
         return Ok(OAuthPollResponse {
             status: "success".into(),
             access_token: Some(tok),
+            attempt_id: Some(current_attempt),
         });
     }
 
@@ -398,11 +437,13 @@ async fn desktop_poll_google_oauth(
     Ok(OAuthPollResponse {
         status,
         access_token: None,
+        attempt_id: Some(current_attempt),
     })
 }
 
 #[tauri::command]
 async fn desktop_clear_google_oauth(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    state.oauth_attempt_id.fetch_add(1, Ordering::SeqCst);
     if let Ok(mut g) = state.oauth_token.lock() {
         *g = None;
     }
@@ -410,6 +451,64 @@ async fn desktop_clear_google_oauth(state: tauri::State<'_, AppState>) -> Result
         *st = "idle".into();
     }
     let _ = fs::remove_file(&state.oauth_path);
+    Ok(true)
+}
+
+fn session_backup_path(session_path: &Path) -> PathBuf {
+    let mut bak_os = session_path.as_os_str().to_os_string();
+    bak_os.push(".bak");
+    PathBuf::from(bak_os)
+}
+
+fn read_valid_session_json(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    if !parsed.is_object() {
+        return None;
+    }
+    Some(raw)
+}
+
+#[tauri::command]
+async fn desktop_save_auth_session(
+    state: tauri::State<'_, AppState>,
+    session_json: String,
+) -> Result<bool, String> {
+    serde_json::from_str::<serde_json::Value>(&session_json)
+        .map_err(|e| format!("Invalid session JSON: {e}"))?;
+
+    if let Some(parent) = state.session_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    fs::write(&state.session_path, session_json.as_bytes())
+        .map_err(|e| format!("Failed to write auth session: {e}"))?;
+
+    let bak_path = session_backup_path(&state.session_path);
+    fs::write(&bak_path, session_json.as_bytes())
+        .map_err(|e| format!("Failed to write auth session backup: {e}"))?;
+
+    Ok(true)
+}
+
+#[tauri::command]
+async fn desktop_load_auth_session(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    if let Some(raw) = read_valid_session_json(&state.session_path) {
+        return Ok(Some(raw));
+    }
+    let bak_path = session_backup_path(&state.session_path);
+    Ok(read_valid_session_json(&bak_path))
+}
+
+#[tauri::command]
+async fn desktop_clear_auth_session(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let _ = fs::remove_file(&state.session_path);
+    let _ = fs::remove_file(session_backup_path(&state.session_path));
     Ok(true)
 }
 
@@ -603,28 +702,56 @@ fn build_main_window(
 }
 
 fn create_main_window_with_fallback(app: &App) -> tauri::Result<WebviewWindow> {
-    match build_main_window(app, "main", None) {
-        Ok(win) => Ok(win),
-        Err(primary_err) => {
-            log_startup(&format!(
-                "Primary WebView2 window failed ({primary_err}); retrying with isolated profile directory"
-            ));
+    const MAX_PRIMARY_ATTEMPTS: usize = 5;
+    for attempt in 1..=MAX_PRIMARY_ATTEMPTS {
+        match build_main_window(app, "main", None) {
+            Ok(win) => return Ok(win),
+            Err(primary_err) => {
+                log_startup(&format!(
+                    "Primary WebView2 window attempt {attempt}/{MAX_PRIMARY_ATTEMPTS} failed ({primary_err})"
+                ));
+                if let Some(leftover) = app.get_webview_window("main") {
+                    let _ = leftover.destroy();
+                }
+                if attempt < MAX_PRIMARY_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+    }
 
-            if let Some(leftover) = app.get_webview_window("main") {
+    let stable_fallback_dir = app_local_dir().join("profiles").join("fallback");
+    log_startup(&format!(
+        "Primary WebView2 retries exhausted; trying stable fallback profile {}",
+        stable_fallback_dir.display()
+    ));
+
+    let label = if app.get_webview_window("main").is_none() {
+        "main".to_string()
+    } else {
+        format!("main-{}", std::process::id())
+    };
+
+    match build_main_window(app, &label, Some(stable_fallback_dir)) {
+        Ok(win) => Ok(win),
+        Err(stable_err) => {
+            log_startup(&format!(
+                "Stable fallback WebView2 window failed ({stable_err}); retrying with isolated session profile"
+            ));
+            if let Some(leftover) = app.get_webview_window(&label) {
                 let _ = leftover.destroy();
             }
 
-            let fallback_dir = app_local_dir()
+            let session_fallback_dir = app_local_dir()
                 .join("profiles")
                 .join(format!("session-{}", std::process::id()));
-
-            let label = if app.get_webview_window("main").is_none() {
+            let session_label = if app.get_webview_window("main").is_none() {
                 "main".to_string()
             } else {
                 format!("main-{}", std::process::id())
             };
 
-            build_main_window(app, &label, Some(fallback_dir))
+            build_main_window(app, &session_label, Some(session_fallback_dir))
         }
     }
 }
@@ -634,11 +761,15 @@ fn main() {
         log_startup(&format!("PANIC: {info}"));
     }));
 
-    let oauth_path = app_local_dir().join("google_oauth.json");
+    let local_dir = app_local_dir();
+    let oauth_path = local_dir.join("google_oauth.json");
+    let session_path = local_dir.join("auth_session.json");
     let state = AppState {
         oauth_path,
+        session_path,
         oauth_token: Arc::new(Mutex::new(None)),
         oauth_status: Arc::new(Mutex::new("idle".into())),
+        oauth_attempt_id: Arc::new(AtomicU64::new(0)),
     };
 
     tauri::Builder::default()
@@ -647,6 +778,9 @@ fn main() {
             desktop_start_google_oauth,
             desktop_poll_google_oauth,
             desktop_clear_google_oauth,
+            desktop_save_auth_session,
+            desktop_load_auth_session,
+            desktop_clear_auth_session,
             desktop_install_update
         ])
         .setup(|app| {

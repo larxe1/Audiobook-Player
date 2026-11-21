@@ -41,6 +41,8 @@ export class AudioEngine {
     this.onSleepTimerUpdate = options.onSleepTimerUpdate || (() => {});
     this.onOfflineChange = options.onOfflineChange || (() => {});
     this.onError = options.onError || (() => {});
+    this.onDriveTokenExpired = options.onDriveTokenExpired || null;
+    this.fetchImpl = options.fetchImpl || null;
 
     this.audio = typeof Audio !== 'undefined' ? new Audio() : null;
     if (this.audio) {
@@ -217,12 +219,26 @@ export class AudioEngine {
     const streamUrl = ch?.driveStreamUrl || book.driveStreamUrl;
     if (streamUrl) {
       if (this.driveAccessToken && streamUrl.includes('googleapis.com')) {
+        const fetchFn = this.fetchImpl || (typeof fetch === 'function' ? fetch : null);
+        if (!fetchFn) return null;
         try {
-          const resp = await fetch(streamUrl, {
+          const prevToken = this.driveAccessToken;
+          let resp = await fetchFn(streamUrl, {
             headers: {
-              Authorization: `Bearer ${this.driveAccessToken}`
+              Authorization: `Bearer ${prevToken}`
             }
           });
+          if (resp.status === 401 && typeof this.onDriveTokenExpired === 'function') {
+            const nextToken = await this.onDriveTokenExpired().catch(() => null);
+            if (nextToken && nextToken !== prevToken) {
+              this.driveAccessToken = nextToken;
+              resp = await fetchFn(streamUrl, {
+                headers: {
+                  Authorization: `Bearer ${this.driveAccessToken}`
+                }
+              });
+            }
+          }
           if (resp.ok) {
             const blob = await resp.blob();
             const url = URL.createObjectURL(blob);

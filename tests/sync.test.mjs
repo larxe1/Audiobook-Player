@@ -12,6 +12,7 @@ import {
   SupabaseSyncService,
   handleRemoteEvent
 } from '../src/services/supabase-sync.js';
+import { AudioEngine } from '../src/player/audio-engine.js';
 
 function createMemoryStorage() {
   const map = new Map();
@@ -1789,8 +1790,9 @@ test('Windows Tauri restoreSession runs _trySilentGoogleRefresh when bridged Sup
   assert.equal(sync.getGoogleAccessToken(), 'ya29.tauri_silent_fresh');
   assert.equal(sync.needsDriveSyncReauth, false);
   assert.equal(sync.needsDriveConsent, false);
-  assert.equal(invokeCalls.filter((c) => c.cmd === 'desktop_start_google_oauth').length, 1);
-  assert.equal(invokeCalls[0].args.silent, true);
+  const startCalls = invokeCalls.filter((c) => c.cmd === 'desktop_start_google_oauth');
+  assert.equal(startCalls.length, 1);
+  assert.equal(startCalls[0].args.silent, true);
 
   // Case 2: When silent refresh returns needs_interactive, keep user signed in and set needsDriveSyncReauth = true, needsDriveConsent = false
   oauthMode = 'needs_interactive';
@@ -1808,4 +1810,365 @@ test('Windows Tauri restoreSession runs _trySilentGoogleRefresh when bridged Sup
   assert.equal(sync.needsDriveConsent, false);
 
   sync.destroy();
+});
+
+test('Windows Tauri native auth session persistence recovers across wiped localStorage + IndexedDB and clears on signOut', async () => {
+  let nativeDiskSession = null;
+  const invokeLog = [];
+
+  const makeTauriWindow = () => {
+    const win = createFakeWindow();
+    win.location.origin = 'https://tauri.localhost';
+    win.__TAURI_INTERNALS__ = {
+      invoke: async (cmd, args) => {
+        invokeLog.push({ cmd, args });
+        if (cmd === 'desktop_save_auth_session') {
+          nativeDiskSession = args?.sessionJson || null;
+          return true;
+        }
+        if (cmd === 'desktop_load_auth_session') {
+          return nativeDiskSession;
+        }
+        if (cmd === 'desktop_clear_auth_session') {
+          nativeDiskSession = null;
+          return true;
+        }
+        if (cmd === 'desktop_clear_google_oauth') {
+          return true;
+        }
+        return null;
+      }
+    };
+    return win;
+  };
+
+  // Session saved on Run 1 writes to localStorage, IDB, AND native disk backup
+  const sync1 = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    indexedDB: createFakeIndexedDB(),
+    windowObj: makeTauriWindow(),
+    navigatorObj: { onLine: true, userAgent: 'Windows NT 10.0' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async () => {
+      throw new Error('hydratePersistedSession must perform ZERO network calls');
+    }
+  });
+
+  sync1.setSession({
+    access_token: 'supa-jwt-win',
+    refresh_token: 'supa-ref-win',
+    provider_token: 'ya29.win_native_backup',
+    auth_mode: 'google_oauth',
+    user: {
+      id: 'supa-win-99',
+      email: 'desktop.backup@gmail.com',
+      user_metadata: { full_name: 'Desktop Listener' }
+    }
+  });
+  assert.ok(nativeDiskSession, 'desktop_save_auth_session should store serialized session');
+  assert.equal(JSON.parse(nativeDiskSession).user.email, 'desktop.backup@gmail.com');
+
+  // Run 2: BOTH localStorage AND IndexedDB are completely wiped (simulating WebView2 profile fallback)
+  const freshStorage = createMemoryStorage();
+  const freshIDB = createFakeIndexedDB();
+  const sync2 = new SupabaseSyncService({
+    storage: freshStorage,
+    indexedDB: freshIDB,
+    windowObj: makeTauriWindow(),
+    navigatorObj: { onLine: true, userAgent: 'Windows NT 10.0' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async () => {
+      throw new Error('hydratePersistedSession must perform ZERO network calls');
+    }
+  });
+
+  assert.equal(sync2.getUserProfile(), null);
+  const hydrated = await sync2.hydratePersistedSession();
+  assert.ok(hydrated, 'hydratePersistedSession must recover session from desktop_load_auth_session');
+  assert.equal(sync2.getUserProfile().email, 'desktop.backup@gmail.com');
+  assert.equal(sync2.getGoogleAccessToken(), 'ya29.win_native_backup');
+
+  // Re-persisted into localStorage and OfflineSyncQueue
+  const rePersisted = JSON.parse(freshStorage.getItem('audiobook_player_supabase_session_v1'));
+  assert.equal(rePersisted.user.email, 'desktop.backup@gmail.com');
+  assert.equal(sync2.offlineQueue.getAuthSession()?.user?.email, 'desktop.backup@gmail.com');
+
+  // Explicit signOut clears native disk backup + OAuth cache + localStorage + IDB
+  sync2.fetchImpl = async () => ({ ok: true, status: 204, async text() { return ''; } });
+  await sync2.signOut();
+  assert.equal(nativeDiskSession, null);
+  assert.equal(freshStorage.getItem('audiobook_player_supabase_session_v1'), null);
+  assert.equal(sync2.offlineQueue.getAuthSession(), null);
+  assert.ok(invokeLog.some((c) => c.cmd === 'desktop_clear_auth_session'));
+  assert.ok(invokeLog.some((c) => c.cmd === 'desktop_clear_google_oauth'));
+
+  sync1.destroy();
+  sync2.destroy();
+});
+
+test('Android Capacitor native AudiobookOAuthNative auth session persists across wiped localStorage + IDB and stays compatible with legacy APK', async () => {
+  let androidPrefsSession = null;
+  let clearCalls = 0;
+
+  const makeAndroidWindow = (withSessionMethods = true) => {
+    const win = createFakeWindow();
+    win.location.origin = 'https://localhost';
+    win.location.protocol = 'https:';
+    win.Capacitor = { isNativePlatform: () => true };
+    win.AudiobookOAuthNative = withSessionMethods
+      ? {
+          saveAuthSession(json) {
+            androidPrefsSession = json;
+            return true;
+          },
+          loadAuthSession() {
+            return androidPrefsSession;
+          },
+          clearAuthSession() {
+            clearCalls += 1;
+            androidPrefsSession = null;
+            return true;
+          }
+        }
+      : {
+          // Legacy APK without session persistence methods
+          consumePendingResult: () => null
+        };
+    return win;
+  };
+
+  const sync1 = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    indexedDB: createFakeIndexedDB(),
+    windowObj: makeAndroidWindow(true),
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null
+  });
+
+  sync1.setSession({
+    access_token: 'supa-android-jwt',
+    provider_token: 'ya29.android_backup_tok',
+    auth_mode: 'google_oauth',
+    user: {
+      id: 'supa-android-1',
+      email: 'mobile.backup@gmail.com',
+      user_metadata: { full_name: 'Mobile Listener' }
+    }
+  });
+  assert.ok(androidPrefsSession);
+  assert.equal(JSON.parse(androidPrefsSession).user.email, 'mobile.backup@gmail.com');
+
+  // Run 2: localStorage and IDB are wiped; synchronous constructor + hydratePersistedSession recover from SharedPreferences
+  const wipedStorage = createMemoryStorage();
+  const sync2 = new SupabaseSyncService({
+    storage: wipedStorage,
+    indexedDB: createFakeIndexedDB(),
+    windowObj: makeAndroidWindow(true),
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async () => {
+      throw new Error('hydratePersistedSession must perform ZERO network calls');
+    }
+  });
+
+  // Constructor eagerly loads from synchronous AudiobookOAuthNative.loadAuthSession()
+  assert.equal(sync2.getUserProfile()?.email, 'mobile.backup@gmail.com');
+
+  const hydrated = await sync2.hydratePersistedSession();
+  assert.ok(hydrated);
+  assert.equal(sync2.getGoogleAccessToken(), 'ya29.android_backup_tok');
+  assert.equal(
+    JSON.parse(wipedStorage.getItem('audiobook_player_supabase_session_v1')).user.email,
+    'mobile.backup@gmail.com'
+  );
+
+  // Explicit signOut clears SharedPreferences backup
+  sync2.fetchImpl = async () => ({ ok: true, status: 204, async text() { return ''; } });
+  await sync2.signOut();
+  assert.equal(clearCalls, 1);
+  assert.equal(androidPrefsSession, null);
+
+  // Legacy APK without saveAuthSession/loadAuthSession/clearAuthSession works cleanly with zero throws
+  const legacySync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    indexedDB: createFakeIndexedDB(),
+    windowObj: makeAndroidWindow(false),
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async () => ({ ok: true, status: 204, async text() { return ''; } })
+  });
+  legacySync.setSession({
+    access_token: 'legacy-jwt',
+    user: { id: 'legacy-1', email: 'legacy@gmail.com' }
+  });
+  const legacyHydrated = await legacySync.hydratePersistedSession();
+  assert.equal(legacyHydrated?.user?.email, 'legacy@gmail.com');
+  await legacySync.signOut();
+  assert.equal(legacySync.getUserProfile(), null);
+
+  sync1.destroy();
+  sync2.destroy();
+  legacySync.destroy();
+});
+
+test('Tauri desktop_poll_google_oauth attemptId + superseded, proactive ensureFreshGoogleToken (45m+), and onGoogleTokenChange', async () => {
+  const fakeWindow = createFakeWindow();
+  fakeWindow.location.origin = 'https://tauri.localhost';
+  const invokeCalls = [];
+  let nextMode = 'superseded';
+
+  fakeWindow.__TAURI_INTERNALS__ = {
+    invoke: async (cmd, args) => {
+      invokeCalls.push({ cmd, args });
+      if (cmd === 'desktop_start_google_oauth') {
+        if (nextMode === 'superseded') {
+          return { status: 'pending', accessToken: null, attemptId: 42 };
+        }
+        return { status: 'success', accessToken: 'ya29.proactive_fresh_token', attemptId: 43 };
+      }
+      if (cmd === 'desktop_poll_google_oauth') {
+        return { status: 'superseded', accessToken: null, attemptId: 43 };
+      }
+      return true;
+    }
+  };
+
+  const sync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: fakeWindow,
+    navigatorObj: { onLine: true, userAgent: 'Windows NT 10.0' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (url) => {
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return { sub: 'sub-9', email: 'proactive@gmail.com', name: 'Proactive User' };
+          }
+        };
+      }
+      return { ok: false, status: 500, async text() { return 'skip'; } };
+    }
+  });
+
+  // 1. desktop_poll_google_oauth passes attemptId and handles status === 'superseded'
+  const supersededRes = await sync.signInWithGooglePopup({ silent: true, autoInteractiveOnSilentFail: false });
+  assert.equal(supersededRes.ok, false);
+  assert.equal(supersededRes.reason, 'superseded');
+  const pollCall = invokeCalls.find((c) => c.cmd === 'desktop_poll_google_oauth');
+  assert.deepEqual(pollCall?.args, { attemptId: 42 });
+
+  // 2. onGoogleTokenChange fires on token updates and unsubscribes cleanly
+  const observedTokens = [];
+  const unsub = sync.onGoogleTokenChange((tok) => observedTokens.push(tok));
+
+  // 3. Proactive ensureFreshGoogleToken skips refresh when token is fresh (<45m), refreshes when >=45m old
+  nextMode = 'fresh';
+  sync.setSession({
+    access_token: 'supa-jwt-pro',
+    auth_mode: 'google_oauth',
+    provider_token: 'ya29.recent_token',
+    googleAccessToken: 'ya29.recent_token',
+    googleTokenObtainedAt: Date.now() - 10 * 60 * 1000,
+    user: { id: 'supa-pro', email: 'proactive@gmail.com' }
+  });
+
+  const startsBefore = invokeCalls.filter((c) => c.cmd === 'desktop_start_google_oauth').length;
+  const freshOk = await sync.ensureFreshGoogleToken();
+  assert.equal(freshOk, true);
+  assert.equal(
+    invokeCalls.filter((c) => c.cmd === 'desktop_start_google_oauth').length,
+    startsBefore,
+    'fresh token (<45m) must NOT trigger silent refresh'
+  );
+
+  // Age token past 45 minutes -> ensureFreshGoogleToken proactively refreshes & notifies listener
+  sync.setSession({
+    ...sync.session,
+    googleTokenObtainedAt: Date.now() - 50 * 60 * 1000
+  });
+  const refreshedOk = await sync.ensureFreshGoogleToken();
+  assert.equal(refreshedOk, true);
+  assert.equal(sync.getGoogleAccessToken(), 'ya29.proactive_fresh_token');
+  assert.ok(Number(sync.session.googleTokenObtainedAt) > Date.now() - 5000);
+  assert.deepEqual(observedTokens, ['ya29.proactive_fresh_token']);
+
+  // Unsubscribe stops further notifications
+  unsub();
+  sync.setGoogleAccessToken('ya29.after_unsub');
+  assert.deepEqual(observedTokens, ['ya29.proactive_fresh_token']);
+
+  sync.destroy();
+});
+
+test('AudioEngine retries Google Drive stream fetch once on 401 via onDriveTokenExpired', async () => {
+  const seenAuthHeaders = [];
+  let refreshCalls = 0;
+
+  const mockFetch = async (url, init = {}) => {
+    const auth = init?.headers?.Authorization || '';
+    seenAuthHeaders.push({ url, auth });
+    if (auth === 'Bearer ya29.expired_stream_tok') {
+      return { ok: false, status: 401 };
+    }
+    if (auth === 'Bearer ya29.refreshed_stream_tok') {
+      return {
+        ok: true,
+        status: 200,
+        async blob() {
+          return new Blob(['fake-audio-bytes'], { type: 'audio/mpeg' });
+        }
+      };
+    }
+    return { ok: false, status: 403 };
+  };
+
+  const engine = new AudioEngine({
+    fetchImpl: mockFetch,
+    onDriveTokenExpired: async () => {
+      refreshCalls += 1;
+      return 'ya29.refreshed_stream_tok';
+    }
+  });
+  engine.setDriveAccessToken('ya29.expired_stream_tok');
+
+  const book = {
+    bookKey: 'drive-book::author',
+    title: 'Drive Book',
+    driveStreamUrl: 'https://www.googleapis.com/drive/v3/files/file-123?alt=media',
+    chapters: [{ index: 0, title: 'Ch 1', startSec: 0, driveStreamUrl: 'https://www.googleapis.com/drive/v3/files/file-123?alt=media' }]
+  };
+
+  const resolvedUrl = await engine._resolveChapterMediaUrl(book, 0);
+  assert.ok(resolvedUrl && resolvedUrl.startsWith('blob:'), 'expected blob URL after 401 token refresh retry');
+  assert.equal(refreshCalls, 1);
+  assert.equal(engine.driveAccessToken, 'ya29.refreshed_stream_tok');
+  assert.deepEqual(
+    seenAuthHeaders.map((h) => h.auth),
+    ['Bearer ya29.expired_stream_tok', 'Bearer ya29.refreshed_stream_tok']
+  );
+
+  // If refresh returns null or the same expired token on 401, returns null cleanly without duplicate fetch
+  let sameTokenFetches = 0;
+  const engineFail = new AudioEngine({
+    fetchImpl: async () => {
+      sameTokenFetches += 1;
+      return { ok: false, status: 401 };
+    },
+    onDriveTokenExpired: async () => 'ya29.dead_tok'
+  });
+  engineFail.setDriveAccessToken('ya29.dead_tok');
+  const failedUrl = await engineFail._resolveChapterMediaUrl(book, 0);
+  assert.equal(failedUrl, null);
+  assert.equal(sameTokenFetches, 1, 'must NOT issue a duplicate 401 fetch with the same expired token');
+
+  engine.destroy();
+  engineFail.destroy();
 });
