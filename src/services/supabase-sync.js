@@ -1081,11 +1081,32 @@ export class SupabaseSyncService {
   }
 
   /**
+   * Returns true if the current 1-hour implicit Google OAuth access token (`ya29.*`)
+   * has aged past its lifetime minus bufferMs (default: 5 minutes -> 55 min max age).
+   * @param {number} [bufferMs=300000]
+   * @returns {boolean}
+   */
+  isGoogleTokenExpired(bufferMs = 5 * 60 * 1000) {
+    const obtainedAt = Number(this.googleTokenObtainedAt || this.session?.googleTokenObtainedAt || 0);
+    if (!Number.isFinite(obtainedAt) || obtainedAt <= 0) {
+      return false;
+    }
+    const safeBuffer = Number.isFinite(Number(bufferMs))
+      ? Math.max(0, Number(bufferMs))
+      : 5 * 60 * 1000;
+    return Date.now() - obtainedAt > 3600 * 1000 - safeBuffer;
+  }
+
+  /**
    * Returns true if a non-expired Google OAuth token is available for Drive appDataFolder sync.
    * @returns {boolean}
    */
   hasDriveSyncToken() {
-    return Boolean(this.getGoogleAccessToken() && !this.needsDriveSyncReauth);
+    return Boolean(
+      this.getGoogleAccessToken() &&
+        !this.needsDriveSyncReauth &&
+        !this.isGoogleTokenExpired()
+    );
   }
 
   /**
@@ -1367,7 +1388,9 @@ export class SupabaseSyncService {
 
   /**
    * Restores and validates any persisted Supabase or Google OAuth session.
-   * Returns the validated session or null when signed out / expired.
+   * Validates the long-lived Supabase session first, adopts any fresher cross-device
+   * Google token from Supabase settings, and only validates non-expired Google tokens.
+   * When Supabase auth is valid, keeps `needsDriveSyncReauth = false` across restarts.
    * @returns {Promise<object|null>}
    */
   async restoreSession() {
@@ -1376,47 +1399,7 @@ export class SupabaseSyncService {
       return null;
     }
 
-    if (this.session.auth_mode === 'google_oauth') {
-      const googleToken = this.getGoogleAccessToken();
-      if (googleToken && this._isOnline() && this.fetchImpl) {
-        try {
-          const res = await this._fetchWithTimeout('https://www.googleapis.com/oauth2/v3/userinfo', {
-            headers: { Authorization: `Bearer ${googleToken}` }
-          });
-          if (res.ok) {
-            const info = await res.json();
-            const updatedUser = {
-              ...(this.session.user || {}),
-              id: this.session.access_token && this.session.user?.id
-                ? this.session.user.id
-                : (info.sub ? `google_${info.sub}` : (this.session.user?.id || 'google_user')),
-              email: info.email || this.session.user?.email || '',
-              user_metadata: {
-                ...(this.session.user?.user_metadata || {}),
-                email: info.email || this.session.user?.email || '',
-                name: info.name || this.session.user?.user_metadata?.name || '',
-                full_name: info.name || this.session.user?.user_metadata?.full_name || '',
-                avatar_url: info.picture || this.session.user?.user_metadata?.avatar_url || '',
-                picture: info.picture || this.session.user?.user_metadata?.picture || ''
-              }
-            };
-            this._saveSession({ ...this.session, user: updatedUser });
-          } else if (res.status === 401) {
-            this.setGoogleAccessToken(null);
-            if (!this._isTauriEnvironment()) {
-              this.needsDriveSyncReauth = true;
-            }
-          } else if (res.status === 403) {
-            this.setGoogleAccessToken(null);
-            this.needsDriveSyncReauth = true;
-            this.needsDriveConsent = true;
-          }
-        } catch {
-          // Offline fallback: keep persisted Google user profile
-        }
-      }
-    }
-
+    // 1. Validate or refresh the long-lived Supabase session FIRST
     if (this.session?.access_token && this._isOnline() && this.fetchImpl) {
       try {
         const res = await this._fetchWithTimeout(`${this.config.url}/auth/v1/user`, {
@@ -1479,29 +1462,101 @@ export class SupabaseSyncService {
       ).catch(() => null);
     }
 
-    if (
-      this.session?.auth_mode === 'google_oauth' &&
-      !this.getGoogleAccessToken() &&
-      !this.needsDriveConsent &&
-      this._isTauriEnvironment()
-    ) {
-      const refreshed = await this._trySilentGoogleRefresh().catch(() => false);
-      if (!refreshed) {
-        this.needsDriveSyncReauth = true;
-      }
-    } else if (
-      this.session?.auth_mode === 'google_oauth' &&
-      !this.getGoogleAccessToken()
-    ) {
-      this.needsDriveSyncReauth = true;
+    // 2. Adopt any fresher (<50 min) Google OAuth token synced from another device via Supabase
+    if (this.isAuthenticated() && this._isOnline() && this.fetchImpl) {
+      await this._fetchMergedDriveFolderConfig(null).catch(() => null);
     }
 
+    // 3. Validate Google token only when it is NOT already known expired; otherwise clear & silently refresh
+    if (this.session?.auth_mode === 'google_oauth') {
+      const googleToken = this.getGoogleAccessToken();
+      if (googleToken) {
+        if (this.isGoogleTokenExpired()) {
+          this._clearExpiredGoogleTokenInMemory();
+        } else if (this._isOnline() && this.fetchImpl) {
+          try {
+            const res = await this._fetchWithTimeout('https://www.googleapis.com/oauth2/v3/userinfo', {
+              headers: { Authorization: `Bearer ${googleToken}` }
+            });
+            if (res.ok) {
+              const info = await res.json();
+              const updatedUser = {
+                ...(this.session.user || {}),
+                id: this.session.access_token && this.session.user?.id
+                  ? this.session.user.id
+                  : (info.sub ? `google_${info.sub}` : (this.session.user?.id || 'google_user')),
+                email: info.email || this.session.user?.email || '',
+                user_metadata: {
+                  ...(this.session.user?.user_metadata || {}),
+                  email: info.email || this.session.user?.email || '',
+                  name: info.name || this.session.user?.user_metadata?.name || '',
+                  full_name: info.name || this.session.user?.user_metadata?.full_name || '',
+                  avatar_url: info.picture || this.session.user?.user_metadata?.avatar_url || '',
+                  picture: info.picture || this.session.user?.user_metadata?.picture || ''
+                }
+              };
+              this._saveSession({ ...this.session, user: updatedUser });
+            } else if (res.status === 401) {
+              this._clearExpiredGoogleTokenInMemory();
+              if (!this.isAuthenticated() && !this._isTauriEnvironment()) {
+                this.needsDriveSyncReauth = true;
+              }
+            } else if (res.status === 403) {
+              this._clearExpiredGoogleTokenInMemory();
+              if (!this.isAuthenticated()) {
+                this.needsDriveSyncReauth = true;
+                this.needsDriveConsent = true;
+              }
+            }
+          } catch {
+            // Offline fallback: keep persisted Google user profile
+          }
+        }
+      }
+
+      if (
+        (!this.getGoogleAccessToken() || this.isGoogleTokenExpired()) &&
+        !this.needsDriveConsent
+      ) {
+        const refreshed = await this._trySilentGoogleRefresh().catch(() => false);
+        if (!refreshed && !this.isAuthenticated()) {
+          this.needsDriveSyncReauth = true;
+        }
+      }
+    }
+
+    // 4. When Supabase session is authenticated, NEVER prompt "Reconnect Google Sync" on app open
     if (this.isAuthenticated()) {
+      this.needsDriveSyncReauth = false;
       this.connectRealtime();
       void this.flushOfflineQueue();
     }
 
     return this.session?.user ? this.session : null;
+  }
+
+  _clearExpiredGoogleTokenInMemory() {
+    this.googleAccessToken = null;
+    this.googleTokenObtainedAt = 0;
+    this.driveSyncFileId = null;
+    this.lastDriveSyncModifiedTime = null;
+    this._lastDrivePayload = null;
+    if (this.session) {
+      this.session.provider_token = null;
+      this.session.googleAccessToken = null;
+      this.session.googleTokenObtainedAt = null;
+    }
+    if (this.storage) {
+      try {
+        this.storage.removeItem(GOOGLE_TOKEN_STORAGE_KEY);
+      } catch {
+        // Ignore storage failures
+      }
+    }
+    if (this.session) {
+      this._saveSession(this.session);
+    }
+    this._emitGoogleTokenChange(null, { expired: true });
   }
 
   /**
@@ -2704,36 +2759,298 @@ export class SupabaseSyncService {
   }
 
   /**
-   * Proactively refreshes the 1-hour Google Drive access token on Windows Tauri
-   * before expiry (default: 45 minutes) or whenever missing, without prompting.
-   * @param {{ maxAgeMs?: number }} [options]
+   * Proactively refreshes the 1-hour Google Drive access token across all platforms
+   * (Supabase cross-device adoption -> Tauri silent WebView -> Android native silent WebView
+   * -> Web/PWA hidden iframe) before expiry (default: 45 minutes) or whenever missing.
+   * @param {{ maxAgeMs?: number, silent?: boolean }} [options]
    * @returns {Promise<boolean>}
    */
-  async ensureFreshGoogleToken({ maxAgeMs = 45 * 60 * 1000 } = {}) {
-    if (
-      this._isTauriEnvironment() &&
-      this.session?.auth_mode === 'google_oauth' &&
-      this._isOnline() &&
-      !this.needsDriveConsent
-    ) {
-      const currentToken = this.getGoogleAccessToken();
-      const obtainedAt = Number(this.session?.googleTokenObtainedAt || 0);
-      const isStale = obtainedAt > 0 && Date.now() - obtainedAt >= maxAgeMs;
-      if (!currentToken || isStale) {
+  async ensureFreshGoogleToken({ maxAgeMs = 45 * 60 * 1000, silent = true } = {}) {
+    if (this._isOnline() && !this.needsDriveConsent) {
+      let currentToken = this.getGoogleAccessToken();
+      let obtainedAt = Number(this.googleTokenObtainedAt || this.session?.googleTokenObtainedAt || 0);
+      let isStale =
+        this.isGoogleTokenExpired() ||
+        (obtainedAt > 0 && Date.now() - obtainedAt >= maxAgeMs);
+
+      if ((!currentToken || isStale) && this.isAuthenticated()) {
+        await this._fetchMergedDriveFolderConfig(null).catch(() => null);
+        currentToken = this.getGoogleAccessToken();
+        obtainedAt = Number(this.googleTokenObtainedAt || this.session?.googleTokenObtainedAt || 0);
+        isStale =
+          this.isGoogleTokenExpired() ||
+          (obtainedAt > 0 && Date.now() - obtainedAt >= maxAgeMs);
+      }
+
+      if (
+        (!currentToken || isStale) &&
+        this.session?.auth_mode === 'google_oauth' &&
+        silent !== false
+      ) {
         await this._trySilentGoogleRefresh().catch(() => false);
       }
     }
-    return Boolean(this.getGoogleAccessToken());
+    return Boolean(this.getGoogleAccessToken() && !this.isGoogleTokenExpired());
+  }
+
+  _buildSilentGoogleOAuthUrl(email, state, redirectUri) {
+    const clientId = (this.getGoogleClientId() || '').trim();
+    if (!clientId) return '';
+    const authParams = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: 'token',
+      scope: DEFAULT_GOOGLE_SCOPES,
+      include_granted_scopes: 'true',
+      prompt: 'none'
+    });
+    if (email) authParams.set('login_hint', email);
+    if (state) authParams.set('state', state);
+    return `https://accounts.google.com/o/oauth2/v2/auth?${authParams.toString()}`;
+  }
+
+  async _tryAndroidNativeSilentGoogleRefresh(email, timeoutMs = 6000) {
+    const nativeBridge = this.windowObj?.AudiobookOAuthNative;
+    if (
+      !this._isCapacitorEnvironment() ||
+      typeof nativeBridge?.startSilentGoogleOAuth !== 'function'
+    ) {
+      return false;
+    }
+
+    const randomNonce =
+      typeof globalThis.crypto?.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID().replace(/-/g, '')
+        : `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    const state = `android_silent_${randomNonce}`;
+    const redirectUri = 'https://larxe1.github.io/Audiobook-Player/oauth-callback.html';
+    const silentUrl = this._buildSilentGoogleOAuthUrl(email, state, redirectUri);
+    if (!silentUrl) return false;
+
+    const parseNativePayload = (raw) => {
+      if (!raw) return null;
+      if (typeof raw === 'string') {
+        try {
+          return JSON.parse(raw);
+        } catch {
+          return null;
+        }
+      }
+      return typeof raw === 'object' ? raw : null;
+    };
+
+    return await new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      const prevHandler = this.windowObj?.__onAndroidGoogleOAuthResult;
+
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (this.windowObj && this.windowObj.__onAndroidGoogleOAuthResult === onSilentResult) {
+          if (typeof prevHandler === 'function') {
+            this.windowObj.__onAndroidGoogleOAuthResult = prevHandler;
+          } else {
+            delete this.windowObj.__onAndroidGoogleOAuthResult;
+          }
+        }
+      };
+
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(Boolean(ok));
+      };
+
+      const onSilentResult = (rawPayload) => {
+        const payload = parseNativePayload(rawPayload);
+        if (!payload) return;
+        if (payload.state && payload.state !== state) {
+          if (typeof prevHandler === 'function') {
+            prevHandler(rawPayload);
+          }
+          return;
+        }
+        if (payload.error) {
+          finish(false);
+          return;
+        }
+        const token = payload.access_token || payload.accessToken;
+        if (token) {
+          settled = true;
+          cleanup();
+          void this.completeGoogleOAuthToken(token)
+            .then((res) => resolve(Boolean(res?.ok && this.getGoogleAccessToken())))
+            .catch(() => resolve(false));
+          return;
+        }
+        finish(false);
+      };
+
+      this.windowObj.__onAndroidGoogleOAuthResult = onSilentResult;
+      timer = setTimeout(() => {
+        const pending = parseNativePayload(nativeBridge.consumePendingResult?.());
+        if (pending && (!pending.state || pending.state === state) && (pending.access_token || pending.accessToken)) {
+          onSilentResult(pending);
+          return;
+        }
+        finish(false);
+      }, timeoutMs);
+
+      try {
+        nativeBridge.startSilentGoogleOAuth(silentUrl);
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
+  async _tryHiddenIframeSilentGoogleRefresh(email, timeoutMs = 5000) {
+    const doc = this.windowObj?.document || (typeof document !== 'undefined' ? document : null);
+    if (
+      !doc ||
+      typeof doc.createElement !== 'function' ||
+      !doc.body ||
+      typeof doc.body.appendChild !== 'function' ||
+      !this.windowObj ||
+      typeof this.windowObj.addEventListener !== 'function'
+    ) {
+      return false;
+    }
+
+    const origin = this.windowObj?.location?.origin || '';
+    if (!origin || origin === 'null' || !/^https?:/i.test(origin)) {
+      return false;
+    }
+    const pathname = this.windowObj?.location?.pathname || '/';
+    const baseDir = pathname.endsWith('/') ? pathname : pathname.replace(/[^/]*$/, '');
+    const redirectUri = `${origin}${baseDir}oauth-callback.html`;
+    const randomNonce =
+      typeof globalThis.crypto?.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID().replace(/-/g, '')
+        : `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    const state = `web_silent_${randomNonce}`;
+    const silentUrl = this._buildSilentGoogleOAuthUrl(email, state, redirectUri);
+    if (!silentUrl) return false;
+
+    let iframe = null;
+    try {
+      return await new Promise((resolve) => {
+        let settled = false;
+        let timer = null;
+
+        const cleanup = () => {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          if (this.windowObj && typeof this.windowObj.removeEventListener === 'function') {
+            this.windowObj.removeEventListener('message', onMessage);
+          }
+          if (iframe) {
+            try {
+              iframe.onload = null;
+              iframe.onerror = null;
+              if (typeof iframe.remove === 'function') {
+                iframe.remove();
+              } else if (iframe.parentNode && typeof iframe.parentNode.removeChild === 'function') {
+                iframe.parentNode.removeChild(iframe);
+              }
+            } catch {
+              // ignore cleanup errors
+            }
+            iframe = null;
+          }
+        };
+
+        const finish = (ok) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(Boolean(ok));
+        };
+
+        const completeToken = (token) => {
+          settled = true;
+          cleanup();
+          void this.completeGoogleOAuthToken(token)
+            .then((res) => resolve(Boolean(res?.ok && this.getGoogleAccessToken())))
+            .catch(() => resolve(false));
+        };
+
+        const onMessage = (event) => {
+          if (settled) return;
+          if (event?.origin && origin && event.origin !== origin) return;
+          const data = event?.data;
+          if (!data || data.type !== 'audiobook_google_oauth') return;
+          if (data.state && data.state !== state) return;
+          if (data.access_token) {
+            completeToken(data.access_token);
+            return;
+          }
+          finish(false);
+        };
+
+        this.windowObj.addEventListener('message', onMessage);
+        timer = setTimeout(() => finish(false), timeoutMs);
+
+        iframe = doc.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.setAttribute?.('aria-hidden', 'true');
+        iframe.setAttribute?.('tabindex', '-1');
+        iframe.onload = () => {
+          if (settled || !iframe) return;
+          try {
+            const hash = iframe.contentWindow?.location?.hash || '';
+            const search = iframe.contentWindow?.location?.search || '';
+            const raw = hash || search;
+            if (raw && (raw.includes('access_token=') || raw.includes('error='))) {
+              const params = new URLSearchParams(raw.replace(/^[?#]/, ''));
+              const paramState = params.get('state') || '';
+              if (!paramState || paramState === state) {
+                const token = params.get('access_token');
+                if (token) {
+                  completeToken(token);
+                } else {
+                  finish(false);
+                }
+              }
+            }
+          } catch {
+            // Cross-origin while on accounts.google.com; wait for redirect or timeout
+          }
+        };
+        iframe.onerror = () => finish(false);
+        iframe.src = silentUrl;
+        doc.body.appendChild(iframe);
+      });
+    } catch {
+      if (iframe) {
+        try {
+          if (typeof iframe.remove === 'function') iframe.remove();
+          else if (iframe.parentNode?.removeChild) iframe.parentNode.removeChild(iframe);
+        } catch {
+          // ignore
+        }
+      }
+      return false;
+    }
   }
 
   /**
-   * Attempts a silent background Google OAuth refresh on Tauri without opening a visible popup.
+   * Attempts a silent background Google OAuth refresh across all platforms without opening a visible popup:
+   * 1. Adopt a fresh (<50 min) token from Supabase cross-device settings if authenticated.
+   * 2. On Tauri Desktop: `desktop_start_google_oauth` with `silent: true` (`prompt: 'none'`).
+   * 3. On Android Capacitor: `AudiobookOAuthNative.startSilentGoogleOAuth` (offscreen WebView, 6s timeout).
+   * 4. On Web / PWA / fallback: hidden `<iframe>` with `prompt=none` (5s timeout, safely cleaned up).
    * Deduplicates concurrent calls and applies a 60s cooldown after failed attempts.
    * @returns {Promise<boolean>}
    */
   async _trySilentGoogleRefresh() {
     if (
-      !this._isTauriEnvironment() ||
       !this._isOnline() ||
       !this.session?.user?.email ||
       (this.session?.auth_mode !== 'google_oauth' && !this.getGoogleAccessToken())
@@ -2751,18 +3068,61 @@ export class SupabaseSyncService {
     }
 
     const email = this.session.user.email;
+    const prevToken = this.getGoogleAccessToken();
+    const prevObtainedAt = Number(this.googleTokenObtainedAt || this.session?.googleTokenObtainedAt || 0);
     this._silentGoogleRefreshInFlight = (async () => {
       try {
-        const res = await this.signInWithGooglePopup({
-          silent: true,
-          forceRefresh: true,
-          autoInteractiveOnSilentFail: false,
-          hint: email
-        });
-        if (res?.ok && this.getGoogleAccessToken()) {
+        // 1. Check Supabase for a fresher cross-device Google token first
+        if (this.isAuthenticated() && this.fetchImpl) {
+          await this._fetchMergedDriveFolderConfig(null).catch(() => null);
+          const nextToken = this.getGoogleAccessToken();
+          const nextObtainedAt = Number(this.googleTokenObtainedAt || this.session?.googleTokenObtainedAt || 0);
+          if (
+            nextToken &&
+            !this.isGoogleTokenExpired() &&
+            (nextToken !== prevToken || nextObtainedAt > prevObtainedAt)
+          ) {
+            this._lastSilentGoogleRefreshFailAt = 0;
+            return true;
+          }
+        }
+
+        // 2. Tauri Desktop silent WebView refresh
+        if (this._isTauriEnvironment()) {
+          const res = await this.signInWithGooglePopup({
+            silent: true,
+            forceRefresh: true,
+            autoInteractiveOnSilentFail: false,
+            hint: email
+          });
+          if (res?.ok && this.getGoogleAccessToken()) {
+            this._lastSilentGoogleRefreshFailAt = 0;
+            return true;
+          }
+          this._lastSilentGoogleRefreshFailAt = Date.now();
+          return false;
+        }
+
+        // 3. Android Capacitor native silent WebView refresh (do NOT fall through to web iframe on Capacitor)
+        if (this._isCapacitorEnvironment()) {
+          if (typeof this.windowObj?.AudiobookOAuthNative?.startSilentGoogleOAuth === 'function') {
+            const androidOk = await this._tryAndroidNativeSilentGoogleRefresh(email, 6000);
+            if (androidOk && this.getGoogleAccessToken()) {
+              this._lastSilentGoogleRefreshFailAt = 0;
+              return true;
+            }
+          }
+          this._lastSilentGoogleRefreshFailAt = Date.now();
+          return false;
+        }
+
+        // 4. Web / PWA hidden iframe fallback
+        const iframeOk = await this._tryHiddenIframeSilentGoogleRefresh(email, 5000);
+        if (iframeOk && this.getGoogleAccessToken()) {
           this._lastSilentGoogleRefreshFailAt = 0;
           return true;
         }
+
         this._lastSilentGoogleRefreshFailAt = Date.now();
         return false;
       } catch {
@@ -2777,17 +3137,17 @@ export class SupabaseSyncService {
   }
 
   async _driveFetch(url, init = {}) {
+    const { _retriedSilentRefresh = false, silent = false, ...fetchInit } = init;
     let token = this.getGoogleAccessToken();
-    if (!token && this.session?.auth_mode === 'google_oauth' && this._isTauriEnvironment()) {
+    if ((!token || this.isGoogleTokenExpired()) && this.session?.auth_mode === 'google_oauth') {
       const refreshed = await this._trySilentGoogleRefresh().catch(() => false);
       if (refreshed) {
         token = this.getGoogleAccessToken();
       }
     }
-    if (!token || !this.fetchImpl || !this._isOnline()) {
+    if (!token || this.isGoogleTokenExpired() || !this.fetchImpl || !this._isOnline()) {
       return { res: null, forbidden: false, unauthorized: false, text: '' };
     }
-    const { _retriedSilentRefresh = false, ...fetchInit } = init;
     try {
       const res = await this.fetchImpl(url, {
         ...fetchInit,
@@ -2799,19 +3159,27 @@ export class SupabaseSyncService {
       if (res.status === 401) {
         if (!_retriedSilentRefresh) {
           const refreshed = await this._trySilentGoogleRefresh().catch(() => false);
-          if (refreshed && this.getGoogleAccessToken()) {
-            return this._driveFetch(url, { ...fetchInit, _retriedSilentRefresh: true });
+          if (refreshed && this.getGoogleAccessToken() && !this.isGoogleTokenExpired()) {
+            return this._driveFetch(url, { ...fetchInit, silent, _retriedSilentRefresh: true });
           }
         }
         const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
-        this.needsDriveSyncReauth = true;
+        if (this.isAuthenticated()) {
+          this._clearExpiredGoogleTokenInMemory();
+        } else {
+          this.needsDriveSyncReauth = true;
+        }
         return { res, forbidden: false, unauthorized: true, text };
       }
       if (res.status === 403) {
         const text = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
         if (!text || /insufficientPermissions|insufficient|PERMISSION_DENIED|scope/i.test(text)) {
-          this.needsDriveSyncReauth = true;
-          this.needsDriveConsent = true;
+          if (!this.isAuthenticated()) {
+            this.needsDriveSyncReauth = true;
+            this.needsDriveConsent = true;
+          } else if (!silent) {
+            this.needsDriveConsent = true;
+          }
         }
         return { res, forbidden: true, unauthorized: false, text };
       }
@@ -2821,16 +3189,17 @@ export class SupabaseSyncService {
     }
   }
 
-  async _findDriveSyncFileMeta() {
+  async _findDriveSyncFileMeta({ silent = false } = {}) {
     const token = this.getGoogleAccessToken();
-    if (!token || !this.fetchImpl || !this._isOnline()) {
+    if (!token || this.isGoogleTokenExpired() || !this.fetchImpl || !this._isOnline()) {
       return null;
     }
 
     if (this.driveSyncFileId) {
       try {
         const { res, forbidden, unauthorized } = await this._driveFetch(
-          `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(this.driveSyncFileId)}?fields=id,name,modifiedTime`
+          `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(this.driveSyncFileId)}?fields=id,name,modifiedTime`,
+          { silent }
         );
         if (forbidden || unauthorized) return null;
         if (res?.ok) {
@@ -2848,7 +3217,7 @@ export class SupabaseSyncService {
     const query = encodeURIComponent(`name='${DRIVE_SYNC_FILENAME}' and trashed=false`);
     const listUrl = `https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${query}&fields=files(id,name,modifiedTime)&pageSize=1`;
     try {
-      const { res, forbidden, unauthorized } = await this._driveFetch(listUrl);
+      const { res, forbidden, unauthorized } = await this._driveFetch(listUrl, { silent });
       if (forbidden || unauthorized || !res?.ok) return null;
       const data = await res.json();
       const file = Array.isArray(data?.files) ? data.files[0] : null;
@@ -2863,11 +3232,12 @@ export class SupabaseSyncService {
 
   async _readDriveSyncPayload({ force = false } = {}) {
     const token = this.getGoogleAccessToken();
-    if (!token || !this.fetchImpl || !this._isOnline()) {
+    if (!token || this.isGoogleTokenExpired() || !this.fetchImpl || !this._isOnline()) {
       return { exists: false, changed: false, payload: null, modifiedTime: null };
     }
 
-    const meta = await this._findDriveSyncFileMeta();
+    const silent = this.isAuthenticated();
+    const meta = await this._findDriveSyncFileMeta({ silent });
     if (this.needsDriveSyncReauth) {
       return { exists: false, changed: false, payload: null, modifiedTime: null };
     }
@@ -2892,7 +3262,8 @@ export class SupabaseSyncService {
 
     try {
       const { res, forbidden, unauthorized } = await this._driveFetch(
-        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(meta.id)}?alt=media`
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(meta.id)}?alt=media`,
+        { silent }
       );
       if (forbidden || unauthorized || !res?.ok) {
         return {
@@ -2926,10 +3297,11 @@ export class SupabaseSyncService {
   async _writeDriveSyncPayload(buildDeltaFn) {
     const task = this._driveWriteQueue.then(async () => {
       const token = this.getGoogleAccessToken();
-      if (!token || !this.fetchImpl || !this._isOnline()) {
+      if (!token || this.isGoogleTokenExpired() || !this.fetchImpl || !this._isOnline()) {
         return null;
       }
 
+      const silent = this.isAuthenticated();
       const remoteState = await this._readDriveSyncPayload({ force: true });
       if (this.needsDriveSyncReauth) {
         return null;
@@ -2963,7 +3335,8 @@ export class SupabaseSyncService {
         headers: {
           'Content-Type': `multipart/related; boundary=${boundary}`
         },
-        body: multipartBody
+        body: multipartBody,
+        silent
       });
 
       if (forbidden || unauthorized || !res?.ok) {

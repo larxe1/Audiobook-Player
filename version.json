@@ -1,13 +1,13 @@
 {
-  "version": "1.0.19",
-  "build": 20,
+  "version": "1.0.20",
+  "build": 21,
   "minNativeBuild": 15,
   "channel": "stable",
-  "publishedAt": "2026-11-21T16:30:00Z",
+  "publishedAt": "2026-11-21T17:05:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "webBundleUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Rebrand to MultiPlayer with Pitch Black default theme, unified search, right-click and long-press context menus, Settings > Advanced Settings, instant Drive HTTP Range streaming, paused switch fix, incremental Drive sync, and Android back navigation"
+  "releaseNotes": "Persistent Google Sync across 1-hour token expiration with silent native/web refresh and full Android Back button navigation hierarchy"
 }

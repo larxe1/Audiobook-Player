@@ -1821,9 +1821,267 @@ test('Settings > Advanced Settings houses the 6 tucked actions, Profile popover 
     app.state.layoutMode = 'android';
     app.state.desktopView = 'detail';
     app._lastBackPressAt = 0;
+    app._lastRootBackPressAt = 0;
     assert.equal(app.handleBackPress(), true);
     assert.match(app.state.statusToast?.message || '', /Press back again to exit/);
     assert.equal(app.handleBackPress(), false);
+  } finally {
+    app?.destroy?.();
+    env.restore();
+  }
+});
+
+test('Android app open after 1-hour Google token expires with valid Supabase refresh_token keeps needsDriveSyncReauth = false and never renders Reconnect Google Sync', async () => {
+  const env = createDomEnv({ innerWidth: 390 });
+  let app = null;
+  try {
+    env.mockWindow.location = {
+      origin: 'https://localhost',
+      protocol: 'https:',
+      pathname: '/',
+      search: '',
+      hash: ''
+    };
+    let silentOAuthUrl = null;
+    env.mockWindow.Capacitor = { isNativePlatform: () => true };
+    env.mockWindow.AudiobookOAuthNative = {
+      loadAuthSession: () => null,
+      saveAuthSession: () => true,
+      clearAuthSession: () => true,
+      consumePendingResult: () => null,
+      startSilentGoogleOAuth: (url) => {
+        silentOAuthUrl = url;
+        // Simulate silent refresh returning login_required (no Google cookie in WebView)
+        const state = new URL(url).searchParams.get('state');
+        env.mockWindow.__onAndroidGoogleOAuthResult?.({ error: 'login_required', state });
+      }
+    };
+
+    const twoHoursAgo = Date.now() - 2 * 3600 * 1000;
+    const persistedSession = {
+      access_token: 'expired-supa-jwt',
+      refresh_token: 'long-lived-supa-refresh',
+      auth_mode: 'google_oauth',
+      provider_token: 'ya29.expired-2h-ago',
+      googleAccessToken: 'ya29.expired-2h-ago',
+      googleTokenObtainedAt: twoHoursAgo,
+      user: {
+        id: 'supa-android-user-1',
+        email: 'android.listener@gmail.com',
+        user_metadata: {
+          email: 'android.listener@gmail.com',
+          full_name: 'Android Listener'
+        }
+      }
+    };
+    globalThis.localStorage.setItem(
+      'audiobook_player_supabase_session_v1',
+      JSON.stringify(persistedSession)
+    );
+    globalThis.localStorage.setItem('audiobook_drive_folder_v1', 'folder-abc');
+
+    const fetchedUrls = [];
+    app = new AudiobookApp(env.rootEl);
+    app._enrichSingleBookInBackground = async () => {};
+    app._runBackgroundMetadataEnrichment = async () => {};
+    app.syncService.navigatorObj = { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14)' };
+    app.syncService.fetchImpl = async (url, init = {}) => {
+      fetchedUrls.push(url);
+      if (url.endsWith('/auth/v1/user')) {
+        return { ok: false, status: 401, async text() { return 'JWT expired'; } };
+      }
+      if (url.includes('/auth/v1/token?grant_type=refresh_token')) {
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return {
+              access_token: 'fresh-supa-jwt',
+              refresh_token: 'rotated-supa-refresh',
+              expires_in: 3600,
+              user: persistedSession.user
+            };
+          }
+        };
+      }
+      if (url.includes('/rest/v1/audiobook_user_settings')) {
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify([
+              {
+                user_id: 'supa-android-user-1',
+                drive_folder_id: 'folder-abc',
+                drive_folder_name: 'Audiobooks',
+                updated_at: '2026-11-22T00:00:00.000Z'
+              }
+            ]);
+          }
+        };
+      }
+      if (url.includes('googleapis.com/oauth2/v3/userinfo')) {
+        throw new Error('Should NOT hit Google userinfo with an already-expired 2h old token');
+      }
+      if (url.includes('/rest/v1/')) {
+        return { ok: true, status: 200, async text() { return '[]'; } };
+      }
+      throw new Error(`Unexpected fetch: ${url} (${init.method || 'GET'})`);
+    };
+
+    let iframeCreated = false;
+    env.mockDocument.createElement = (tag) => {
+      if (String(tag).toLowerCase() === 'iframe') iframeCreated = true;
+      return new MockElement(tag);
+    };
+    const restored = await app.syncService.restoreSession();
+    assert.ok(restored, 'restoreSession must succeed via Supabase refresh_token');
+    assert.equal(iframeCreated, false, 'Android Capacitor must NOT fall through to web hidden iframe after native silent OAuth fails');
+    assert.equal(app.syncService.isAuthenticated(), true);
+    assert.equal(app.syncService.needsDriveSyncReauth, false, 'needsDriveSyncReauth MUST remain false when Supabase is authenticated');
+    assert.equal(app.syncService.getGoogleAccessToken(), null, 'Expired 2h Google token must be cleared from memory');
+    assert.equal(app.syncService.hasDriveSyncToken(), false);
+    assert.ok(silentOAuthUrl && silentOAuthUrl.includes('prompt=none'), 'Android native silent OAuth must be attempted with prompt=none');
+    assert.ok(
+      !fetchedUrls.some((u) => u.includes('googleapis.com/oauth2/v3/userinfo')),
+      'Expired Google token must skip Google userinfo check'
+    );
+
+    // _maybeRunAutoDriveSync must skip quietly without calling runGoogleDriveSync or setting needsDriveSyncReauth
+    let driveSyncCalled = false;
+    app.runGoogleDriveSync = async () => {
+      driveSyncCalled = true;
+    };
+    const autoSynced = await app._maybeRunAutoDriveSync({ force: true });
+    assert.equal(autoSynced, false);
+    assert.equal(driveSyncCalled, false);
+    assert.equal(app.syncService.needsDriveSyncReauth, false);
+
+    // UI banners and empty library card MUST NOT render "Reconnect Google Sync" when Supabase is authenticated
+    app.user = app.syncService.getUserProfile();
+    app.books = [];
+    app.state.needsDriveSyncReauth = true; // even if stale flag were set, authenticated Supabase suppresses banner
+    app.render();
+    assert.equal(env.rootEl.querySelector('.sync-reauth-banner'), null, 'Workspace banner must NOT show Reconnect Google Sync');
+    assert.equal(env.rootEl.querySelector('[data-action="reauth-drive-sync"]'), null, 'Empty library card must NOT show Reconnect Google button');
+    assert.doesNotMatch(env.rootEl.innerHTML, /Reconnect Google Sync/);
+  } finally {
+    app?.destroy?.();
+    env.restore();
+  }
+});
+
+test('Android handleBackPress closes modals (including driveModal.loading), syncProgress, expanded series, and podcasts tab first, deduplicates native+popstate, and requires double-tap within 2500ms at root', () => {
+  const env = createDomEnv({ innerWidth: 390 });
+  let app = null;
+  try {
+    const pushedStates = [];
+    env.mockWindow.history = {
+      state: null,
+      pushState: (state) => {
+        env.mockWindow.history.state = state;
+        pushedStates.push(state);
+      }
+    };
+    let capBackHandler = null;
+    env.mockWindow.Capacitor = {
+      Plugins: {
+        App: {
+          addListener: (name, fn) => {
+            if (name === 'backButton') capBackHandler = fn;
+            return { remove: () => {} };
+          }
+        }
+      }
+    };
+
+    app = new AudiobookApp(env.rootEl);
+    app._enrichSingleBookInBackground = async () => {};
+    app._runBackgroundMetadataEnrichment = async () => {};
+    app.guestLocalMode = true;
+    app.books = [makeBook(1), makeBook(2)];
+    app.state.activeBookKey = app.books[0].bookKey;
+
+    // Binding global inputs registers popstate, cordova backbutton, capacitor backButton, and user-gesture guard
+    app._bindGlobalInputs();
+    assert.equal(typeof capBackHandler, 'function', 'Capacitor App backButton listener must be registered');
+    env.mockDocument.dispatchEvent('pointerdown');
+    assert.equal(env.mockWindow.history.state?.multiplayerUserGuard, true, 'User gesture must arm multiplayerUserGuard');
+
+    // Simulating popstate while an overlay is open must push the guard at most once (no duplicate history leak)
+    app.state.settingsModalOpen = true;
+    env.mockWindow.history.state = null; // browser popped the guard entry before firing popstate
+    const pushesBeforePop = pushedStates.length;
+    env.mockWindow.dispatchEvent('popstate');
+    assert.equal(app.state.settingsModalOpen, false);
+    assert.equal(
+      pushedStates.length - pushesBeforePop,
+      1,
+      '_popstateHandler must re-arm history guard once without leaking duplicate history entries'
+    );
+    app._lastBackPressHandledAt = 0;
+    app._lastBackPressSource = '';
+
+    // Open multiple layers including driveModal.loading, syncProgress, expanded series, and podcasts filter
+    let aborted = false;
+    app._syncAbortController = { abort: () => { aborted = true; } };
+    app.state.contextMenu = { type: 'book', bookKey: app.books[0].bookKey, x: 20, y: 20 };
+    app.state.driveModal = { open: true, folderId: 'f1', token: 't1', loading: true, error: '' };
+    app.state.syncProgress = { active: true, phase: 'drive', percent: 40, currentFolder: 'Books', scannedFolders: 1, discoveredFolders: 2, booksFound: 1 };
+    app.state.settingsModalOpen = true;
+    app.state.profileOpen = true;
+    app.state.mobileSheetOpen = true;
+    app.state.searchQuery = 'dune';
+    app.state.expandedSeries = new Set(['Series Saga']);
+    app.state.filterSource = 'podcasts';
+
+    // 1. Context menu closes first (from native); simultaneous popstate within 300ms MUST be deduplicated
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.equal(app.state.contextMenu, null);
+    assert.equal(app.state.driveModal.open, true);
+    assert.equal(app.handleBackPress({ source: 'popstate' }), true, 'Simultaneous popstate from same physical tap must be deduplicated');
+    assert.equal(app.state.driveModal.open, true, 'Deduplicated popstate must NOT close the next modal layer');
+
+    // 2. Drive modal closes EVEN WHEN loading: true (and aborts in-flight sync)
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.equal(app.state.driveModal.open, false);
+    assert.equal(app.state.driveModal.loading, false);
+    assert.equal(aborted, true, 'Closing loading driveModal must abort in-flight sync');
+
+    // 3. syncProgress.active closes next
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.equal(app.state.syncProgress.active, false);
+
+    // 4. settingsModalOpen -> profileOpen -> mobileSheetOpen
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.equal(app.state.settingsModalOpen, false);
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.equal(app.state.profileOpen, false);
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.equal(app.state.mobileSheetOpen, false);
+
+    // 5. searchQuery -> expandedSeries -> podcasts filter tab
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.equal(app.state.searchQuery, '');
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.equal(app.state.expandedSeries.size, 0);
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.equal(app.state.filterSource, 'audiobooks');
+
+    // 6. Now at root home screen: 1st tap returns true + toast; simultaneous popstate is deduplicated (does NOT exit!)
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.match(app.state.statusToast?.message || '', /Press back again to exit/);
+    assert.equal(app.handleBackPress({ source: 'popstate' }), true, 'Duplicate popstate on 1st root tap must NOT trigger exit');
+
+    // 7. 2nd genuine tap at root within 2500ms from same source returns false (confirmed exit)
+    assert.equal(app.handleBackPress({ source: 'native' }), false);
+    assert.equal(app._lastRootBackPressAt, 0);
+
+    // 8. Tap after >2500ms expires window and shows toast again instead of exiting
+    app._lastRootBackPressAt = Date.now() - 2600;
+    app._lastBackPressAt = app._lastRootBackPressAt;
+    assert.equal(app.handleBackPress({ source: 'native' }), true);
+    assert.match(app.state.statusToast?.message || '', /Press back again to exit/);
   } finally {
     app?.destroy?.();
     env.restore();

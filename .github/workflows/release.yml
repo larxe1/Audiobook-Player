@@ -179,6 +179,8 @@ jobs:
           import android.os.Bundle;
           import android.view.View;
           import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import android.widget.Toast;
           import androidx.activity.OnBackPressedCallback;
           import androidx.core.graphics.Insets;
           import androidx.core.view.ViewCompat;
@@ -197,6 +199,7 @@ jobs:
           public class MainActivity extends BridgeActivity {
               private AudiobookOAuthBridge oauthBridge;
               private AudiobookUpdaterBridge updaterBridge;
+              private long lastBackExitPromptMs = 0L;
 
               @Override
               public void onCreate(Bundle savedInstanceState) {
@@ -262,21 +265,40 @@ jobs:
                       @Override
                       public void handleOnBackPressed() {
                           if (getBridge() != null && getBridge().getWebView() != null) {
-                              getBridge().getWebView().post(() -> {
-                                  getBridge().getWebView().evaluateJavascript(
-                                      "(function(){ return Boolean(window.__audiobookApp && typeof window.__audiobookApp.handleBackPress === 'function' && window.__audiobookApp.handleBackPress()); })()",
+                              final WebView wv = getBridge().getWebView();
+                              wv.post(() -> {
+                                  wv.evaluateJavascript(
+                                      "(function(){ try { if (window.__audiobookApp && typeof window.__audiobookApp.handleBackPress === 'function') { return window.__audiobookApp.handleBackPress({ source: 'native' }) ? 'handled' : 'exit'; } return 'unready'; } catch(e) { return 'error'; } })()",
                                       value -> {
-                                          if (!"true".equals(value)) {
+                                          if ("\\"exit\\"".equals(value)) {
+                                              lastBackExitPromptMs = 0L;
                                               moveTaskToBack(true);
+                                          } else if ("\\"unready\\"".equals(value)
+                                              || "\\"error\\"".equals(value)
+                                              || value == null
+                                              || "null".equals(value)
+                                              || "undefined".equals(value)) {
+                                              handleNativeDoubleTapExit();
                                           }
                                       }
                                   );
                               });
                           } else {
-                              moveTaskToBack(true);
+                              handleNativeDoubleTapExit();
                           }
                       }
                   });
+              }
+
+              private void handleNativeDoubleTapExit() {
+                  long now = System.currentTimeMillis();
+                  if (now - lastBackExitPromptMs < 2500L) {
+                      lastBackExitPromptMs = 0L;
+                      moveTaskToBack(true);
+                  } else {
+                      lastBackExitPromptMs = now;
+                      Toast.makeText(MainActivity.this, "Press back again to exit", Toast.LENGTH_SHORT).show();
+                  }
               }
 
               private static int readBuildFromStream(InputStream stream) {

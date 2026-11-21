@@ -512,7 +512,13 @@ class AudiobookApp {
     this._longPressStart = null;
     this._suppressNextClickUntil = 0;
     this._lastBackPressAt = 0;
+    this._lastRootBackPressAt = 0;
+    this._lastBackPressHandledAt = 0;
+    this._lastBackPressSource = '';
     this._popstateHandler = null;
+    this._backbuttonHandler = null;
+    this._capacitorBackListener = null;
+    this._userBackGuardHandler = null;
     this._globalInputsBound = false;
     this._androidUpdateReturnCleanup = null;
     this._destroyed = false;
@@ -992,10 +998,12 @@ class AudiobookApp {
   }
 
   _hasGoogleDriveToken() {
+    if (typeof this.syncService?.hasDriveSyncToken === 'function') {
+      return Boolean(this.syncService.hasDriveSyncToken());
+    }
     return Boolean(
-      this.syncService?.hasDriveSyncToken?.() ||
-        this.syncService?.hasGoogleDriveToken?.() ||
-        this.syncService?.getGoogleAccessToken?.()
+      (this.syncService?.hasGoogleDriveToken?.() || this.syncService?.getGoogleAccessToken?.()) &&
+        !this.syncService?.isGoogleTokenExpired?.()
     );
   }
 
@@ -1643,6 +1651,29 @@ class AudiobookApp {
       window.removeEventListener('popstate', this._popstateHandler);
       this._popstateHandler = null;
     }
+    if (this._backbuttonHandler && typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener('backbutton', this._backbuttonHandler, false);
+      this._backbuttonHandler = null;
+    }
+    if (this._userBackGuardHandler && typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener('pointerdown', this._userBackGuardHandler);
+      document.removeEventListener('touchend', this._userBackGuardHandler);
+      document.removeEventListener('click', this._userBackGuardHandler);
+      this._userBackGuardHandler = null;
+    }
+    if (this._capacitorBackListener) {
+      const listener = this._capacitorBackListener;
+      this._capacitorBackListener = null;
+      if (typeof listener.remove === 'function') {
+        try {
+          void listener.remove();
+        } catch {
+          // ignore
+        }
+      } else if (typeof listener.then === 'function') {
+        void listener.then((handle) => handle?.remove?.()).catch(() => null);
+      }
+    }
     if (typeof this._unsubGoogleToken === 'function') {
       this._unsubGoogleToken();
       this._unsubGoogleToken = null;
@@ -1663,17 +1694,15 @@ class AudiobookApp {
 
     this._syncInFlight = (async () => {
       try {
-        if (
-          this.user &&
-          this.syncService?.session?.auth_mode === 'google_oauth' &&
-          this.syncService?._isTauriEnvironment?.()
-        ) {
-          await this.syncService.ensureFreshGoogleToken?.().catch(() => false);
+        if (this.user && this.syncService?.session?.auth_mode === 'google_oauth') {
+          await this.syncService.ensureFreshGoogleToken?.({ silent: true }).catch(() => false);
         }
         const snapshot = await this._pullCloudSnapshotUnified({ force: force || true });
 
         const prevReauth = this.state.needsDriveSyncReauth;
-        this.state.needsDriveSyncReauth = Boolean(this.syncService?.needsDriveSyncReauth);
+        this.state.needsDriveSyncReauth = Boolean(
+          this.syncService?.needsDriveSyncReauth && !this.syncService?.isAuthenticated?.()
+        );
 
         if (!snapshot) {
           if (prevReauth !== this.state.needsDriveSyncReauth) this.render();
@@ -1793,7 +1822,9 @@ class AudiobookApp {
           : [];
       remoteDevices = Array.isArray(snapshot?.devices) ? snapshot.devices : [];
       progressMap = snapshot?.progress || null;
-      this.state.needsDriveSyncReauth = Boolean(this.syncService?.needsDriveSyncReauth);
+      this.state.needsDriveSyncReauth = Boolean(
+        this.syncService?.needsDriveSyncReauth && !this.syncService?.isAuthenticated?.()
+      );
 
       const savedFolderId = this._getSavedDriveFolderId();
       if (remoteDriveFolder?.folderId && !savedFolderId) {
@@ -1923,6 +1954,7 @@ class AudiobookApp {
     }
     this._applyThemeBodyClass(this.state.theme);
     this._applyPlatformViewportClasses();
+    this._bindGlobalInputs();
     if (!this._destroyed) {
       void this.handleCheckForUpdate({ silent: true });
     }
@@ -2002,7 +2034,9 @@ class AudiobookApp {
 
     const token = this.syncService.getGoogleAccessToken();
     this.audioEngine.setDriveAccessToken(token || null);
-    this.state.needsDriveSyncReauth = Boolean(this.syncService?.needsDriveSyncReauth);
+    this.state.needsDriveSyncReauth = Boolean(
+      this.syncService?.needsDriveSyncReauth && !this.syncService?.isAuthenticated?.()
+    );
 
     if (this.user || this.guestLocalMode) {
       await this._loadUserLibraryAndSync();
@@ -2222,12 +2256,8 @@ class AudiobookApp {
     const triggerResumeSync = (reason) => {
       if (!((this.user || this.guestLocalMode) && this._hasCloudSyncAuth())) return;
       void (async () => {
-        if (
-          this.user &&
-          this.syncService?.session?.auth_mode === 'google_oauth' &&
-          this.syncService?._isTauriEnvironment?.()
-        ) {
-          await this.syncService.ensureFreshGoogleToken?.().catch(() => false);
+        if (this.user && this.syncService?.session?.auth_mode === 'google_oauth') {
+          await this.syncService.ensureFreshGoogleToken?.({ silent: true }).catch(() => false);
         }
         await this._runPeriodicCloudSync({ force: true, reason });
       })();
@@ -2249,6 +2279,20 @@ class AudiobookApp {
           triggerResumeSync('visibility');
         }
       });
+
+      this._backbuttonHandler = (e) => {
+        if (this._destroyed) return;
+        e?.preventDefault?.();
+        this.handleBackPress({ source: 'cordova' });
+      };
+      document.addEventListener('backbutton', this._backbuttonHandler, false);
+
+      this._userBackGuardHandler = () => {
+        this._armUserBackGuard();
+      };
+      document.addEventListener('pointerdown', this._userBackGuardHandler, { passive: true });
+      document.addEventListener('touchend', this._userBackGuardHandler, { passive: true });
+      document.addEventListener('click', this._userBackGuardHandler, { passive: true });
     }
 
     if (typeof window !== 'undefined') {
@@ -2284,16 +2328,28 @@ class AudiobookApp {
       }
       this._popstateHandler = () => {
         if (this._destroyed) return;
-        const handled = this.handleBackPress();
-        if (handled && typeof window.history?.pushState === 'function') {
-          try {
-            window.history.pushState({ multiplayerGuard: true }, '');
-          } catch {
-            // ignore
-          }
+        const handled = this.handleBackPress({ source: 'popstate' });
+        if (handled) {
+          this._armUserBackGuard();
         }
       };
       window.addEventListener('popstate', this._popstateHandler);
+
+      const capApp = window.Capacitor?.Plugins?.App;
+      if (capApp && typeof capApp.addListener === 'function') {
+        try {
+          this._capacitorBackListener = capApp.addListener('backButton', () => {
+            if (this._destroyed) return;
+            const handled = this.handleBackPress({ source: 'capacitor' });
+            if (!handled && typeof capApp.minimizeApp === 'function') {
+              void capApp.minimizeApp().catch(() => null);
+            }
+          });
+        } catch {
+          // ignore if Capacitor App plugin is unavailable
+        }
+      }
+
       if (typeof window.matchMedia === 'function') {
         const mqMobile = window.matchMedia('(max-width: 767px)');
         const mqWatch = window.matchMedia('(max-width: 340px)');
@@ -2307,80 +2363,154 @@ class AudiobookApp {
     }
   }
 
-  handleBackPress() {
+  _armUserBackGuard() {
+    if (this._destroyed || typeof window === 'undefined' || typeof window.history?.pushState !== 'function') {
+      return;
+    }
+    try {
+      if (!window.history.state?.multiplayerUserGuard) {
+        window.history.pushState({ multiplayerGuard: true, multiplayerUserGuard: true }, '');
+      }
+    } catch {
+      // ignore restricted history environments
+    }
+  }
+
+  handleBackPress(options = {}) {
+    const now = Date.now();
+    const source = typeof options?.source === 'string' ? options.source : '';
+    if (
+      !options?.bypassDedup &&
+      source &&
+      this._lastBackPressSource &&
+      this._lastBackPressSource !== source &&
+      this._lastBackPressHandledAt &&
+      now - this._lastBackPressHandledAt < 300
+    ) {
+      return true;
+    }
+    this._lastBackPressHandledAt = now;
+    if (source) {
+      this._lastBackPressSource = source;
+    }
+
+    const markHandled = () => {
+      this._lastRootBackPressAt = 0;
+      this._lastBackPressAt = 0;
+      this._armUserBackGuard();
+      return true;
+    };
+
     if (this.state.contextMenu) {
       this.state.contextMenu = null;
       this.render();
-      return true;
+      return markHandled();
     }
     if (this.state.errorModal?.open) {
       this.state.errorModal.open = false;
       this.render();
-      return true;
+      return markHandled();
     }
-    if (this.state.showWipeSyncedModal && !this.state.wipeInProgress) {
-      this.state.showWipeSyncedModal = false;
-      this.state.wipeClearDriveFolder = false;
-      this.render();
-      return true;
+    if (this.state.showWipeSyncedModal) {
+      if (!this.state.wipeInProgress) {
+        this.state.showWipeSyncedModal = false;
+        this.state.wipeClearDriveFolder = false;
+        this.render();
+      }
+      return markHandled();
     }
     if (Array.isArray(this.state.pendingDriveRemovals) && this.state.pendingDriveRemovals.length > 0) {
       this.state.pendingDriveRemovals = [];
       this.render();
-      return true;
+      return markHandled();
     }
     if (this.state.coverModal?.open) {
       this.state.coverModal.open = false;
       this.render();
-      return true;
+      return markHandled();
     }
-    if (this.state.driveModal?.open && !this.state.driveModal?.loading) {
+    if (this.state.driveModal?.open) {
+      if (this.state.driveModal.loading && this._syncAbortController) {
+        try {
+          this._syncAbortController.abort();
+        } catch {
+          // ignore
+        }
+      }
       this.state.driveModal.open = false;
+      this.state.driveModal.loading = false;
       this.render();
-      return true;
+      return markHandled();
+    }
+    if (this.state.syncProgress?.active) {
+      this.state.syncProgress.active = false;
+      this.render();
+      return markHandled();
     }
     if (this.state.devicesModalOpen) {
       this.state.devicesModalOpen = false;
       this.render();
-      return true;
+      return markHandled();
     }
     if (this.state.settingsModalOpen) {
       this.state.settingsModalOpen = false;
       this.render();
-      return true;
+      return markHandled();
     }
     if (this.state.podcastModal?.open) {
       this.closePodcastModal();
-      return true;
+      return markHandled();
     }
     if (this.state.profileOpen) {
       this.state.profileOpen = false;
       this.render();
-      return true;
+      return markHandled();
     }
     if (this.state.shadeOpen) {
       this.state.shadeOpen = false;
       this.render();
-      return true;
+      return markHandled();
     }
     if (this.state.mobileSheetOpen) {
       this.state.mobileSheetOpen = false;
+      this.state.detailBookKey = null;
       this.render();
-      return true;
+      return markHandled();
     }
-    if (this.state.layoutMode === 'desktop' && this.state.desktopView === 'detail') {
+    if (
+      (this.state.layoutMode === 'desktop' && this.state.desktopView === 'detail') ||
+      Boolean(this.state.detailBookKey)
+    ) {
       this.state.desktopView = 'home';
       this.state.detailBookKey = null;
       this.render();
-      return true;
+      return markHandled();
+    }
+    if (String(this.state.searchQuery || '').length > 0) {
+      this.state.searchQuery = '';
+      this.render();
+      return markHandled();
+    }
+    if (this.state.expandedSeries && this.state.expandedSeries.size > 0) {
+      this.state.expandedSeries.clear();
+      this.render();
+      return markHandled();
+    }
+    if (this.state.filterSource === 'podcasts') {
+      this.state.filterSource = 'audiobooks';
+      this.render();
+      return markHandled();
     }
 
-    const now = Date.now();
-    if (this._lastBackPressAt && now - this._lastBackPressAt < 2000) {
+    const lastRootAt = this._lastRootBackPressAt || this._lastBackPressAt || 0;
+    if (lastRootAt && now - lastRootAt < 2500) {
+      this._lastRootBackPressAt = 0;
       this._lastBackPressAt = 0;
       return false;
     }
+    this._lastRootBackPressAt = now;
     this._lastBackPressAt = now;
+    this._armUserBackGuard();
     this.showStatusToast('Press back again to exit', 'info');
     return true;
   }
@@ -4040,13 +4170,22 @@ class AudiobookApp {
   async _maybeRunAutoDriveSync({ force = false } = {}) {
     if (this._destroyed) return false;
     if (this.state.autoDriveSyncEnabled === false) return false;
-    if (!this._hasGoogleDriveToken()) return false;
     if (this.state.driveModal?.loading || this.state.syncProgress?.active) return false;
 
     const savedFolderId = this._getSavedDriveFolderId();
     if (!savedFolderId && this.books.length > 0) return false;
     const now = Date.now();
     if (!force && this._lastAutoDriveSyncAt && now - this._lastAutoDriveSyncAt < AUTO_DRIVE_SYNC_INTERVAL_MS) {
+      return false;
+    }
+
+    if (
+      this.syncService?.isGoogleTokenExpired?.() ||
+      (!this._hasGoogleDriveToken() && this.syncService?.session?.auth_mode === 'google_oauth')
+    ) {
+      await this.syncService?.ensureFreshGoogleToken?.({ silent: true }).catch(() => false);
+    }
+    if (!this._hasGoogleDriveToken() || this.syncService?.isGoogleTokenExpired?.()) {
       return false;
     }
 
@@ -5196,8 +5335,10 @@ class AudiobookApp {
   _renderWorkspaceBanners() {
     const us = this.state.updateState || {};
     const showUpdate = Boolean(us.updateAvailable && !us.dismissed);
+    const isSupabaseAuthenticated = Boolean(this.syncService?.isAuthenticated?.());
     const showReauth = Boolean(
-      this.state.needsDriveSyncReauth || this.syncService?.needsDriveSyncReauth
+      !isSupabaseAuthenticated &&
+        (this.state.needsDriveSyncReauth || this.syncService?.needsDriveSyncReauth)
     );
     if (!showUpdate && !showReauth) return '';
 
@@ -5464,8 +5605,10 @@ class AudiobookApp {
   }
 
   _renderEmptyLibraryCard() {
+    const isSupabaseAuthenticated = Boolean(this.syncService?.isAuthenticated?.());
     const needsReauth = Boolean(
-      this.books.length === 0 &&
+      !isSupabaseAuthenticated &&
+        this.books.length === 0 &&
         this.user &&
         (this.state.needsDriveSyncReauth || this.syncService?.needsDriveSyncReauth)
     );
@@ -8326,6 +8469,7 @@ class AudiobookApp {
           }
           case 'close-mobile-sheet': {
             this.state.mobileSheetOpen = false;
+            this.state.detailBookKey = null;
             this.render();
             break;
           }

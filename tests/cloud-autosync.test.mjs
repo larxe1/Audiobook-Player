@@ -350,9 +350,10 @@ test('Google OAuth bridges PC and Android to the exact same Supabase Auth accoun
   assert.equal(androidSync.isAuthenticated(), true);
   assert.equal(androidSync.session.user.id, pcUserId, 'PC and Android must bridge to the same Supabase user ID');
 
-  // pullCloudSnapshot handles 401 from _driveFetch without throwing, flags needsDriveSyncReauth, and returns Supabase catalog + active playback
+  // pullCloudSnapshot handles 401 from _driveFetch without throwing, clears expired Drive token without prompting reauth (Supabase is authenticated), and returns Supabase catalog + active playback
   const snap = await androidSync.pullCloudSnapshot({ force: false });
-  assert.equal(androidSync.needsDriveSyncReauth, true);
+  assert.equal(androidSync.needsDriveSyncReauth, false);
+  assert.equal(androidSync.getGoogleAccessToken(), null);
   assert.equal(snap.changed, true);
   assert.equal(snap.library.length, 1);
   assert.equal(snap.library[0].bookKey, 'lincoln-in-the-bardo::george-saunders');

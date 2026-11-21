@@ -1794,7 +1794,7 @@ test('Windows Tauri restoreSession runs _trySilentGoogleRefresh when bridged Sup
   assert.equal(startCalls.length, 1);
   assert.equal(startCalls[0].args.silent, true);
 
-  // Case 2: When silent refresh returns needs_interactive, keep user signed in and set needsDriveSyncReauth = true, needsDriveConsent = false
+  // Case 2: When silent refresh returns needs_interactive while Supabase session is valid, keep user signed in and keep needsDriveSyncReauth = false, needsDriveConsent = false
   oauthMode = 'needs_interactive';
   sync.setSession({
     ...sync.session,
@@ -1806,7 +1806,7 @@ test('Windows Tauri restoreSession runs _trySilentGoogleRefresh when bridged Sup
   assert.ok(restoredNeedsInteractive);
   assert.equal(sync.isAuthenticated(), true);
   assert.equal(sync.getGoogleAccessToken(), null);
-  assert.equal(sync.needsDriveSyncReauth, true);
+  assert.equal(sync.needsDriveSyncReauth, false);
   assert.equal(sync.needsDriveConsent, false);
 
   sync.destroy();

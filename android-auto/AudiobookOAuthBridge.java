@@ -2,17 +2,28 @@ package com.audiobook.player;
 
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.View;
+import android.view.ViewGroup;
+import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebSettings;
 import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import androidx.browser.customtabs.CustomTabColorSchemeParams;
 import androidx.browser.customtabs.CustomTabsIntent;
 import com.getcapacitor.BridgeActivity;
 import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -31,12 +42,15 @@ public class AudiobookOAuthBridge {
         "https://larxe1.github.io/Audiobook-Player/oauth-callback.html";
     private static final String DEEP_LINK_SCHEME = "com.audiobook.player";
     private static final String DEEP_LINK_HOST = "oauth";
+    private static final String REDIRECT_PREFIX = "com.audiobook.player://oauth";
+    private static final long SILENT_OAUTH_TIMEOUT_MS = 6000L;
     private static final String DEFAULT_PROMPT = "select_account";
     private static final String PREFS_NAME = "audiobook_auth_prefs";
     private static final String KEY_AUTH_SESSION = "auth_session_v1";
 
     private final BridgeActivity activity;
     private String pendingResultJson;
+    private Runnable activeSilentCleanup;
 
     public AudiobookOAuthBridge(BridgeActivity activity) {
         this.activity = activity;
@@ -124,6 +138,192 @@ public class AudiobookOAuthBridge {
     }
 
     @JavascriptInterface
+    public void startSilentGoogleOAuth(final String authUrl) {
+        synchronized (this) {
+            pendingResultJson = null;
+        }
+
+        if (authUrl == null || authUrl.trim().isEmpty()) {
+            storeAndDispatchResult(
+                null,
+                "invalid_auth_url",
+                "Silent Google OAuth URL is empty.",
+                null
+            );
+            return;
+        }
+
+        final String trimmedUrl = authUrl.trim();
+        String parsedState = null;
+        try {
+            parsedState = Uri.parse(trimmedUrl).getQueryParameter("state");
+        } catch (Exception ignored) {
+        }
+        final String fallbackState = parsedState;
+
+        activity.runOnUiThread(
+            () -> {
+                if (activeSilentCleanup != null) {
+                    activeSilentCleanup.run();
+                }
+
+                final Handler mainHandler = new Handler(Looper.getMainLooper());
+                final AtomicBoolean completed = new AtomicBoolean(false);
+                final WebView[] webViewRef = new WebView[1];
+                final Runnable[] timeoutRef = new Runnable[1];
+
+                final Runnable cleanupWebView =
+                    () -> {
+                        if (timeoutRef[0] != null) {
+                            mainHandler.removeCallbacks(timeoutRef[0]);
+                            timeoutRef[0] = null;
+                        }
+                        WebView wv = webViewRef[0];
+                        webViewRef[0] = null;
+                        if (wv != null) {
+                            try {
+                                wv.stopLoading();
+                                if (wv.getParent() instanceof ViewGroup) {
+                                    ((ViewGroup) wv.getParent()).removeView(wv);
+                                }
+                                wv.loadUrl("about:blank");
+                                wv.clearHistory();
+                                wv.removeAllViews();
+                                wv.destroy();
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    };
+
+                activeSilentCleanup =
+                    () -> {
+                        completed.set(true);
+                        cleanupWebView.run();
+                    };
+
+                try {
+                    final WebView silentWebView = new WebView(activity);
+                    webViewRef[0] = silentWebView;
+                    silentWebView.setVisibility(View.INVISIBLE);
+                    silentWebView.setFocusable(false);
+                    silentWebView.setClickable(false);
+
+                    WebSettings settings = silentWebView.getSettings();
+                    settings.setJavaScriptEnabled(true);
+                    settings.setDomStorageEnabled(true);
+                    settings.setDatabaseEnabled(true);
+
+                    try {
+                        CookieManager cookieManager = CookieManager.getInstance();
+                        cookieManager.setAcceptCookie(true);
+                        cookieManager.setAcceptThirdPartyCookies(silentWebView, true);
+                    } catch (Exception ignored) {
+                    }
+
+                    View rootContent = activity.findViewById(android.R.id.content);
+                    if (rootContent instanceof ViewGroup) {
+                        ((ViewGroup) rootContent)
+                            .addView(silentWebView, new ViewGroup.LayoutParams(1, 1));
+                    }
+
+                    timeoutRef[0] =
+                        () -> {
+                            if (completed.compareAndSet(false, true)) {
+                                activeSilentCleanup = null;
+                                cleanupWebView.run();
+                                storeAndDispatchResult(
+                                    null,
+                                    "silent_oauth_timeout",
+                                    "Silent Google OAuth refresh timed out.",
+                                    fallbackState
+                                );
+                            }
+                        };
+                    mainHandler.postDelayed(timeoutRef[0], SILENT_OAUTH_TIMEOUT_MS);
+
+                    silentWebView.setWebViewClient(
+                        new WebViewClient() {
+                            private boolean handleInterceptedUrl(String url) {
+                                if (!isSilentOAuthCallbackUrl(url)) {
+                                    return false;
+                                }
+                                if (completed.compareAndSet(false, true)) {
+                                    activeSilentCleanup = null;
+                                    if (timeoutRef[0] != null) {
+                                        mainHandler.removeCallbacks(timeoutRef[0]);
+                                        timeoutRef[0] = null;
+                                    }
+                                    mainHandler.post(cleanupWebView);
+                                    try {
+                                        deliverOAuthRedirect(Uri.parse(url));
+                                    } catch (Exception err) {
+                                        storeAndDispatchResult(
+                                            null,
+                                            "silent_oauth_parse_error",
+                                            err.getMessage(),
+                                            fallbackState
+                                        );
+                                    }
+                                }
+                                return true;
+                            }
+
+                            @Override
+                            public boolean shouldOverrideUrlLoading(
+                                WebView view,
+                                WebResourceRequest request
+                            ) {
+                                String url =
+                                    request != null && request.getUrl() != null
+                                        ? request.getUrl().toString()
+                                        : null;
+                                return handleInterceptedUrl(url);
+                            }
+
+                            @Override
+                            @SuppressWarnings("deprecation")
+                            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                                return handleInterceptedUrl(url);
+                            }
+
+                            @Override
+                            public void onPageStarted(
+                                WebView view,
+                                String url,
+                                Bitmap favicon
+                            ) {
+                                if (!handleInterceptedUrl(url)) {
+                                    super.onPageStarted(view, url, favicon);
+                                }
+                            }
+
+                            @Override
+                            public void onPageFinished(WebView view, String url) {
+                                if (!handleInterceptedUrl(url)) {
+                                    super.onPageFinished(view, url);
+                                }
+                            }
+                        }
+                    );
+
+                    silentWebView.loadUrl(trimmedUrl);
+                } catch (Exception err) {
+                    if (completed.compareAndSet(false, true)) {
+                        activeSilentCleanup = null;
+                        cleanupWebView.run();
+                        storeAndDispatchResult(
+                            null,
+                            "silent_oauth_init_failed",
+                            err.getMessage(),
+                            fallbackState
+                        );
+                    }
+                }
+            }
+        );
+    }
+
+    @JavascriptInterface
     public synchronized String consumePendingResult() {
         String result = pendingResultJson;
         pendingResultJson = null;
@@ -184,6 +384,14 @@ public class AudiobookOAuthBridge {
             return false;
         }
 
+        intent.setData(null);
+        return deliverOAuthRedirect(data);
+    }
+
+    private boolean deliverOAuthRedirect(Uri data) {
+        if (data == null) {
+            return false;
+        }
         Map<String, String> params = new HashMap<>();
         parseFormEncoded(data.getEncodedQuery(), params);
         parseFormEncoded(data.getEncodedFragment(), params);
@@ -198,9 +406,48 @@ public class AudiobookOAuthBridge {
             errorDescription = "Google OAuth callback did not include an access token.";
         }
 
-        intent.setData(null);
+        if (accessToken != null && !accessToken.isEmpty()) {
+            persistRefreshedGoogleToken(accessToken);
+        }
+
         storeAndDispatchResult(accessToken, error, errorDescription, state);
         return true;
+    }
+
+    private void persistRefreshedGoogleToken(String accessToken) {
+        if (accessToken == null || accessToken.isEmpty()) {
+            return;
+        }
+        try {
+            String existing = loadAuthSession();
+            if (existing == null || existing.trim().isEmpty()) {
+                return;
+            }
+            JSONObject sessionObj = new JSONObject(existing);
+            sessionObj.put("provider_token", accessToken);
+            sessionObj.put("googleAccessToken", accessToken);
+            sessionObj.put("googleTokenObtainedAt", System.currentTimeMillis());
+            saveAuthSession(sessionObj.toString());
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static boolean isSilentOAuthCallbackUrl(String url) {
+        if (url == null || url.isEmpty()) {
+            return false;
+        }
+        if (url.regionMatches(true, 0, REDIRECT_PREFIX, 0, REDIRECT_PREFIX.length())) {
+            return true;
+        }
+        try {
+            Uri uri = Uri.parse(url);
+            String path = uri.getPath();
+            if (path != null && path.endsWith("oauth-callback.html")) {
+                return url.contains("access_token=") || url.contains("error=");
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
     }
 
     private void storeAndDispatchResult(
@@ -277,10 +524,14 @@ public class AudiobookOAuthBridge {
             return DEFAULT_PROMPT;
         }
         String normalized = prompt.trim().replaceAll("\\s+", " ");
-        if ("select_account".equals(normalized)
-            || "select_account consent".equals(normalized)
-            || "consent".equals(normalized)) {
-            return normalized;
+        String lower = normalized.toLowerCase(Locale.US);
+        if ("none".equals(lower)) {
+            return "none";
+        }
+        if ("select_account".equals(lower)
+            || "select_account consent".equals(lower)
+            || "consent".equals(lower)) {
+            return lower;
         }
         return DEFAULT_PROMPT;
     }
