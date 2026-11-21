@@ -360,12 +360,12 @@ export class MediaSessionBridge {
 
     const albumLabel = chapterTitle
       ? `${book.series || book.title} — ${chapterTitle}`
-      : book.series || 'Audiobook Player';
+      : book.series || 'MultiPlayer';
 
     try {
       if (typeof MediaMetadata !== 'undefined') {
         ms.metadata = new MediaMetadata({
-          title: book.title || 'Audiobook Player',
+          title: book.title || 'MultiPlayer',
           artist: book.author || 'Unknown Author',
           album: albumLabel,
           artwork

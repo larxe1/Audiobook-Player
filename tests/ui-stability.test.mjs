@@ -418,10 +418,29 @@ test('scroll positions persist across folder toggle and open-detail on Desktop a
     assert.equal(env.rootEl.querySelector('#book-list').scrollTop, 440, 'Desktop #book-list scrollTop must persist on open-detail');
     assert.equal(env.rootEl.querySelector('#desktopMainScroll').scrollTop, 0, '#desktopMainScroll resets on view/detail change');
 
-    // Change filter: #book-list scroll resets to 0
-    const driveFilterBtn = env.rootEl.querySelector('[data-action="set-filter"][data-filter="drive"]');
-    driveFilterBtn.click();
+    // Change filter: #book-list scroll resets to 0 (2-way Audiobooks | Podcasts toggle)
+    assert.equal(
+      env.rootEl.querySelector('[data-action="set-filter"][data-filter="drive"]'),
+      null,
+      'Drive filter pill must be removed'
+    );
+    assert.equal(
+      env.rootEl.querySelector('[data-action="set-filter"][data-filter="local"]'),
+      null,
+      'Local filter pill must be removed'
+    );
+    assert.equal(
+      env.rootEl.querySelector('[data-action="toggle-group-series"]'),
+      null,
+      'Series toggle button must be removed'
+    );
+    const podcastsFilterBtn = env.rootEl.querySelector('[data-action="set-filter"][data-filter="podcasts"]');
+    assert.ok(podcastsFilterBtn, 'Podcasts filter pill must exist');
+    podcastsFilterBtn.click();
     assert.equal(env.rootEl.querySelector('#book-list').scrollTop, 0, '#book-list resets when filter changes');
+    const audiobooksFilterBtn = env.rootEl.querySelector('[data-action="set-filter"][data-filter="audiobooks"]');
+    assert.ok(audiobooksFilterBtn, 'Audiobooks filter pill must exist');
+    audiobooksFilterBtn.click();
 
     // Switch to Android Mobile viewport (< 768px)
     env.mockWindow.innerWidth = 390;
@@ -455,17 +474,19 @@ test('scroll positions persist across folder toggle and open-detail on Desktop a
     assert.equal(sheetSecond.scrollTop, 210, '#mobileSheetScroll scrollTop persists across re-render');
     assert.equal(sheetSecond.classList.contains('no-enter-anim'), true, 'already-open mobile sheet gets no-enter-anim');
 
-    // Notification shade gets no-enter-anim on subsequent re-renders while open
+    // Inline notification shade button & inline shade are removed from Mobile header
     app.state.mobileSheetOpen = false;
-    app.state.shadeOpen = true;
     app.render();
-    const shadeFirst = env.rootEl.querySelector('.notif-shade');
-    assert.ok(shadeFirst);
-    assert.equal(shadeFirst.classList.contains('no-enter-anim'), false);
-    app.state.snapshot = { ...app.state.snapshot, playing: true };
-    app.render();
-    const shadeSecond = env.rootEl.querySelector('.notif-shade');
-    assert.equal(shadeSecond.classList.contains('no-enter-anim'), true);
+    assert.equal(
+      env.rootEl.querySelector('[data-action="toggle-shade"]'),
+      null,
+      'Mobile header must not render inline notification shade toggle button'
+    );
+    assert.equal(
+      env.rootEl.querySelector('.notif-shade'),
+      null,
+      'Mobile view must not render redundant inline notification shade'
+    );
 
     app.syncService?.destroy?.();
     app.audioEngine?.destroy?.();
@@ -1287,12 +1308,14 @@ test('podcasts filter chip, + Podcast trigger, Podcast Finder modal stability, s
     app.state.activeBookKey = app.books[0].bookKey;
     app.render();
 
-    // 1. Desktop sidebar & main header render Podcasts filter chip, prominent Find Podcasts button, and zero standalone Devices clutter in transport bar
+    // 1. Desktop sidebar & main header render Audiobooks/Podcasts filter chips, unified Search trigger, and zero standalone Devices clutter in transport bar
+    const desktopAudiobooksChip = env.rootEl.querySelector('[data-action="set-filter"][data-filter="audiobooks"]');
     const desktopPodcastChip = env.rootEl.querySelector('[data-action="set-filter"][data-filter="podcasts"]');
-    const desktopOpenPodcastBtn = env.rootEl.querySelector('[data-action="open-podcast-modal"]');
+    const desktopSearchTrigger = env.rootEl.querySelector('[data-action="open-search-modal"]');
+    assert.ok(desktopAudiobooksChip, 'Desktop sidebar must render Audiobooks filter chip');
     assert.ok(desktopPodcastChip, 'Desktop sidebar must render Podcasts filter chip');
     assert.ok(desktopPodcastChip.classList.contains('filter-pill'), 'Filter chip must carry filter-pill animation class');
-    assert.ok(desktopOpenPodcastBtn, 'Desktop must render Find Podcasts button');
+    assert.ok(desktopSearchTrigger, 'Desktop must render unified Search trigger button');
     assert.equal(
       env.rootEl.querySelector('#appMainLayer')?.querySelector('[data-action="open-devices-modal"]'),
       null,
@@ -1428,8 +1451,8 @@ test('podcasts filter chip, + Podcast trigger, Podcast Finder modal stability, s
     );
     assert.equal(hardForkFolder, undefined, 'Podcasts must NEVER be grouped into series folders');
 
-    // 4. Desktop New Episodes shelf & Podcast Detail view (Episodes list, Refresh, Unfollow, Offline toggle)
-    app.state.filterSource = 'all';
+    // 4. Desktop New Episodes shelf (under Podcasts filter) & Podcast Detail view (Episodes list, Refresh, Unfollow, Offline toggle)
+    app.state.filterSource = 'podcasts';
     app.render();
     assert.match(env.rootEl.querySelector('#appMainLayer').innerHTML, /New Episodes/);
     assert.match(env.rootEl.querySelector('#appMainLayer').innerHTML, /AI Agents in 2026/);
@@ -1460,12 +1483,13 @@ test('podcasts filter chip, + Podcast trigger, Podcast Finder modal stability, s
       'downloaded filter must include podcasts with offlineCached episodes'
     );
 
-    // 5. Switch to Android Mobile viewport (< 768px) -> verifies mobile Podcasts chip, pinned Find Podcasts button, inline Discovery Hub, animation classes, and zero standalone Devices clutter
+    // 5. Switch to Android Mobile viewport (< 768px) -> verifies mobile Audiobooks/Podcasts chips, unified Search trigger, inline Discovery Hub, animation classes, and zero standalone Devices clutter
     app.state.filterSource = 'podcasts';
     env.mockWindow.innerWidth = 390;
     app.render();
+    assert.ok(env.rootEl.querySelector('[data-action="set-filter"][data-filter="audiobooks"]'));
     assert.ok(env.rootEl.querySelector('[data-action="set-filter"][data-filter="podcasts"]'));
-    assert.ok(env.rootEl.querySelector('[data-action="open-podcast-modal"]'));
+    assert.ok(env.rootEl.querySelector('[data-action="open-search-modal"]'));
     assert.ok(
       env.rootEl.querySelector('[data-action="open-podcast-category"][data-category-id="tech"]'),
       'Inline Podcast Discovery Hub must render on Mobile even when podcasts are already followed'
@@ -1478,6 +1502,328 @@ test('podcasts filter chip, + Podcast trigger, Podcast Finder modal stability, s
     assert.ok(env.rootEl.querySelector('.ui-view-enter'), 'Main sections must carry ui-view-enter class');
     assert.ok(env.rootEl.querySelector('.ui-stagger-grid'), 'Card grids must carry ui-stagger-grid class');
     assert.match(env.rootEl.querySelector('#mobileMainScroll').textContent, /New Episodes/);
+  } finally {
+    app?.destroy?.();
+    env.restore();
+  }
+});
+
+test('MultiPlayer rename, Pitch default + Midnight migration, series collapsed by default, offline-only checkmark & zero cloud icon', () => {
+  const env = createDomEnv({ innerWidth: 1280 });
+  let app = null;
+  try {
+    // Stored 'midnight' theme must auto-migrate to 'pitch'
+    globalThis.localStorage.setItem('audiobook_player_theme_v1', 'midnight');
+    app = new AudiobookApp(env.rootEl);
+    assert.equal(app.state.theme, 'pitch', 'Midnight theme must auto-migrate to pitch');
+    assert.equal(globalThis.localStorage.getItem('audiobook_player_theme_v1'), 'pitch');
+
+    // Login screen displays MultiPlayer
+    app.render();
+    assert.match(env.rootEl.querySelector('h1')?.textContent || '', /^MultiPlayer$/);
+    assert.match(app._renderNotificationShade(null, app.state.snapshot), /MultiPlayer/);
+    assert.match(app._renderGalaxyWatchView(null, app.state.snapshot), /MultiPlayer/);
+
+    // Series folders must start collapsed by default (expandedSeries empty)
+    app.guestLocalMode = true;
+    app.books = [
+      makeBook(1, { sources: ['drive'], offlineCached: false, isOffline: false }),
+      makeBook(2, { sources: ['drive'], offlineCached: true, isOffline: true }),
+      makeBook(3, { title: 'Standalone Local', author: 'Indie', series: '', sources: ['local'], offlineCached: false, isOffline: false })
+    ];
+    app.render();
+    assert.equal(app.state.expandedSeries.size, 0, 'Series folders must be collapsed by default');
+    assert.equal(
+      env.rootEl.querySelector('#book-list')?.querySelectorAll('.franchise-book-item').length,
+      0,
+      'Nested series books must not render until folder is expanded'
+    );
+
+    // Expanding folder reveals nested books
+    env.rootEl.querySelector('[data-action="toggle-series-folder"]').click();
+    assert.equal(app.state.expandedSeries.size, 1);
+    assert.equal(
+      env.rootEl.querySelector('#book-list')?.querySelectorAll('.franchise-book-item').length,
+      2
+    );
+
+    // _renderSourceBadges returns empty string (no blue cloud icon / folder icon)
+    assert.equal(app._renderSourceBadges(app.books[0]), '');
+    assert.equal(app._renderSourceBadges(app.books[2]), '');
+
+    // _renderDownloadedIcon shows green checkmark ONLY when genuinely saved offline
+    assert.equal(app._renderDownloadedIcon(app.books[0]), '', 'Uncached Drive book must NOT show offline checkmark');
+    assert.equal(app._renderDownloadedIcon(app.books[2]), '', 'Non-offline book without offlineCached/isOffline must NOT show checkmark');
+    assert.match(
+      app._renderDownloadedIcon(app.books[1]),
+      /data-offline-saved="true"/,
+      'Offline-cached book must render green checkmark'
+    );
+  } finally {
+    app?.destroy?.();
+    env.restore();
+  }
+});
+
+test('Unified Search modal preserves #podcastSearchInput DOM node in-place on keystrokes and filters All/Audiobooks/Podcasts', () => {
+  const env = createDomEnv({ innerWidth: 390 });
+  let app = null;
+  try {
+    app = new AudiobookApp(env.rootEl);
+    app._enrichSingleBookInBackground = async () => {};
+    app._runBackgroundMetadataEnrichment = async () => {};
+    app.guestLocalMode = true;
+    app.books = [
+      makeBook(1, { title: 'Dune', author: 'Frank Herbert', series: 'Dune' }),
+      makeBook(2, { title: 'Hyperion', author: 'Dan Simmons', series: 'Hyperion' })
+    ];
+    app.state.podcastModal = {
+      open: true,
+      query: '',
+      searchFilter: 'all',
+      activeCategory: 'trending',
+      loading: false,
+      subscribingId: '',
+      error: '',
+      results: [
+        { id: 'p1', title: 'Tech Talk', author: 'Host', feedUrl: 'https://example.com/rss', genre: 'Tech' }
+      ]
+    };
+    app.render();
+
+    const podcastSlot = env.rootEl.querySelector('#appOverlayPodcast');
+    const initialInput = podcastSlot.querySelector('#podcastSearchInput');
+    assert.ok(initialInput, '#podcastSearchInput must mount');
+
+    // Update query & loading transition (simulating Android keystroke + async fetch)
+    app.state.podcastModal.query = 'Dune';
+    app.state.podcastModal.loading = true;
+    app.render();
+    assert.equal(
+      podcastSlot.querySelector('#podcastSearchInput'),
+      initialInput,
+      '#podcastSearchInput DOM node MUST stay identical on keystroke render (zero keyboard blur/pop-in)'
+    );
+
+    // Switch filter to Audiobooks -> shows Dune, hides Podcasts to Follow
+    const abFilterBtn = podcastSlot.querySelector('[data-action="set-search-filter"][data-search-filter="audiobooks"]');
+    assert.ok(abFilterBtn);
+    abFilterBtn.click();
+    assert.equal(app.state.podcastModal.searchFilter, 'audiobooks');
+    assert.equal(podcastSlot.querySelector('#podcastSearchInput'), initialInput);
+    const regionText = podcastSlot.querySelector('#podcastModalResultsRegion').textContent;
+    assert.match(regionText, /Dune/);
+    assert.doesNotMatch(regionText, /Hyperion/);
+    assert.doesNotMatch(regionText, /Tech Talk/);
+  } finally {
+    app?.destroy?.();
+    env.restore();
+  }
+});
+
+test('Compact Continue Listening dismissal persists in localStorage across heartbeats and restarts', () => {
+  const env1 = createDomEnv({ innerWidth: 390 });
+  let app1 = null;
+  let app2 = null;
+  try {
+    app1 = new AudiobookApp(env1.rootEl);
+    app1.guestLocalMode = true;
+    app1.syncService.deviceId = 'dev_android';
+    app1.books = [makeBook(1, { title: 'Dune', author: 'Frank Herbert' })];
+    const bookKey = app1.books[0].bookKey;
+
+    const makeRemoteDevice = (posSec, iso) => [
+      {
+        deviceId: 'dev_pc',
+        deviceName: 'Windows PC',
+        currentBookKey: bookKey,
+        currentBookTitle: 'Dune',
+        positionSec: posSec,
+        isPlaying: true,
+        isActivePlayer: true,
+        lastSeenAt: iso
+      }
+    ];
+
+    app1._updateDevicesAndPrompt(makeRemoteDevice(120, '2026-11-22T01:00:00Z'));
+    app1.render();
+    assert.ok(env1.rootEl.querySelector('.continue-device-card'));
+
+    // Click X dismiss
+    env1.rootEl.querySelector('[data-action="dismiss-remote-prompt"]').click();
+    assert.equal(app1.state.remotePlaybackPrompt, null);
+    assert.ok(globalThis.localStorage.getItem('multiplayer_dismissed_continue_v1'));
+
+    // Subsequent 14-second heartbeat with updated positionSec & lastSeenAt MUST NOT reopen banner
+    app1._updateDevicesAndPrompt(makeRemoteDevice(134, '2026-11-22T01:00:14Z'));
+    assert.equal(app1.state.remotePlaybackPrompt, null, 'Heartbeat must not reopen dismissed Continue banner');
+
+    // Fresh app instance (simulating reload) MUST still stay dismissed for same device+book
+    app1.destroy();
+    app1 = null;
+    app2 = new AudiobookApp(env1.rootEl);
+    app2.guestLocalMode = true;
+    app2.syncService.deviceId = 'dev_android';
+    app2.books = [makeBook(1, { title: 'Dune', author: 'Frank Herbert' }), makeBook(2, { title: 'Dune Messiah', author: 'Frank Herbert' })];
+    app2._updateDevicesAndPrompt(makeRemoteDevice(180, '2026-11-22T01:01:00Z'));
+    assert.equal(app2.state.remotePlaybackPrompt, null, 'Reload must remember dismissed Continue banner');
+
+    // Switching remote device to a DIFFERENT book re-shows banner
+    app2._updateDevicesAndPrompt([
+      {
+        deviceId: 'dev_pc',
+        deviceName: 'Windows PC',
+        currentBookKey: app2.books[1].bookKey,
+        currentBookTitle: 'Dune Messiah',
+        positionSec: 15,
+        isPlaying: true,
+        isActivePlayer: true,
+        lastSeenAt: '2026-11-22T01:02:00Z'
+      }
+    ]);
+    assert.equal(app2.state.remotePlaybackPrompt?.bookKey, app2.books[1].bookKey);
+  } finally {
+    app1?.destroy?.();
+    app2?.destroy?.();
+    env1.restore();
+  }
+});
+
+test('Settings > Advanced Settings houses the 6 tucked actions, Profile popover is uncluttered, Context Menu & Back button work', async () => {
+  const env = createDomEnv({ innerWidth: 390 });
+  let app = null;
+  try {
+    app = new AudiobookApp(env.rootEl);
+    app._enrichSingleBookInBackground = async () => {};
+    app._runBackgroundMetadataEnrichment = async () => {};
+    app.guestLocalMode = true;
+    const book1 = makeBook(1, { title: 'Book One', author: 'Auth One', series: '' });
+    const book2 = makeBook(2, { title: 'Book Two', author: 'Auth Two', series: '' });
+    const pod = {
+      bookKey: 'podcast:show1',
+      title: 'My Show',
+      author: 'Host',
+      isPodcast: true,
+      mediaType: 'podcast',
+      sources: ['podcast'],
+      chapters: [{ index: 0, episodeId: 'ep-1', title: 'Ep 1', durationSec: 600 }],
+      episodeProgress: {}
+    };
+    app.books = [book1, book2, pod];
+    app.state.activeBookKey = book1.bookKey;
+
+    // 1. Profile popover has Settings & Devices, NOT the 6 tucked actions or Midnight
+    app.state.profileOpen = true;
+    app.render();
+    const profileSlot = env.rootEl.querySelector('#appOverlayProfile');
+    assert.ok(profileSlot.querySelector('[data-action="open-settings-modal"]'));
+    assert.ok(profileSlot.querySelector('[data-action="open-devices-modal"]'));
+    assert.equal(profileSlot.querySelector('[data-action="trigger-local-folder"]'), null);
+    assert.equal(profileSlot.querySelector('[data-action="trigger-local-files"]'), null);
+    assert.equal(profileSlot.querySelector('[data-action="connect-drive"]'), null);
+    assert.equal(profileSlot.querySelector('[data-action="open-cover-search"]'), null);
+    assert.equal(profileSlot.querySelector('[data-action="auto-match-tags"]'), null);
+    assert.equal(profileSlot.querySelector('[data-action="open-wipe-synced-modal"]'), null);
+    assert.doesNotMatch(profileSlot.textContent, /Midnight/);
+
+    // 2. Open Settings -> expand Advanced Settings -> all 6 actions present + auto-sync toggle
+    profileSlot.querySelector('[data-action="open-settings-modal"]').click();
+    assert.equal(app.state.settingsModalOpen, true);
+    const settingsSlot = env.rootEl.querySelector('#appOverlaySettings');
+    assert.ok(settingsSlot.querySelector('[data-action="toggle-auto-drive-sync"]'));
+    settingsSlot.querySelector('[data-action="toggle-advanced-settings"]').click();
+    assert.ok(settingsSlot.querySelector('[data-action="trigger-local-folder"]'));
+    assert.ok(settingsSlot.querySelector('[data-action="trigger-local-files"]'));
+    assert.ok(settingsSlot.querySelector('[data-action="connect-drive"]'));
+    assert.ok(settingsSlot.querySelector('[data-action="open-cover-search"]'));
+    assert.ok(settingsSlot.querySelector('[data-action="auto-match-tags"]'));
+    assert.ok(settingsSlot.querySelector('[data-action="open-wipe-synced-modal"]'));
+
+    // 3. Context Menu for Podcast & Audiobook + handlers
+    app.state.settingsModalOpen = false;
+    app.openContextMenuForTarget({ attr: 'data-book-key', value: pod.bookKey }, { x: 40, y: 80, fromTouch: true });
+    const cmSlot = env.rootEl.querySelector('#appOverlayContextMenu');
+    assert.ok(cmSlot.querySelector('[data-action="unsubscribe-podcast"]'));
+    assert.ok(cmSlot.querySelector('[data-action="mark-podcast-played"]'));
+    cmSlot.querySelector('[data-action="mark-podcast-played"]').click();
+    assert.equal(app.state.contextMenu, null);
+    assert.equal(app.books.find((b) => b.bookKey === pod.bookKey).episodeProgress['ep-1'].completed, true);
+
+    // 4. Paused switch & zero-blink no-enter-anim on same-view selection
+    let loadCalls = [];
+    app.audioEngine.loadBook = async (b) => {
+      loadCalls.push(b.bookKey);
+      app.audioEngine.currentBook = b;
+    };
+    app.audioEngine.play = async () => {};
+    app.render();
+    await app.selectBook(book2.bookKey, false);
+    assert.equal(app.state.activeBookKey, book2.bookKey);
+    assert.ok(app._lastLocalPlayAt > 0, 'Paused book selection must update _lastLocalPlayAt');
+    assert.equal(loadCalls.at(-1), book2.bookKey);
+    assert.ok(
+      env.rootEl.querySelector('#mobileMainScroll')?.classList.contains('no-enter-anim'),
+      'Same-view selection on mobile must apply no-enter-anim to eliminate blink'
+    );
+
+    // 5. Android Back button closes overlays in priority order and requires double-press at root
+    assert.equal(window.__audiobookApp, app);
+    app.state.mobileSheetOpen = true;
+    app.state.settingsModalOpen = true;
+    app.openContextMenuForTarget({ attr: 'data-book-key', value: book1.bookKey });
+    assert.equal(app.handleBackPress(), true);
+    assert.equal(app.state.contextMenu, null);
+    assert.equal(app.handleBackPress(), true);
+    assert.equal(app.state.settingsModalOpen, false);
+    assert.equal(app.handleBackPress(), true);
+    assert.equal(app.state.mobileSheetOpen, false);
+
+    // At root: 1st back press shows toast & returns true; 2nd within 2s returns false
+    assert.equal(app.handleBackPress(), true);
+    assert.match(app.state.statusToast?.message || '', /Press back again to exit/);
+    assert.equal(app.handleBackPress(), false);
+
+    // 6. Removed Drive files confirmation prompt renders, Keep Files suppresses re-prompting, and local token change pushes Drive folder config
+    app.state.pendingDriveRemovals = [book1];
+    app.render();
+    const removalSlot = env.rootEl.querySelector('#appOverlayDriveRemovals');
+    assert.ok(removalSlot.querySelector('[data-action="confirm-drive-removals"]'));
+    assert.ok(removalSlot.querySelector('[data-action="dismiss-drive-removals"]'));
+    removalSlot.querySelector('[data-action="dismiss-drive-removals"]').click();
+    assert.equal(app.state.pendingDriveRemovals.length, 0);
+    assert.ok(app.books.some((b) => b.bookKey === book1.bookKey), 'Keep Files must preserve book');
+    assert.ok(
+      app._dismissedDriveRemovalKeys.has(book1.bookKey),
+      'Keep Files must record bookKey to prevent 5-min auto-sync re-prompting'
+    );
+
+    // 7. Context menu closes immediately on async action before promise settles
+    let resolveAsyncDownload;
+    app.toggleOfflineDownload = () =>
+      new Promise((r) => {
+        resolveAsyncDownload = r;
+      });
+    app.openContextMenuForTarget({ attr: 'data-book-key', value: book1.bookKey }, { fromTouch: true });
+    assert.ok(env.rootEl.querySelector('#appOverlayContextMenu')?.innerHTML);
+    env.rootEl
+      .querySelector('#appOverlayContextMenu')
+      .querySelector('[data-action="toggle-download"]')
+      .click();
+    assert.equal(app.state.contextMenu, null);
+    assert.equal(
+      env.rootEl.querySelector('#appOverlayContextMenu').innerHTML,
+      '',
+      'Context menu must close immediately before async action finishes'
+    );
+    resolveAsyncDownload?.();
+
+    // 8. Mobile handleBackPress ignores stale desktopView === 'detail'
+    app.state.layoutMode = 'android';
+    app.state.desktopView = 'detail';
+    app._lastBackPressAt = 0;
+    assert.equal(app.handleBackPress(), true);
+    assert.match(app.state.statusToast?.message || '', /Press back again to exit/);
+    assert.equal(app.handleBackPress(), false);
   } finally {
     app?.destroy?.();
     env.restore();

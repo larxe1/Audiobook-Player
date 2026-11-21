@@ -1,13 +1,13 @@
 {
   "appId": "com.audiobook.player",
-  "appName": "Audiobook Player",
+  "appName": "MultiPlayer",
   "webDir": ".",
   "bundledWebRuntime": false,
   "server": {
     "androidScheme": "https"
   },
   "android": {
-    "backgroundColor": "#060911"
+    "backgroundColor": "#000000"
   },
   "plugins": {
     "SystemBars": {

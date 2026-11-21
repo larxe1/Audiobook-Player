@@ -209,7 +209,7 @@ public class AudiobookUpdaterBridge {
                 dispatchProgress(
                     "permission_required",
                     -1,
-                    "Allow Install unknown apps for Audiobook Player, then tap Update again."
+                    "Allow Install unknown apps for MultiPlayer, then tap Update again."
                 );
                 activity.runOnUiThread(
                     () -> {

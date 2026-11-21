@@ -253,6 +253,7 @@ test('enforceMandatoryUpdate mounts blocking gate on Windows Tauri, pauses audio
     elementsById.get('mandatory-update-title').textContent,
     'Update Required — Preparing v1.0.13 (Build 14)'
   );
+  assert.match(elementsById.get('mandatory-update-subtitle').textContent, /MultiPlayer/);
   assert.equal(elementsById.get('mandatory-update-status').textContent, 'Download timeout');
 
   const retryBtn = elementsById.get('mandatory-update-action-btn');
@@ -344,7 +345,7 @@ test('enforceMandatoryUpdate handles Android APK CI polling, native bridge insta
   // Simulate permission_required followed by returning to app (focus)
   windowObj.__onAndroidUpdateProgress({
     status: 'permission_required',
-    message: 'Allow Install unknown apps for Audiobook Player.'
+    message: 'Allow Install unknown apps for MultiPlayer.'
   });
   assert.match(elementsById.get('mandatory-update-status').textContent, /Allow Install unknown apps/i);
   windowObj.dispatchEvent('focus');
@@ -629,5 +630,71 @@ test('enforceMandatoryUpdate executes fast Web OTA update via startWebOtaUpdate 
   assert.match(elementsById.get('mandatory-update-status').textContent, /Applying update and reloading/i);
   assert.equal(elementsById.get('mandatory-update-action-btn').style.display, 'none');
 
+  service.destroy();
+});
+
+test('resolveReadyPackageUrl matches both MultiPlayer and Audiobook-Player release assets and uses MultiPlayer copy', async () => {
+  const { documentObj, windowObj, elementsById } = createMockDom();
+  const service = new SelfUpdaterService({ windowObj, documentObj, storage: null });
+
+  const multiPkg = await service.resolveReadyPackageUrl(
+    'windows-tauri',
+    {
+      version: '1.0.19',
+      build: 20,
+      exeDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/MultiPlayer.exe'
+    },
+    async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        assets: [
+          {
+            name: 'Audiobook-Player.exe',
+            browser_download_url: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.19/Audiobook-Player.exe'
+          },
+          {
+            name: 'MultiPlayer.exe',
+            browser_download_url: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.19/MultiPlayer.exe'
+          }
+        ]
+      })
+    })
+  );
+  assert.equal(multiPkg.ready, true);
+  assert.equal(
+    multiPkg.url,
+    'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.19/MultiPlayer.exe?v=1.0.19-20'
+  );
+
+  const legacyPkg = await service.resolveReadyPackageUrl(
+    'android-apk',
+    {
+      version: '1.0.19',
+      build: 20,
+      apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk'
+    },
+    async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        assets: [
+          {
+            name: 'Audiobook-Player.apk',
+            browser_download_url: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.19/Audiobook-Player.apk'
+          }
+        ]
+      })
+    })
+  );
+  assert.equal(legacyPkg.ready, true);
+  assert.equal(
+    legacyPkg.url,
+    'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.19/Audiobook-Player.apk?v=1.0.19-20'
+  );
+
+  service.mountMandatoryUpdateGate({ latestVersion: '1.0.19', latestBuild: 20 });
+  assert.match(elementsById.get('mandatory-update-subtitle').textContent, /MultiPlayer/);
+  assert.doesNotMatch(elementsById.get('mandatory-update-subtitle').textContent, /Audiobook Player/);
   service.destroy();
 });

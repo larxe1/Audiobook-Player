@@ -1,8 +1,8 @@
 [package]
 name = "audiobook-player"
-version = "1.0.18"
-description = "Audiobook Player Standalone Windows Desktop App (Tauri 2)"
-authors = ["Audiobook Player"]
+version = "1.0.19"
+description = "MultiPlayer Desktop App (Tauri 2)"
+authors = ["MultiPlayer"]
 edition = "2021"
 
 [build-dependencies]

@@ -199,13 +199,140 @@ function mergeBookmarks(a = [], b = []) {
   );
 }
 
+function collectBookDriveFileIds(book) {
+  const ids = new Set();
+  if (!book || typeof book !== 'object') return ids;
+  if (book.driveFileId) ids.add(String(book.driveFileId));
+  if (Array.isArray(book.chapters)) {
+    for (const ch of book.chapters) {
+      if (ch?.driveFileId) ids.add(String(ch.driveFileId));
+    }
+  }
+  if (Array.isArray(book.tracks)) {
+    for (const tr of book.tracks) {
+      if (tr?.driveFileId) ids.add(String(tr.driveFileId));
+    }
+  }
+  return ids;
+}
+
 function mergeChapters(existing = [], incoming = []) {
   const a = Array.isArray(existing) ? existing : [];
   const b = Array.isArray(incoming) ? incoming : [];
-  if (a.length === 0) return b;
-  if (b.length === 0) return a;
-  // Prefer whichever source has richer chapter metadata
-  return b.length > a.length ? b : a;
+  if (a.length === 0) return b.map((ch) => ({ ...ch }));
+  if (b.length === 0) return a.map((ch) => ({ ...ch }));
+
+  const hasDriveTrackIds =
+    a.some((ch) => Boolean(ch?.driveFileId || ch?.driveStreamUrl)) ||
+    b.some((ch) => Boolean(ch?.driveFileId || ch?.driveStreamUrl));
+
+  if (!hasDriveTrackIds) {
+    // Prefer whichever source has richer embedded chapter metadata
+    return b.length > a.length ? b.map((ch) => ({ ...ch })) : a.map((ch) => ({ ...ch }));
+  }
+
+  const incomingByDriveId = new Map();
+  const incomingByFileName = new Map();
+  for (const ch of b) {
+    if (ch?.driveFileId) incomingByDriveId.set(String(ch.driveFileId), ch);
+    if (ch?.fileName) incomingByFileName.set(String(ch.fileName).toLowerCase(), ch);
+  }
+
+  const seenDriveIds = new Set();
+  const seenFileNames = new Set();
+  const merged = a.map((ch, idx) => {
+    const fId = ch?.driveFileId ? String(ch.driveFileId) : '';
+    const fName = ch?.fileName ? String(ch.fileName).toLowerCase() : '';
+    const match =
+      (fId && incomingByDriveId.get(fId)) ||
+      (fName && incomingByFileName.get(fName)) ||
+      (!fId && !fName && b[idx] && b[idx].driveFileId ? b[idx] : null);
+
+    const nextDriveId = ch?.driveFileId || match?.driveFileId || '';
+    if (nextDriveId) seenDriveIds.add(String(nextDriveId));
+    if (fName) seenFileNames.add(fName);
+    if (match?.fileName) seenFileNames.add(String(match.fileName).toLowerCase());
+
+    if (!match) return { ...ch };
+    return {
+      ...ch,
+      driveFileId: nextDriveId,
+      driveStreamUrl:
+        ch?.driveStreamUrl ||
+        match.driveStreamUrl ||
+        (nextDriveId ? buildDriveStreamUrl(nextDriveId) : ''),
+      ...(match.streamUrl && !ch?.streamUrl ? { streamUrl: match.streamUrl } : {}),
+      ...(!Number(ch?.durationSec) && Number(match.durationSec) > 0
+        ? { durationSec: match.durationSec }
+        : {}),
+      ...(!Number(ch?.sizeBytes) && Number(match.sizeBytes) > 0
+        ? { sizeBytes: match.sizeBytes }
+        : {}),
+    };
+  });
+
+  for (const ch of b) {
+    const fId = ch?.driveFileId ? String(ch.driveFileId) : '';
+    const fName = ch?.fileName ? String(ch.fileName).toLowerCase() : '';
+    if (fId && seenDriveIds.has(fId)) continue;
+    if (!fId && fName && seenFileNames.has(fName)) continue;
+    if (!fId && !fName) continue;
+    if (fId) seenDriveIds.add(fId);
+    if (fName) seenFileNames.add(fName);
+    merged.push({ ...ch, index: merged.length });
+  }
+
+  return merged;
+}
+
+function mergeTracks(existing = [], incoming = []) {
+  const a = Array.isArray(existing) ? existing : [];
+  const b = Array.isArray(incoming) ? incoming : [];
+  if (a.length === 0) return b.length > 0 ? b.map((tr) => ({ ...tr })) : undefined;
+  if (b.length === 0) return a.map((tr) => ({ ...tr }));
+
+  const incomingByDriveId = new Map();
+  const incomingByFileName = new Map();
+  for (const tr of b) {
+    if (tr?.driveFileId) incomingByDriveId.set(String(tr.driveFileId), tr);
+    const nameKey = String(tr?.fileName || tr?.title || '').toLowerCase();
+    if (nameKey) incomingByFileName.set(nameKey, tr);
+  }
+
+  const seenDriveIds = new Set();
+  const seenNames = new Set();
+  const merged = a.map((tr) => {
+    const fId = tr?.driveFileId ? String(tr.driveFileId) : '';
+    const nameKey = String(tr?.fileName || tr?.title || '').toLowerCase();
+    const match =
+      (fId && incomingByDriveId.get(fId)) ||
+      (nameKey && incomingByFileName.get(nameKey)) ||
+      null;
+    const nextDriveId = tr?.driveFileId || match?.driveFileId || '';
+    if (nextDriveId) seenDriveIds.add(String(nextDriveId));
+    if (nameKey) seenNames.add(nameKey);
+    if (!match) return { ...tr };
+    return {
+      ...tr,
+      driveFileId: nextDriveId,
+      driveStreamUrl:
+        tr?.driveStreamUrl ||
+        match.driveStreamUrl ||
+        (nextDriveId ? buildDriveStreamUrl(nextDriveId) : ''),
+    };
+  });
+
+  for (const tr of b) {
+    const fId = tr?.driveFileId ? String(tr.driveFileId) : '';
+    const nameKey = String(tr?.fileName || tr?.title || '').toLowerCase();
+    if (fId && seenDriveIds.has(fId)) continue;
+    if (!fId && nameKey && seenNames.has(nameKey)) continue;
+    if (fId) seenDriveIds.add(fId);
+    if (nameKey) seenNames.add(nameKey);
+    merged.push({ ...tr, index: merged.length });
+  }
+
+  return merged;
 }
 
 function parseTimestampMs(value) {
@@ -217,7 +344,7 @@ function parseTimestampMs(value) {
 
 /**
  * Merge duplicate audiobooks across Local Folders and Google Drive sharing the same
- * normalized bookKey, preferring 'local' playback whenever a local copy exists.
+ * driveFileId or normalized bookKey, preferring 'local' playback whenever a local copy exists.
  * @param {Array<object>} items
  * @returns {Array<object>}
  */
@@ -226,6 +353,7 @@ export function deduplicateLibraryItems(items = []) {
 
   const byKey = new Map();
   const podcastByFeedUrl = new Map();
+  const driveFileIdToMapKey = new Map();
 
   for (const raw of items) {
     if (!raw || typeof raw !== 'object') continue;
@@ -245,6 +373,15 @@ export function deduplicateLibraryItems(items = []) {
       } else {
         podcastByFeedUrl.set(normFeedUrl, mapKey);
       }
+    } else if (!isPodcast) {
+      const rawDriveIds = collectBookDriveFileIds(raw);
+      for (const fid of rawDriveIds) {
+        const matchedKey = driveFileIdToMapKey.get(fid);
+        if (matchedKey) {
+          mapKey = matchedKey;
+          break;
+        }
+      }
     }
 
     const rawSources = collectSources(raw);
@@ -256,7 +393,7 @@ export function deduplicateLibraryItems(items = []) {
 
     if (!byKey.has(mapKey)) {
       const sources = orderSources(rawSources);
-      byKey.set(mapKey, {
+      const created = {
         ...raw,
         id: raw.id || key,
         bookKey: key,
@@ -292,7 +429,13 @@ export function deduplicateLibraryItems(items = []) {
         progress: rawProgress,
         chapterIndex: rawChapterIdx,
         totalDurationSec: rawDuration,
-      });
+      };
+      byKey.set(mapKey, created);
+      if (!isPodcast) {
+        for (const fid of collectBookDriveFileIds(created)) {
+          driveFileIdToMapKey.set(fid, mapKey);
+        }
+      }
       continue;
     }
 
@@ -332,8 +475,13 @@ export function deduplicateLibraryItems(items = []) {
     const mergedChapters = isPodcast
       ? mergePodcastChapters(existing.chapters, raw.chapters, preferIncomingFeed)
       : mergeChapters(existing.chapters, raw.chapters);
+    const mergedTracks = isPodcast
+      ? (Array.isArray(existing.tracks) && existing.tracks.length > 0
+          ? existing.tracks
+          : (Array.isArray(raw.tracks) ? raw.tracks : undefined))
+      : mergeTracks(existing.tracks, raw.tracks);
 
-    byKey.set(mapKey, {
+    const mergedItem = {
       ...existing,
       id: existing.id || raw.id || existing.bookKey,
       bookKey: existing.bookKey || key,
@@ -351,9 +499,7 @@ export function deduplicateLibraryItems(items = []) {
         : (isPodcast ? 'podcast' : (sources[0] || 'drive')),
       localUrl: existing.localUrl || raw.localUrl || '',
       localFile: existing.localFile || raw.localFile || null,
-      tracks: Array.isArray(existing.tracks) && existing.tracks.length > 0
-        ? existing.tracks
-        : (Array.isArray(raw.tracks) ? raw.tracks : undefined),
+      ...(mergedTracks ? { tracks: mergedTracks } : {}),
       driveFileId: existing.driveFileId || raw.driveFileId || '',
       driveStreamUrl:
         existing.driveStreamUrl ||
@@ -361,6 +507,12 @@ export function deduplicateLibraryItems(items = []) {
         (raw.driveFileId ? buildDriveStreamUrl(raw.driveFileId) : ''),
       isOffline: offlineStatus,
       offline: offlineStatus,
+      ...(existing.offlineCached !== undefined || raw.offlineCached !== undefined
+        ? { offlineCached: Boolean(existing.offlineCached ?? raw.offlineCached) }
+        : {}),
+      ...(existing.completed !== undefined || raw.completed !== undefined
+        ? { completed: existing.completed !== undefined ? Boolean(existing.completed) : Boolean(raw.completed) }
+        : {}),
       ...(isPodcast
         ? {
             isPodcast: true,
@@ -389,7 +541,14 @@ export function deduplicateLibraryItems(items = []) {
         ? { enrichmentCheckedAt: existing.enrichmentCheckedAt || raw.enrichmentCheckedAt }
         : {}),
       ...(latestTs ? { lastPlayedAt: latestTs } : {}),
-    });
+    };
+
+    byKey.set(mapKey, mergedItem);
+    if (!isPodcast) {
+      for (const fid of collectBookDriveFileIds(mergedItem)) {
+        driveFileIdToMapKey.set(fid, mapKey);
+      }
+    }
   }
 
   return Array.from(byKey.values()).map((item) =>
@@ -398,6 +557,164 @@ export function deduplicateLibraryItems(items = []) {
 }
 
 export const deduplicateBooks = deduplicateLibraryItems;
+
+/**
+ * Diff an existing library against a fresh Google Drive folder scan without clobbering
+ * locally edited metadata, progress, covers, or offline state, and without auto-deleting
+ * missing Drive books.
+ *
+ * @param {Array<object>} [existingBooks=[]]
+ * @param {Array<object>} [scannedDriveBooks=[]]
+ * @param {string} [folderId='']
+ * @returns {{ mergedNonRemovedBooks: Array<object>, addedBooks: Array<object>, removedDriveBooks: Array<object> }}
+ */
+export function diffDriveLibrarySync(existingBooks = [], scannedDriveBooks = [], folderId = '') {
+  const existingList = Array.isArray(existingBooks) ? existingBooks.filter((b) => b && typeof b === 'object') : [];
+  const scannedList = Array.isArray(scannedDriveBooks) ? scannedDriveBooks.filter((b) => b && typeof b === 'object') : [];
+  const cleanFolderId = extractGoogleDriveFolderId(folderId || '');
+
+  const existingByDriveFileId = new Map();
+  const existingByBookKey = new Map();
+
+  existingList.forEach((book, idx) => {
+    if (isPodcastItem(book)) return;
+    for (const fid of collectBookDriveFileIds(book)) {
+      if (!existingByDriveFileId.has(fid)) {
+        existingByDriveFileId.set(fid, idx);
+      }
+    }
+    const directKey = book.bookKey ? String(book.bookKey).trim() : '';
+    if (directKey && !existingByBookKey.has(directKey)) {
+      existingByBookKey.set(directKey, idx);
+    }
+    const normalizedKey = normalizeBookKey(book.title || '', book.author || '');
+    if (normalizedKey && !existingByBookKey.has(normalizedKey)) {
+      existingByBookKey.set(normalizedKey, idx);
+    }
+  });
+
+  const matchedExistingByIndex = new Map();
+  const addedBooks = [];
+  const allScannedFileIds = new Set();
+
+  for (const scanned of scannedList) {
+    if (isPodcastItem(scanned)) continue;
+    const scannedIds = collectBookDriveFileIds(scanned);
+    for (const fid of scannedIds) {
+      allScannedFileIds.add(fid);
+    }
+
+    let matchedIdx = -1;
+    for (const fid of scannedIds) {
+      if (existingByDriveFileId.has(fid)) {
+        matchedIdx = existingByDriveFileId.get(fid);
+        break;
+      }
+    }
+
+    if (matchedIdx < 0) {
+      const scannedKey = scanned.bookKey ? String(scanned.bookKey).trim() : '';
+      const scannedNormKey = normalizeBookKey(scanned.title || '', scanned.author || '');
+      if (scannedKey && existingByBookKey.has(scannedKey)) {
+        matchedIdx = existingByBookKey.get(scannedKey);
+      } else if (scannedNormKey && existingByBookKey.has(scannedNormKey)) {
+        matchedIdx = existingByBookKey.get(scannedNormKey);
+      }
+    }
+
+    if (matchedIdx < 0) {
+      const preparedNew = {
+        ...scanned,
+        ...(cleanFolderId && !scanned.driveFolderId ? { driveFolderId: cleanFolderId } : {})
+      };
+      addedBooks.push(preparedNew);
+      continue;
+    }
+
+    const base = matchedExistingByIndex.get(matchedIdx) || existingList[matchedIdx];
+    const sources = orderSources(new Set([...collectSources(base), 'drive']));
+    const mergedDriveFileId = base.driveFileId || scanned.driveFileId || '';
+    const mergedStreamUrl =
+      base.driveStreamUrl ||
+      scanned.driveStreamUrl ||
+      (mergedDriveFileId ? buildDriveStreamUrl(mergedDriveFileId) : '');
+    const mergedChapters = mergeChapters(base.chapters, scanned.chapters);
+    const mergedTracks = mergeTracks(base.tracks, scanned.tracks);
+
+    const updated = {
+      ...base,
+      bookKey: base.bookKey || scanned.bookKey || normalizeBookKey(base.title || '', base.author || ''),
+      title: base.title || scanned.title || '',
+      author: base.author || scanned.author || '',
+      coverUrl: base.coverUrl || scanned.coverUrl || '',
+      positionSec: Number(base.positionSec ?? base.progressSec ?? 0) || 0,
+      bookmarks: mergeBookmarks(base.bookmarks),
+      ...(base.completed !== undefined ? { completed: base.completed } : {}),
+      ...(base.offlineCached !== undefined ? { offlineCached: base.offlineCached } : {}),
+      ...(base.episodeProgress !== undefined ? { episodeProgress: base.episodeProgress } : {}),
+      sources,
+      preferredPlaybackSource: sources.includes('local')
+        ? 'local'
+        : (base.preferredPlaybackSource || 'drive'),
+      driveFileId: mergedDriveFileId,
+      driveStreamUrl: mergedStreamUrl,
+      ...(base.streamUrl || mergedStreamUrl ? { streamUrl: base.streamUrl || mergedStreamUrl } : {}),
+      ...(base.driveFolderId || cleanFolderId || scanned.driveFolderId
+        ? { driveFolderId: base.driveFolderId || cleanFolderId || scanned.driveFolderId }
+        : {}),
+      chapters: mergedChapters,
+      ...(mergedTracks ? { tracks: mergedTracks } : {}),
+      totalDurationSec:
+        Number(base.totalDurationSec || 0) > 0
+          ? Number(base.totalDurationSec)
+          : Number(scanned.totalDurationSec || 0),
+    };
+
+    matchedExistingByIndex.set(matchedIdx, updated);
+    for (const fid of collectBookDriveFileIds(updated)) {
+      if (!existingByDriveFileId.has(fid)) {
+        existingByDriveFileId.set(fid, matchedIdx);
+      }
+    }
+  }
+
+  const removedDriveBooks = [];
+  const removedIndices = new Set();
+
+  existingList.forEach((book, idx) => {
+    if (matchedExistingByIndex.has(idx)) return;
+    if (isPodcastItem(book)) return;
+    const sources = collectSources(book);
+    if (!sources.has('drive')) return;
+
+    const bookFolderId = extractGoogleDriveFolderId(book.driveFolderId || '');
+    if (cleanFolderId && bookFolderId && bookFolderId !== cleanFolderId) {
+      return;
+    }
+
+    const existingIds = collectBookDriveFileIds(book);
+    if (existingIds.size > 0) {
+      const anyStillPresent = Array.from(existingIds).some((fid) => allScannedFileIds.has(fid));
+      if (anyStillPresent) return;
+    }
+
+    removedIndices.add(idx);
+    removedDriveBooks.push(book);
+  });
+
+  const nonRemovedExisting = [];
+  existingList.forEach((book, idx) => {
+    if (removedIndices.has(idx)) return;
+    nonRemovedExisting.push(matchedExistingByIndex.get(idx) || book);
+  });
+
+  const mergedNonRemovedBooks = [...nonRemovedExisting, ...addedBooks];
+  return {
+    mergedNonRemovedBooks,
+    addedBooks,
+    removedDriveBooks,
+  };
+}
 
 /**
  * Safely read up to the first 128 KB of a File/Blob-like object.

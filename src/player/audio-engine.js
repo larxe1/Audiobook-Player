@@ -42,7 +42,12 @@ export class AudioEngine {
     this.onOfflineChange = options.onOfflineChange || (() => {});
     this.onError = options.onError || (() => {});
     this.onDriveTokenExpired = options.onDriveTokenExpired || null;
-    this.fetchImpl = options.fetchImpl || null;
+    this.fetchImpl = options.fetchFn || options.fetchImpl || null;
+    this._hasCustomFetchFn = Boolean(options.fetchFn || options.fetchImpl);
+
+    this._loadSeq = 0;
+    this._activeLoadAbortController = null;
+    this._pendingDirectDriveFallback = null;
 
     this.audio = typeof Audio !== 'undefined' ? new Audio() : null;
     if (this.audio) {
@@ -134,9 +139,122 @@ export class AudioEngine {
 
     this.audio.addEventListener('error', () => {
       if (this.usingSynth || !this.currentBook) return;
+      if (this._tryDriveBlobFallbackOnError()) return;
       // Graceful fallback to Web Audio synthesizer if remote/demo stream fails
       this._activateSynthFallback();
     });
+  }
+
+  _emitState() {
+    this.onStateChange(this.getSnapshot());
+  }
+
+  _isDirectDriveStreamUrl(url) {
+    return Boolean(
+      url &&
+      typeof url === 'string' &&
+      url.includes('googleapis.com') &&
+      !url.startsWith('blob:') &&
+      url.includes('access_token=')
+    );
+  }
+
+  async _fetchDriveBlobUrl(streamUrl, token = this.driveAccessToken, signal = undefined) {
+    const fetchFn = this.fetchImpl || (typeof fetch === 'function' ? fetch : null);
+    if (!fetchFn || !streamUrl || signal?.aborted) return null;
+    try {
+      const prevToken = token || this.driveAccessToken;
+      if (!prevToken) return null;
+      const buildInit = (bearer) => ({
+        headers: {
+          Authorization: `Bearer ${bearer}`
+        },
+        ...(signal ? { signal } : {})
+      });
+      let resp = await fetchFn(streamUrl, buildInit(prevToken));
+      if (signal?.aborted) return null;
+      if (resp.status === 401 && typeof this.onDriveTokenExpired === 'function') {
+        const nextToken = await this.onDriveTokenExpired().catch(() => null);
+        if (signal?.aborted) return null;
+        if (nextToken && nextToken !== prevToken) {
+          this.driveAccessToken = nextToken;
+          resp = await fetchFn(streamUrl, buildInit(this.driveAccessToken));
+          if (signal?.aborted) return null;
+        }
+      }
+      if (resp && resp.ok) {
+        const blob = await resp.blob();
+        if (signal?.aborted) return null;
+        return URL.createObjectURL(blob);
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  _tryDriveBlobFallbackOnError({ autoPlay = false } = {}) {
+    const fb = this._pendingDirectDriveFallback;
+    if (!fb || fb.loadSeq !== this._loadSeq || fb.signal?.aborted) {
+      return false;
+    }
+    fb.wantAutoPlay = Boolean(fb.wantAutoPlay || autoPlay || this.playing);
+    if (fb.inFlight) {
+      return true;
+    }
+    if (fb.attempted) {
+      return false;
+    }
+    fb.attempted = true;
+    fb.inFlight = true;
+    const savedPos = this.positionSec;
+    void (async () => {
+      try {
+        const blobUrl = await this._fetchDriveBlobUrl(fb.streamUrl, this.driveAccessToken, fb.signal);
+        fb.inFlight = false;
+        if (fb.loadSeq !== this._loadSeq || fb.signal?.aborted) {
+          if (blobUrl && blobUrl.startsWith('blob:') && typeof URL !== 'undefined') {
+            try {
+              URL.revokeObjectURL(blobUrl);
+            } catch {
+              // ignore
+            }
+          }
+          return;
+        }
+        if (blobUrl && this.audio) {
+          this._stopSynthTone();
+          this.usingSynth = false;
+          this.activeObjectUrl = blobUrl;
+          this.audio.src = blobUrl;
+          this.audio.playbackRate = this.playbackRate;
+          try {
+            this.audio.currentTime = savedPos;
+          } catch {
+            // Applied on loadedmetadata
+          }
+          if (fb.wantAutoPlay || this.playing) {
+            try {
+              await this.audio.play();
+            } catch {
+              if (fb.loadSeq === this._loadSeq && !fb.signal?.aborted) {
+                this._activateSynthFallback();
+                this._startSynthTone();
+              }
+            }
+          }
+          this._emitState();
+        } else if (fb.loadSeq === this._loadSeq && !fb.signal?.aborted) {
+          this._activateSynthFallback();
+          if (fb.wantAutoPlay || this.playing) {
+            this._startSynthTone();
+          }
+        }
+      } finally {
+        fb.inFlight = false;
+      }
+    })();
+    return true;
   }
 
   setDriveAccessToken(token) {
@@ -233,20 +351,17 @@ export class AudioEngine {
     return Boolean(record);
   }
 
-  async _resolveChapterMediaUrl(book, chapterIndex = 0) {
+  async _resolveChapterMediaUrl(book, chapterIndex = 0, { signal } = {}) {
+    if (signal?.aborted) return null;
     const ch = Array.isArray(book?.chapters) ? book.chapters[chapterIndex] : null;
     if (ch?.localFile && typeof URL !== 'undefined') {
-      const url = URL.createObjectURL(ch.localFile);
-      this.activeObjectUrl = url;
-      return url;
+      return URL.createObjectURL(ch.localFile);
     }
     if (ch?.localUrl) {
       return ch.localUrl;
     }
     if (book.localFile && typeof URL !== 'undefined') {
-      const url = URL.createObjectURL(book.localFile);
-      this.activeObjectUrl = url;
-      return url;
+      return URL.createObjectURL(book.localFile);
     }
     if (book.localUrl) {
       return book.localUrl;
@@ -255,53 +370,30 @@ export class AudioEngine {
     const epKey = ch?.episodeId || ch?.driveFileId || '';
     const cacheKey = epKey ? `${book.bookKey}::${epKey}` : book.bookKey;
     let cached = await this._readCachedBlob(cacheKey);
+    if (signal?.aborted) return null;
     if (!cached && book?.isPodcast) {
       const fallbackEpKey = this.getEpisodeCacheKey(book, chapterIndex);
       if (fallbackEpKey && fallbackEpKey !== cacheKey) {
         cached = await this._readCachedBlob(fallbackEpKey);
+        if (signal?.aborted) return null;
       }
     }
     if (!cached && !book?.isPodcast) {
       cached = await this._readCachedBlob(book.bookKey);
+      if (signal?.aborted) return null;
     }
     if (cached && cached.blob && typeof URL !== 'undefined') {
-      const url = URL.createObjectURL(cached.blob);
-      this.activeObjectUrl = url;
-      return url;
+      return URL.createObjectURL(cached.blob);
     }
 
     const streamUrl = ch?.audioUrl || ch?.driveStreamUrl || book.driveStreamUrl;
     if (streamUrl) {
       if (this.driveAccessToken && streamUrl.includes('googleapis.com')) {
-        const fetchFn = this.fetchImpl || (typeof fetch === 'function' ? fetch : null);
-        if (!fetchFn) return null;
-        try {
-          const prevToken = this.driveAccessToken;
-          let resp = await fetchFn(streamUrl, {
-            headers: {
-              Authorization: `Bearer ${prevToken}`
-            }
-          });
-          if (resp.status === 401 && typeof this.onDriveTokenExpired === 'function') {
-            const nextToken = await this.onDriveTokenExpired().catch(() => null);
-            if (nextToken && nextToken !== prevToken) {
-              this.driveAccessToken = nextToken;
-              resp = await fetchFn(streamUrl, {
-                headers: {
-                  Authorization: `Bearer ${this.driveAccessToken}`
-                }
-              });
-            }
-          }
-          if (resp.ok) {
-            const blob = await resp.blob();
-            const url = URL.createObjectURL(blob);
-            this.activeObjectUrl = url;
-            return url;
-          }
-        } catch {
-          return null;
+        if (!this._hasCustomFetchFn && typeof window !== 'undefined') {
+          const sep = streamUrl.includes('?') ? '&' : '?';
+          return `${streamUrl}${sep}access_token=${encodeURIComponent(this.driveAccessToken)}`;
         }
+        return await this._fetchDriveBlobUrl(streamUrl, this.driveAccessToken, signal);
       } else {
         return streamUrl;
       }
@@ -314,7 +406,33 @@ export class AudioEngine {
     if (this.currentBook && this.currentBook !== book) {
       this._saveCurrentEpisodeProgress(this.currentBook);
     }
-    this.pause();
+
+    this._loadSeq += 1;
+    const loadSeq = this._loadSeq;
+    if (this._activeLoadAbortController) {
+      try {
+        this._activeLoadAbortController.abort();
+      } catch {
+        // ignore
+      }
+    }
+    this._activeLoadAbortController =
+      typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const signal = this._activeLoadAbortController?.signal;
+    this._pendingDirectDriveFallback = null;
+
+    // Stop active playback without emitting stale currentBook state before switching
+    this._saveCurrentEpisodeProgress();
+    this.playing = false;
+    this._stopVirtualClock();
+    this._stopSynthTone();
+    if (this.audio && !this.usingSynth) {
+      try {
+        this.audio.pause();
+      } catch {
+        // ignore
+      }
+    }
     this._revokeObjectUrl();
 
     this.currentBook = book;
@@ -356,10 +474,44 @@ export class AudioEngine {
     this.positionSec = Math.max(0, Math.min(this.durationSec, Number.isFinite(initialPos) ? initialPos : 0));
     this.usingSynth = false;
 
-    const mediaUrl = await this._resolveChapterMediaUrl(book, this.chapterIndex);
+    // Emit updated currentBook & chapterIndex immediately before async URL resolution
+    this._emitState();
+
+    const mediaUrl = await this._resolveChapterMediaUrl(book, this.chapterIndex, { signal });
+    if (loadSeq !== this._loadSeq || signal?.aborted) {
+      if (mediaUrl && typeof mediaUrl === 'string' && mediaUrl.startsWith('blob:') && typeof URL !== 'undefined') {
+        try {
+          URL.revokeObjectURL(mediaUrl);
+        } catch {
+          // ignore
+        }
+        if (this.activeObjectUrl === mediaUrl) {
+          this.activeObjectUrl = null;
+        }
+      }
+      return;
+    }
 
     if (mediaUrl && this.audio) {
       this.usingSynth = false;
+      if (typeof mediaUrl === 'string' && mediaUrl.startsWith('blob:')) {
+        this.activeObjectUrl = mediaUrl;
+      }
+      if (this._isDirectDriveStreamUrl(mediaUrl)) {
+        const rawStreamUrl = activeChapter?.audioUrl || activeChapter?.driveStreamUrl || book.driveStreamUrl;
+        if (rawStreamUrl) {
+          this._pendingDirectDriveFallback = {
+            streamUrl: rawStreamUrl,
+            book,
+            chapterIndex: this.chapterIndex,
+            loadSeq,
+            signal,
+            attempted: false,
+            inFlight: false,
+            wantAutoPlay: false
+          };
+        }
+      }
       this.audio.src = mediaUrl;
       this.audio.playbackRate = this.playbackRate;
       try {
@@ -371,7 +523,7 @@ export class AudioEngine {
       this._activateSynthFallback();
     }
 
-    this.onStateChange(this.getSnapshot());
+    this._emitState();
     this.onTimeUpdate(this.getSnapshot());
   }
 
@@ -534,12 +686,15 @@ export class AudioEngine {
     try {
       this.audio.playbackRate = this.playbackRate;
       await this.audio.play();
-      this.onStateChange(this.getSnapshot());
+      this._emitState();
     } catch {
+      if (this._tryDriveBlobFallbackOnError({ autoPlay: true })) {
+        return;
+      }
       // Fallback cleanly to synth playback if browser blocks/fails audio element
       this._activateSynthFallback();
       this._startSynthTone();
-      this.onStateChange(this.getSnapshot());
+      this._emitState();
     }
   }
 
@@ -611,7 +766,21 @@ export class AudioEngine {
       const prevIdx = this.chapterIndex;
       const isSwitchingEpisode = clampedIdx !== prevIdx;
       const wasPlaying = this.playing;
+
+      this._loadSeq += 1;
+      const loadSeq = this._loadSeq;
+      if (this._activeLoadAbortController) {
+        try {
+          this._activeLoadAbortController.abort();
+        } catch {
+          // ignore
+        }
+      }
+      this._activeLoadAbortController =
+        typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const signal = this._activeLoadAbortController?.signal;
       if (isSwitchingEpisode) {
+        this._pendingDirectDriveFallback = null;
         this.pause();
         this._revokeObjectUrl();
       }
@@ -640,9 +809,42 @@ export class AudioEngine {
 
       if (isSwitchingEpisode) {
         this.usingSynth = false;
-        const mediaUrl = await this._resolveChapterMediaUrl(this.currentBook, clampedIdx);
+        this._emitState();
+        const mediaUrl = await this._resolveChapterMediaUrl(this.currentBook, clampedIdx, { signal });
+        if (loadSeq !== this._loadSeq || signal?.aborted) {
+          if (mediaUrl && typeof mediaUrl === 'string' && mediaUrl.startsWith('blob:') && typeof URL !== 'undefined') {
+            try {
+              URL.revokeObjectURL(mediaUrl);
+            } catch {
+              // ignore
+            }
+            if (this.activeObjectUrl === mediaUrl) {
+              this.activeObjectUrl = null;
+            }
+          }
+          return;
+        }
         if (mediaUrl && this.audio) {
           this.usingSynth = false;
+          if (typeof mediaUrl === 'string' && mediaUrl.startsWith('blob:')) {
+            this.activeObjectUrl = mediaUrl;
+          }
+          if (this._isDirectDriveStreamUrl(mediaUrl)) {
+            const rawStreamUrl =
+              targetChapter?.audioUrl || targetChapter?.driveStreamUrl || this.currentBook?.driveStreamUrl;
+            if (rawStreamUrl) {
+              this._pendingDirectDriveFallback = {
+                streamUrl: rawStreamUrl,
+                book: this.currentBook,
+                chapterIndex: clampedIdx,
+                loadSeq,
+                signal,
+                attempted: false,
+                inFlight: false,
+                wantAutoPlay: false
+              };
+            }
+          }
           this.audio.src = mediaUrl;
           this.audio.playbackRate = this.playbackRate;
           try {
@@ -655,6 +857,7 @@ export class AudioEngine {
         }
         if (wasPlaying) {
           await this.play();
+          if (loadSeq !== this._loadSeq || signal?.aborted) return;
         }
       } else if (this.audio && !this.usingSynth) {
         try {
@@ -670,7 +873,7 @@ export class AudioEngine {
       }
       this.onChapterChange(clampedIdx, targetChapter);
       this.onTimeUpdate(this.getSnapshot());
-      this.onStateChange(this.getSnapshot());
+      this._emitState();
       return;
     }
 
@@ -989,6 +1192,16 @@ export class AudioEngine {
   }
 
   destroy() {
+    this._loadSeq += 1;
+    if (this._activeLoadAbortController) {
+      try {
+        this._activeLoadAbortController.abort();
+      } catch {
+        // ignore
+      }
+      this._activeLoadAbortController = null;
+    }
+    this._pendingDirectDriveFallback = null;
     this.pause();
     this._revokeObjectUrl();
     if (this._audioCtx) {

@@ -1,5 +1,5 @@
 /**
- * Clean vector SVG icons & Microsoft Fluent 3D source badges for Audiobook Player.
+ * Clean vector SVG icons for MultiPlayer.
  * Zero standard text emojis are used anywhere in the UI.
  */
 
@@ -90,7 +90,27 @@ export const ICON_CHEVRON = (direction = 'right', size = 16, cls = '') => {
 };
 
 /**
- * Spotify 14px green downloaded arrow-in-circle SVG (replaces any "Offline" text badge).
+ * Clean green checkmark-in-circle SVG shown ONLY when an item is saved offline.
+ */
+export const ICON_OFFLINE_CHECK = (size = 14, cls = '') => `
+<svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="none" class="${cls}" data-offline-saved="true" aria-label="Saved offline" role="img">
+  <circle cx="8" cy="8" r="7.5" fill="#1ed760"/>
+  <path d="M4.6 8.3l2.2 2.2 4.6-4.8" stroke="#050506" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>`;
+
+export const ICON_CHECKMARK = ICON_OFFLINE_CHECK;
+
+/**
+ * Settings gear icon for Profile popover & Settings modal.
+ */
+export const ICON_SETTINGS = (size = 16, cls = '') => `
+<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="${cls}" aria-hidden="true">
+  <circle cx="12" cy="12" r="3"/>
+  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+</svg>`;
+
+/**
+ * Spotify 14px green downloaded arrow-in-circle SVG (kept for episode download buttons).
  */
 export const ICON_DOWNLOADED = (size = 14, cls = '') => `
 <svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="none" class="${cls}" aria-label="Downloaded" role="img">

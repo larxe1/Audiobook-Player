@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#060911" />
-    <title>Audiobook Player — Google Sign-In</title>
+    <title>MultiPlayer — Google Sign-In</title>
     <style>
       :root {
         color-scheme: dark;
@@ -90,7 +90,7 @@
       <div id="statusBadge" class="badge">✓</div>
       <h1 id="statusTitle">Completing Google Sign-In…</h1>
       <p id="statusSubtitle">Please wait a moment.</p>
-      <a id="returnBtn" class="btn hidden" href="com.audiobook.player://oauth">Return to Audiobook Player</a>
+      <a id="returnBtn" class="btn hidden" href="com.audiobook.player://oauth">Return to MultiPlayer</a>
     </main>
 
     <script>
@@ -126,7 +126,7 @@
             titleEl.textContent = 'Google Sign-In did not complete';
             subtitleEl.textContent = error_description || error;
           } else {
-            titleEl.textContent = 'Returning to Audiobook Player…';
+            titleEl.textContent = 'Returning to MultiPlayer…';
             subtitleEl.textContent = 'Tap the button below if the app does not reopen automatically.';
           }
 
@@ -156,7 +156,7 @@
           subtitleEl.textContent = (error_description || error) + ' — you can close this window.';
         } else {
           titleEl.textContent = 'Sign-in complete — you can close this window';
-          subtitleEl.textContent = 'Your Google account is now connected to Audiobook Player.';
+          subtitleEl.textContent = 'Your Google account is now connected to MultiPlayer.';
         }
 
         if (window.opener && !window.opener.closed) {

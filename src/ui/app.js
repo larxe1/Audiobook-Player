@@ -1,23 +1,19 @@
 /**
- * Audiobook Player — Main Interactive Application Controller
+ * MultiPlayer — Main Interactive Application Controller
  * Supports:
  * - Automatic viewport layout switching (Desktop 3-column, Mobile full-bleed, Wear OS Watch)
- * - Midnight Black (default) & Pitch Black themes (via Profile menu)
+ * - Pitch Black (default) & True Black themes (via Settings / Profile menu)
  * - Real adaptive audio output detection via navigator.mediaDevices.enumerateDevices()
- * - Gmail Profile Avatar + Clean Minimalist Profile & Settings Popover
- * - Live Cover Image Search Modal + Local Cover Upload
- * - Real Local Folder Scanning (#localFolderInput) + Google Drive Scanning + Deduplication
+ * - Gmail Profile Avatar + Clean Minimalist Profile Popover + Settings > Advanced Settings
+ * - Unified Magnifying Glass Search (All / Audiobooks / Podcasts to Follow)
+ * - Right-Click (PC) & Long-Press (Android) Context Menu
+ * - Incremental Google Drive Auto-Sync + Removed-Files Confirmation Prompt
+ * - Android Back Button Navigation (handleBackPress + popstate)
  */
 
 import { OfflineSyncQueue, resolveProgressConflict } from '../services/offline-queue.js';
 import { SupabaseSyncService, handleRemoteEvent } from '../services/supabase-sync.js';
-import {
-  deduplicateLibraryItems,
-  scanLocalFiles,
-  scanGoogleDriveFolder,
-  collectFilesFromDirectoryHandle,
-  normalizeBookKey
-} from '../services/library-scanner.js';
+import * as libraryScanner from '../services/library-scanner.js';
 import * as metadataEnrichment from '../services/metadata-enrichment.js';
 import { searchCoverImages, buildCuratedSvgCover } from '../services/cover-search.js';
 import {
@@ -29,6 +25,105 @@ import {
   parsePodcastRssXml,
   createPodcastBookItem
 } from '../services/podcast-service.js';
+
+const {
+  deduplicateLibraryItems,
+  scanLocalFiles,
+  scanGoogleDriveFolder,
+  collectFilesFromDirectoryHandle,
+  normalizeBookKey
+} = libraryScanner;
+
+const diffDriveLibrarySync =
+  libraryScanner.diffDriveLibrarySync ||
+  function fallbackDiffDriveLibrarySync(existingBooks = [], scannedDriveBooks = [], folderId = '') {
+    const existing = Array.isArray(existingBooks) ? existingBooks : [];
+    const scanned = Array.isArray(scannedDriveBooks) ? scannedDriveBooks : [];
+    const scannedIdSet = new Set();
+    const scannedByDriveId = new Map();
+    const scannedByKey = new Map();
+
+    const getBookDriveIds = (b) => {
+      const ids = [];
+      if (b?.driveFileId) ids.push(String(b.driveFileId));
+      if (Array.isArray(b?.tracks)) {
+        for (const t of b.tracks) if (t?.driveFileId) ids.push(String(t.driveFileId));
+      }
+      if (Array.isArray(b?.chapters)) {
+        for (const c of b.chapters) if (c?.driveFileId) ids.push(String(c.driveFileId));
+      }
+      return Array.from(new Set(ids));
+    };
+
+    for (const sb of scanned) {
+      if (!sb) continue;
+      const key = sb.bookKey || normalizeBookKey(sb.title || '', sb.author || '');
+      if (key) scannedByKey.set(key, sb);
+      for (const id of getBookDriveIds(sb)) {
+        scannedIdSet.add(id);
+        scannedByDriveId.set(id, sb);
+      }
+    }
+
+    const matchedScanned = new Set();
+    const mergedNonRemovedBooks = [];
+    const removedDriveBooks = [];
+
+    for (const eb of existing) {
+      if (!eb) continue;
+      const isDrive = Boolean(eb.sources?.includes('drive') || eb.driveFileId);
+      if (!isDrive) {
+        mergedNonRemovedBooks.push(eb);
+        continue;
+      }
+      if (folderId && folderId !== 'root' && eb.driveFolderId && eb.driveFolderId !== folderId) {
+        mergedNonRemovedBooks.push(eb);
+        continue;
+      }
+      const existingIds = getBookDriveIds(eb);
+      let match = null;
+      for (const id of existingIds) {
+        if (scannedByDriveId.has(id)) {
+          match = scannedByDriveId.get(id);
+          break;
+        }
+      }
+      if (!match && eb.bookKey && scannedByKey.has(eb.bookKey)) {
+        match = scannedByKey.get(eb.bookKey);
+      }
+      if (match) {
+        matchedScanned.add(match);
+        mergedNonRemovedBooks.push({
+          ...match,
+          ...eb,
+          driveFileId: eb.driveFileId || match.driveFileId || '',
+          driveStreamUrl: eb.driveStreamUrl || match.driveStreamUrl || '',
+          driveFolderId: eb.driveFolderId || match.driveFolderId || folderId || '',
+          sources: Array.from(new Set([...(eb.sources || []), ...(match.sources || []), 'drive'])),
+          tracks:
+            Array.isArray(match.tracks) && match.tracks.length > (eb.tracks?.length || 0)
+              ? match.tracks
+              : eb.tracks || match.tracks,
+          chapters:
+            Array.isArray(match.chapters) && match.chapters.length > (eb.chapters?.length || 0)
+              ? match.chapters
+              : eb.chapters || match.chapters
+        });
+      } else {
+        removedDriveBooks.push(eb);
+      }
+    }
+
+    const addedBooks = [];
+    for (const sb of scanned) {
+      if (sb && !matchedScanned.has(sb)) {
+        addedBooks.push(sb);
+        mergedNonRemovedBooks.push(sb);
+      }
+    }
+
+    return { mergedNonRemovedBooks, addedBooks, removedDriveBooks };
+  };
 
 const {
   enrichBookMetadata,
@@ -115,6 +210,8 @@ import {
   ICON_CLOSE,
   ICON_CHEVRON,
   ICON_DOWNLOADED,
+  ICON_OFFLINE_CHECK,
+  ICON_SETTINGS,
   ICON_DOWNLOAD_CIRCLE,
   ICON_SLEEP,
   ICON_SPEAKER,
@@ -134,7 +231,27 @@ const STORAGE_PODCASTS_KEY = 'audiobook_podcasts_v1';
 const STORAGE_ACTIVE_BOOK_KEY = 'audiobook_player_active_book_v1';
 const STORAGE_LAST_EMAIL_KEY = 'audiobook_player_last_email_v1';
 const STORAGE_GUEST_MODE_KEY = 'audiobook_player_guest_mode_v1';
+const STORAGE_DISMISSED_CONTINUE_KEY = 'multiplayer_dismissed_continue_v1';
+const STORAGE_AUTO_DRIVE_SYNC_KEY = 'multiplayer_auto_drive_sync_v1';
 const PODCAST_AUTO_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
+const AUTO_DRIVE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+
+function closestByAttr(node, attrNames = []) {
+  let cur = node;
+  while (cur && typeof cur === 'object') {
+    for (const attr of attrNames) {
+      const val =
+        typeof cur.getAttribute === 'function'
+          ? cur.getAttribute(attr)
+          : cur.attributes?.[attr];
+      if (val !== undefined && val !== null && val !== '') {
+        return { el: cur, attr, value: String(val) };
+      }
+    }
+    cur = cur.parentNode || null;
+  }
+  return null;
+}
 
 const PLAYBACK_RATES = [1.0, 1.25, 1.5, 1.75, 2.0];
 
@@ -180,6 +297,9 @@ function formatRemaining(totalSec = 0, positionSec = 0) {
 class AudiobookApp {
   constructor(rootEl) {
     this.rootEl = rootEl;
+    if (typeof window !== 'undefined') {
+      window.__audiobookApp = this;
+    }
     this.offlineQueue = new OfflineSyncQueue();
     this.syncService = new SupabaseSyncService({ offlineQueue: this.offlineQueue });
     this.updaterService = new SelfUpdaterService();
@@ -234,10 +354,21 @@ class AudiobookApp {
       this.audioEngine.setDriveAccessToken(initialGoogleToken);
     }
     this._unsubGoogleToken =
-      this.syncService.onGoogleTokenChange?.((token) => {
+      this.syncService.onGoogleTokenChange?.((token, meta = {}) => {
         this.audioEngine.setDriveAccessToken(token);
         if (token && this.state) {
           this.state.needsDriveSyncReauth = false;
+          const fromRemote = Boolean(
+            meta?.fromRemote || this.syncService?._lastGoogleTokenFromRemote
+          );
+          if (!fromRemote && this._hasCloudSyncAuth()) {
+            const savedFolderId = this._getSavedDriveFolderId();
+            if (savedFolderId && savedFolderId !== 'root') {
+              void this.syncService
+                .syncDriveFolderConfig?.({ folderId: savedFolderId })
+                .catch(() => null);
+            }
+          }
         }
       }) || null;
     this._unsubRemotePlayback = null;
@@ -253,7 +384,7 @@ class AudiobookApp {
       profileOpen: false,
       sidebarCollapsed: false,
       rightPanelOpen: true,
-      filterSource: 'all', // 'all' | 'local' | 'drive' | 'podcasts' | 'downloaded'
+      filterSource: 'audiobooks', // 'audiobooks' | 'podcasts' (back-compat: 'all' | 'downloaded')
       searchQuery: '',
       activeOutputDevice: initialAudioOutput.activeLabel || 'System Audio',
       activeOutputDeviceId: initialAudioOutput.activeDeviceId || 'default',
@@ -285,12 +416,18 @@ class AudiobookApp {
       podcastModal: {
         open: false,
         query: '',
+        searchFilter: 'all', // 'all' | 'audiobooks' | 'podcasts'
         activeCategory: 'trending',
         loading: false,
         subscribingId: '',
         error: '',
         results: []
       },
+      settingsModalOpen: false,
+      advancedSettingsExpanded: false,
+      autoDriveSyncEnabled: this._loadAutoDriveSyncEnabled(),
+      contextMenu: null,
+      pendingDriveRemovals: [],
       refreshingPodcastKeys: new Set(),
       downloadingEpisodeKeys: new Set(),
       syncProgress: {
@@ -355,6 +492,7 @@ class AudiobookApp {
     this._suppressOfflineRender = false;
     this._shellEls = null;
     this._lastMainHtml = null;
+    this._lastMainViewSignature = null;
     this._prevMainViewMeta = null;
     this._overlayState = {};
     this._legacyBookKeyMap = new Map();
@@ -363,9 +501,18 @@ class AudiobookApp {
     this._podcastSearchDebounceTimer = null;
     this._podcastSearchReqId = 0;
     this._syncInFlight = null;
+    this._lastAutoDriveSyncAt = 0;
+    this._selectBookSeq = 0;
     this._lastDeviceRegisterAt = 0;
     this._lastLocalPlayAt = 0;
     this._dismissedRemotePromptSig = null;
+    this._dismissedRemotePromptSigs = this._loadDismissedContinueSigs();
+    this._dismissedDriveRemovalKeys = new Set();
+    this._longPressTimer = null;
+    this._longPressStart = null;
+    this._suppressNextClickUntil = 0;
+    this._lastBackPressAt = 0;
+    this._popstateHandler = null;
     this._globalInputsBound = false;
     this._androidUpdateReturnCleanup = null;
     this._destroyed = false;
@@ -527,18 +674,22 @@ class AudiobookApp {
   _loadTheme() {
     try {
       const saved = localStorage.getItem(STORAGE_THEME_KEY);
-      if (saved === 'pitch' || saved === 'midnight') return saved;
+      if (saved === 'pitch' || saved === 'amoled') return saved;
+      if (saved === 'midnight' || saved) {
+        localStorage.setItem(STORAGE_THEME_KEY, 'pitch');
+      }
     } catch {
       // ignore
     }
-    return 'midnight';
+    return 'pitch';
   }
 
   _saveTheme(theme) {
-    this.state.theme = theme;
-    this._applyThemeBodyClass(theme);
+    const cleanTheme = theme === 'amoled' ? 'amoled' : 'pitch';
+    this.state.theme = cleanTheme;
+    this._applyThemeBodyClass(cleanTheme);
     try {
-      localStorage.setItem(STORAGE_THEME_KEY, theme);
+      localStorage.setItem(STORAGE_THEME_KEY, cleanTheme);
     } catch {
       // ignore
     }
@@ -546,8 +697,54 @@ class AudiobookApp {
 
   _applyThemeBodyClass(theme) {
     if (typeof document === 'undefined') return;
-    document.body.classList.remove('theme-midnight', 'theme-pitch');
-    document.body.classList.add(theme === 'pitch' ? 'theme-pitch' : 'theme-midnight');
+    document.body.classList.remove('theme-midnight', 'theme-pitch', 'theme-amoled');
+    document.body.classList.add(theme === 'amoled' ? 'theme-amoled' : 'theme-pitch');
+  }
+
+  _loadDismissedContinueSigs() {
+    try {
+      const raw = localStorage.getItem(STORAGE_DISMISSED_CONTINUE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return new Set(parsed.filter((s) => typeof s === 'string' && s.trim()));
+        }
+        if (parsed && typeof parsed === 'object') {
+          return new Set(Object.keys(parsed).filter((k) => parsed[k]));
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return new Set();
+  }
+
+  _saveDismissedContinueSigs() {
+    try {
+      const arr = Array.from(this._dismissedRemotePromptSigs || []);
+      localStorage.setItem(STORAGE_DISMISSED_CONTINUE_KEY, JSON.stringify(arr));
+    } catch {
+      // ignore
+    }
+  }
+
+  _loadAutoDriveSyncEnabled() {
+    try {
+      const raw = localStorage.getItem(STORAGE_AUTO_DRIVE_SYNC_KEY);
+      if (raw === '0' || raw === 'false') return false;
+      return true;
+    } catch {
+      return true;
+    }
+  }
+
+  _saveAutoDriveSyncEnabled(enabled) {
+    this.state.autoDriveSyncEnabled = Boolean(enabled);
+    try {
+      localStorage.setItem(STORAGE_AUTO_DRIVE_SYNC_KEY, this.state.autoDriveSyncEnabled ? '1' : '0');
+    } catch {
+      // ignore
+    }
   }
 
   _isNativeAndroidApp() {
@@ -1073,8 +1270,24 @@ class AudiobookApp {
       return;
     }
 
-    const sig = `${best.deviceId}:${best.currentBookKey}:${best.lastSeenAt || Math.round(best.positionSec)}`;
-    if (this._dismissedRemotePromptSig && this._dismissedRemotePromptSig === sig) {
+    const sig = `${best.deviceId}:${best.currentBookKey}`;
+    if (this._dismissedRemotePromptSigs?.size) {
+      let pruned = false;
+      const devPrefix = `${best.deviceId}:`;
+      for (const existingSig of Array.from(this._dismissedRemotePromptSigs)) {
+        if (existingSig.startsWith(devPrefix) && existingSig !== sig) {
+          this._dismissedRemotePromptSigs.delete(existingSig);
+          pruned = true;
+        }
+      }
+      if (pruned) {
+        this._saveDismissedContinueSigs();
+      }
+    }
+    if (
+      this._dismissedRemotePromptSigs?.has(sig) ||
+      (this._dismissedRemotePromptSig && this._dismissedRemotePromptSig === sig)
+    ) {
       this.state.remotePlaybackPrompt = null;
       return;
     }
@@ -1422,6 +1635,14 @@ class AudiobookApp {
       clearTimeout(this._statusToastTimer);
       this._statusToastTimer = null;
     }
+    if (this._longPressTimer) {
+      clearTimeout(this._longPressTimer);
+      this._longPressTimer = null;
+    }
+    if (this._popstateHandler && typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      window.removeEventListener('popstate', this._popstateHandler);
+      this._popstateHandler = null;
+    }
     if (typeof this._unsubGoogleToken === 'function') {
       this._unsubGoogleToken();
       this._unsubGoogleToken = null;
@@ -1500,6 +1721,8 @@ class AudiobookApp {
           if (scanned) {
             uiChanged = true;
           }
+        } else if (this.state.autoDriveSyncEnabled !== false && this._hasGoogleDriveToken()) {
+          void this._maybeRunAutoDriveSync();
         }
 
         if (this._shouldPushLocalCatalog(remoteBooks, snapshot?.driveFolder)) {
@@ -1611,6 +1834,8 @@ class AudiobookApp {
 
     if (hasCloudAuth && this.books.length === 0 && this._hasGoogleDriveToken()) {
       await this._autoScanGoogleDriveIfEmpty();
+    } else if (this.state.autoDriveSyncEnabled !== false && this._hasGoogleDriveToken()) {
+      void this._maybeRunAutoDriveSync();
     }
 
     if (hasCloudAuth && this._shouldPushLocalCatalog(remoteBooks, remoteDriveFolder)) {
@@ -2048,6 +2273,27 @@ class AudiobookApp {
           this._syncCurrentDevicePlaybackState({ isPlaying: false, isActivePlayer: false });
         }
       });
+      if (typeof window.history?.pushState === 'function') {
+        try {
+          if (!window.history.state?.multiplayerGuard) {
+            window.history.pushState({ multiplayerGuard: true }, '');
+          }
+        } catch {
+          // ignore restricted history environments
+        }
+      }
+      this._popstateHandler = () => {
+        if (this._destroyed) return;
+        const handled = this.handleBackPress();
+        if (handled && typeof window.history?.pushState === 'function') {
+          try {
+            window.history.pushState({ multiplayerGuard: true }, '');
+          } catch {
+            // ignore
+          }
+        }
+      };
+      window.addEventListener('popstate', this._popstateHandler);
       if (typeof window.matchMedia === 'function') {
         const mqMobile = window.matchMedia('(max-width: 767px)');
         const mqWatch = window.matchMedia('(max-width: 340px)');
@@ -2059,6 +2305,84 @@ class AudiobookApp {
         }
       }
     }
+  }
+
+  handleBackPress() {
+    if (this.state.contextMenu) {
+      this.state.contextMenu = null;
+      this.render();
+      return true;
+    }
+    if (this.state.errorModal?.open) {
+      this.state.errorModal.open = false;
+      this.render();
+      return true;
+    }
+    if (this.state.showWipeSyncedModal && !this.state.wipeInProgress) {
+      this.state.showWipeSyncedModal = false;
+      this.state.wipeClearDriveFolder = false;
+      this.render();
+      return true;
+    }
+    if (Array.isArray(this.state.pendingDriveRemovals) && this.state.pendingDriveRemovals.length > 0) {
+      this.state.pendingDriveRemovals = [];
+      this.render();
+      return true;
+    }
+    if (this.state.coverModal?.open) {
+      this.state.coverModal.open = false;
+      this.render();
+      return true;
+    }
+    if (this.state.driveModal?.open && !this.state.driveModal?.loading) {
+      this.state.driveModal.open = false;
+      this.render();
+      return true;
+    }
+    if (this.state.devicesModalOpen) {
+      this.state.devicesModalOpen = false;
+      this.render();
+      return true;
+    }
+    if (this.state.settingsModalOpen) {
+      this.state.settingsModalOpen = false;
+      this.render();
+      return true;
+    }
+    if (this.state.podcastModal?.open) {
+      this.closePodcastModal();
+      return true;
+    }
+    if (this.state.profileOpen) {
+      this.state.profileOpen = false;
+      this.render();
+      return true;
+    }
+    if (this.state.shadeOpen) {
+      this.state.shadeOpen = false;
+      this.render();
+      return true;
+    }
+    if (this.state.mobileSheetOpen) {
+      this.state.mobileSheetOpen = false;
+      this.render();
+      return true;
+    }
+    if (this.state.layoutMode === 'desktop' && this.state.desktopView === 'detail') {
+      this.state.desktopView = 'home';
+      this.state.detailBookKey = null;
+      this.render();
+      return true;
+    }
+
+    const now = Date.now();
+    if (this._lastBackPressAt && now - this._lastBackPressAt < 2000) {
+      this._lastBackPressAt = 0;
+      return false;
+    }
+    this._lastBackPressAt = now;
+    this.showStatusToast('Press back again to exit', 'info');
+    return true;
   }
 
   getActiveBook() {
@@ -2096,18 +2420,18 @@ class AudiobookApp {
 
   getFilteredBooks() {
     const q = (this.state.searchQuery || '').trim().toLowerCase();
+    const filter = this.state.filterSource || 'audiobooks';
     return this.state.books.filter((book) => {
       const isPodcast = Boolean(book?.isPodcast || book?.sources?.includes('podcast'));
-      if (this.state.filterSource === 'podcasts' && !isPodcast) return false;
-      if (this.state.filterSource === 'local' && !book.sources?.includes('local')) return false;
-      if (this.state.filterSource === 'drive' && !book.sources?.includes('drive')) return false;
-      if (this.state.filterSource === 'downloaded') {
-        const hasOfflineEp =
-          book.hasOfflineEpisodes ||
-          (Array.isArray(book.chapters) && book.chapters.some((c) => Boolean(c?.offlineCached)));
-        if (!book.isOffline && !book.offlineCached && !hasOfflineEp) {
+      if (filter === 'podcasts') {
+        if (!isPodcast) return false;
+      } else if (filter === 'downloaded') {
+        if (!this._isBookSavedOffline(book)) {
           return false;
         }
+      } else {
+        // 'audiobooks' (default), and back-compat 'all' / 'local' / 'drive': show all audiobooks (local + Drive combined)
+        if (isPodcast) return false;
       }
       if (q) {
         const epTitles = isPodcast
@@ -2189,11 +2513,11 @@ class AudiobookApp {
       this._showRemoteLocalOnlyNotice(book);
       return;
     }
+    const seq = (this._selectBookSeq = (this._selectBookSeq || 0) + 1);
     const prevActiveKey = this.state.activeBookKey;
     this.state.activeBookKey = book.bookKey;
-    const franchiseKey = this._getBookSeriesKey(book);
-    if (franchiseKey) {
-      this.state.expandedSeries.add(franchiseKey);
+    if (!options?.skipDeviceSync) {
+      this._lastLocalPlayAt = Date.now();
     }
     try {
       localStorage.setItem(STORAGE_ACTIVE_BOOK_KEY, book.bookKey);
@@ -2201,9 +2525,14 @@ class AudiobookApp {
       // ignore
     }
 
-    await this.audioEngine.loadBook(book, book.positionSec || 0);
-    this.state.snapshot = this.audioEngine.getSnapshot();
     this._updateAmbientColor(book.accentHex);
+    if (!options?.skipImmediateRender && prevActiveKey !== book.bookKey) {
+      this.render();
+    }
+
+    await this.audioEngine.loadBook(book, book.positionSec || 0);
+    if (seq !== this._selectBookSeq) return;
+    this.state.snapshot = this.audioEngine.getSnapshot();
     this._syncMediaSessionMetadata();
 
     if (autoPlay) {
@@ -2212,6 +2541,7 @@ class AudiobookApp {
         this.state.remotePlaybackPrompt = null;
       }
       await this.audioEngine.play();
+      if (seq !== this._selectBookSeq) return;
       this.state.snapshot = this.audioEngine.getSnapshot();
       this.syncService.broadcastPlaybackState({
         isPlaying: true,
@@ -2563,20 +2893,28 @@ class AudiobookApp {
     );
   }
 
-  async openPodcastModal(initialQuery = '', categoryId = '') {
+  async openSearchModal(initialQuery = '', searchFilter = '', categoryId = '') {
     const cleanQuery = String(initialQuery || '').trim();
     const defaultCat = PODCAST_CATEGORIES?.[0]?.id || 'trending';
     const activeCategory =
       String(categoryId || '').trim() ||
       this.state.podcastModal?.activeCategory ||
       defaultCat;
+    const resolvedFilter =
+      searchFilter === 'audiobooks' || searchFilter === 'podcasts' || searchFilter === 'all'
+        ? searchFilter
+        : categoryId
+          ? 'podcasts'
+          : this.state.podcastModal?.searchFilter || 'all';
     this.state.profileOpen = false;
+    this.state.contextMenu = null;
     this.state.podcastModal = {
       ...this.state.podcastModal,
       open: true,
       query: cleanQuery,
+      searchFilter: resolvedFilter,
       activeCategory,
-      loading: true,
+      loading: resolvedFilter !== 'audiobooks',
       subscribingId: '',
       error: '',
       results:
@@ -2587,10 +2925,30 @@ class AudiobookApp {
             : []
     };
     this.render();
+    if (resolvedFilter === 'audiobooks') {
+      return;
+    }
     if (cleanQuery) {
       await this.runPodcastSearch(cleanQuery);
     } else {
       await this.selectPodcastCategory(activeCategory);
+    }
+  }
+
+  async openPodcastModal(initialQuery = '', categoryId = '') {
+    return this.openSearchModal(initialQuery, 'podcasts', categoryId);
+  }
+
+  setSearchFilter(filter = 'all') {
+    const clean = filter === 'audiobooks' || filter === 'podcasts' ? filter : 'all';
+    this.state.podcastModal.searchFilter = clean;
+    this.render();
+    if (
+      clean !== 'audiobooks' &&
+      this.state.podcastModal.query &&
+      (!Array.isArray(this.state.podcastModal.results) || this.state.podcastModal.results.length === 0)
+    ) {
+      void this.runPodcastSearch(this.state.podcastModal.query);
     }
   }
 
@@ -2618,6 +2976,12 @@ class AudiobookApp {
     this.state.podcastModal.query = '';
     this.state.podcastModal.error = '';
     this.state.podcastModal.loading = true;
+    const inputEl =
+      this.rootEl?.querySelector?.('#podcastSearchInput') ||
+      (typeof document !== 'undefined' ? document.getElementById('podcastSearchInput') : null);
+    if (inputEl && inputEl.value) {
+      inputEl.value = '';
+    }
     this.render();
 
     const reqId = (this._podcastSearchReqId = (this._podcastSearchReqId || 0) + 1);
@@ -2632,6 +2996,11 @@ class AudiobookApp {
     const clean = String(query ?? '').trim();
     this.state.podcastModal.query = clean;
     this.state.podcastModal.error = '';
+    if (this.state.podcastModal.searchFilter === 'audiobooks') {
+      this.state.podcastModal.loading = false;
+      this.render();
+      return;
+    }
     if (!clean) {
       await this.selectPodcastCategory(this.state.podcastModal.activeCategory || 'trending');
       return;
@@ -2645,6 +3014,169 @@ class AudiobookApp {
     this.state.podcastModal.loading = false;
     this.state.podcastModal.results = Array.isArray(results) ? results : [];
     this.render();
+  }
+
+  openContextMenuForTarget(target, { x = 0, y = 0, fromTouch = false } = {}) {
+    if (!target) return;
+    if (target.attr === 'data-series') {
+      const seriesKey = target.value;
+      const grouped = this._groupBooksByFranchise(this.getFilteredBooks());
+      const entry = grouped.find((e) => e.type === 'franchise' && e.seriesKey === seriesKey);
+      const firstBook = entry?.books?.[0] || null;
+      this.state.contextMenu = {
+        targetType: 'series',
+        seriesKey,
+        bookKey: firstBook?.bookKey || '',
+        title: entry?.seriesName || seriesKey,
+        subtitle: entry ? `${entry.books.length} books` : 'Series',
+        isExpanded: this.state.expandedSeries.has(seriesKey),
+        x,
+        y,
+        fromTouch
+      };
+      this.render();
+      return;
+    }
+
+    const bookKey = target.value;
+    const book = this.books.find((b) => b.bookKey === bookKey);
+    if (!book) return;
+    const isPodcast = Boolean(book.isPodcast || book.sources?.includes('podcast'));
+    this.state.contextMenu = {
+      targetType: isPodcast ? 'podcast' : 'audiobook',
+      bookKey: book.bookKey,
+      seriesKey: '',
+      title: book.title || 'Untitled',
+      subtitle: book.author || (isPodcast ? 'Podcast' : 'Audiobook'),
+      x,
+      y,
+      fromTouch
+    };
+    this.render();
+  }
+
+  closeContextMenu() {
+    if (!this.state.contextMenu) return;
+    this.state.contextMenu = null;
+    this.render();
+  }
+
+  async markPodcastAllPlayed(bookKey) {
+    const book = this.books.find((b) => b.bookKey === bookKey);
+    if (!book) return;
+    const nowIso = new Date().toISOString();
+    if (!book.episodeProgress || typeof book.episodeProgress !== 'object') {
+      book.episodeProgress = {};
+    }
+    const chapters = Array.isArray(book.chapters) ? book.chapters : [];
+    for (let i = 0; i < chapters.length; i += 1) {
+      const ch = chapters[i];
+      const epId = ch?.episodeId || `${book.bookKey}::${i}`;
+      const dur = Math.max(1, Number(ch?.durationSec || 1800));
+      book.episodeProgress[epId] = {
+        positionSec: Math.round(dur),
+        durationSec: Math.round(dur),
+        completed: true,
+        updatedAt: nowIso
+      };
+    }
+    this._persistBooks();
+    if (this._hasCloudSyncAuth()) {
+      void this._syncLibraryToCloud([book]);
+    }
+    this.showStatusToast(`Marked all episodes of ${book.title} as played`);
+  }
+
+  async markBookFinished(bookKey) {
+    const book = this.books.find((b) => b.bookKey === bookKey);
+    if (!book) return;
+    const total = Math.max(1, Number(book.totalDurationSec || 0));
+    const lastChIdx = Math.max(0, (book.chapters?.length || 1) - 1);
+    book.completed = true;
+    book.positionSec = total;
+    book.chapterIndex = lastChIdx;
+    if (this.state.activeBookKey === bookKey && this.audioEngine) {
+      this.audioEngine.pause?.();
+      this.audioEngine.seekToSeconds?.(total);
+      this.state.snapshot = this.audioEngine.getSnapshot();
+    }
+    const checkpoint = {
+      bookKey: book.bookKey,
+      chapterIndex: lastChIdx,
+      positionSec: Math.round(total),
+      durationSec: Math.round(total),
+      completed: true,
+      clientUpdatedAt: new Date().toISOString()
+    };
+    this._persistBooks();
+    this.offlineQueue.saveLocalProgress(book.bookKey, checkpoint);
+    if (this._hasCloudSyncAuth()) {
+      void this.syncService.pushProgress(checkpoint).catch(() => null);
+    }
+    this.showStatusToast(`Marked ${book.title} as finished`);
+  }
+
+  async resetBookProgress(bookKey) {
+    const book = this.books.find((b) => b.bookKey === bookKey);
+    if (!book) return;
+    book.completed = false;
+    book.positionSec = 0;
+    book.chapterIndex = 0;
+    if (this.state.activeBookKey === bookKey && this.audioEngine) {
+      this.audioEngine.seekToSeconds?.(0);
+      this.state.snapshot = this.audioEngine.getSnapshot();
+    }
+    const checkpoint = {
+      bookKey: book.bookKey,
+      chapterIndex: 0,
+      positionSec: 0,
+      durationSec: Math.round(Number(book.totalDurationSec || 0)),
+      completed: false,
+      clientUpdatedAt: new Date().toISOString()
+    };
+    this._persistBooks();
+    this.offlineQueue.saveLocalProgress(book.bookKey, checkpoint);
+    if (this._hasCloudSyncAuth()) {
+      void this.syncService.pushProgress(checkpoint).catch(() => null);
+    }
+    this.showStatusToast(`Reset progress for ${book.title}`);
+  }
+
+  async removeBookFromLibrary(bookKey) {
+    const target = this.books.find((b) => b.bookKey === bookKey);
+    if (!target) return;
+    if (target.isPodcast || target.sources?.includes('podcast')) {
+      return this.unsubscribePodcast(bookKey);
+    }
+    if (target.offlineCached || typeof this.audioEngine?.removeOfflineCopy === 'function') {
+      await this.audioEngine?.removeOfflineCopy?.(target).catch(() => null);
+    }
+    this.books = this.books.filter((b) => b.bookKey !== bookKey);
+    if (this.state.detailBookKey === bookKey) {
+      this.state.detailBookKey = this.books[0]?.bookKey || null;
+      if (this.state.desktopView === 'detail') {
+        this.state.desktopView = 'home';
+      }
+    }
+    if (this.state.activeBookKey === bookKey) {
+      try {
+        this.audioEngine?.pause?.();
+      } catch {
+        // ignore
+      }
+      this.state.activeBookKey = this.books[0]?.bookKey || null;
+      this.state.mobileSheetOpen = false;
+      if (this.state.activeBookKey) {
+        await this.selectBook(this.state.activeBookKey, false);
+      } else if (this.audioEngine) {
+        this.audioEngine.currentBook = null;
+      }
+    }
+    this._persistBooks();
+    if (this._hasCloudSyncAuth() && typeof this.syncService?.deleteLibraryItems === 'function') {
+      void this.syncService.deleteLibraryItems([bookKey]).catch(() => null);
+    }
+    this.showStatusToast(`Removed ${target.title} from library`);
   }
 
   async handleSubscribePodcast(indexOrChoice) {
@@ -2662,7 +3194,9 @@ class AudiobookApp {
       this.state.podcastModal.open = false;
       this.state.podcastModal.subscribingId = '';
       this.state.detailBookKey = existing.bookKey;
-      this.state.desktopView = 'detail';
+      if (!this._isAndroidOrMobileViewport()) {
+        this.state.desktopView = 'detail';
+      }
       await this.selectBook(existing.bookKey, false);
       if (this._isAndroidOrMobileViewport()) {
         this.state.mobileSheetOpen = true;
@@ -2696,7 +3230,9 @@ class AudiobookApp {
       this.state.podcastModal.open = false;
       this.state.podcastModal.subscribingId = '';
       this.state.detailBookKey = podcastBook.bookKey;
-      this.state.desktopView = 'detail';
+      if (!this._isAndroidOrMobileViewport()) {
+        this.state.desktopView = 'detail';
+      }
       await this.selectBook(podcastBook.bookKey, false);
       if (this._isAndroidOrMobileViewport()) {
         this.state.mobileSheetOpen = true;
@@ -3276,7 +3812,7 @@ class AudiobookApp {
       }
 
       if (nextBooks.length > 0 && !this.state.activeBookKey) {
-        await this.selectBook(nextBooks[0].bookKey, false);
+        await this.selectBook(nextBooks[0].bookKey, false, { skipImmediateRender: true });
       } else if (nextBooks.length === 0) {
         if (this.audioEngine) {
           this.audioEngine.currentBook = null;
@@ -3453,7 +3989,6 @@ class AudiobookApp {
 
       if (!this._seenSeriesKeys.has(group.seriesKey)) {
         this._seenSeriesKeys.add(group.seriesKey);
-        this.state.expandedSeries.add(group.seriesKey);
       }
     }
 
@@ -3502,11 +4037,123 @@ class AudiobookApp {
     this.render();
   }
 
-  async runGoogleDriveSync(folderIdInput = '', tokenInput = '') {
+  async _maybeRunAutoDriveSync({ force = false } = {}) {
+    if (this._destroyed) return false;
+    if (this.state.autoDriveSyncEnabled === false) return false;
+    if (!this._hasGoogleDriveToken()) return false;
+    if (this.state.driveModal?.loading || this.state.syncProgress?.active) return false;
+
+    const savedFolderId = this._getSavedDriveFolderId();
+    if (!savedFolderId && this.books.length > 0) return false;
+    const now = Date.now();
+    if (!force && this._lastAutoDriveSyncAt && now - this._lastAutoDriveSyncAt < AUTO_DRIVE_SYNC_INTERVAL_MS) {
+      return false;
+    }
+
+    this._lastAutoDriveSyncAt = now;
+    await this.runGoogleDriveSync(savedFolderId || 'root', { silent: true });
+    return true;
+  }
+
+  async confirmDriveRemovals() {
+    const removals = Array.isArray(this.state.pendingDriveRemovals)
+      ? [...this.state.pendingDriveRemovals]
+      : [];
+    this.state.pendingDriveRemovals = [];
+    if (removals.length === 0) {
+      this.render();
+      return;
+    }
+
+    const removedKeys = new Set(removals.map((b) => b.bookKey));
+    const deletedKeys = [];
+    const updatedHybrid = [];
+    const nextBooks = [];
+
+    for (const book of this.books) {
+      if (!removedKeys.has(book.bookKey)) {
+        nextBooks.push(book);
+        continue;
+      }
+      const sources = Array.isArray(book.sources) ? book.sources : [];
+      if (sources.includes('local')) {
+        const stripped = {
+          ...book,
+          sources: sources.filter((s) => s !== 'drive'),
+          preferredPlaybackSource: 'local',
+          driveFileId: null,
+          driveStreamUrl: '',
+          streamUrl: ''
+        };
+        updatedHybrid.push(stripped);
+        nextBooks.push(stripped);
+      } else {
+        deletedKeys.push(book.bookKey);
+        if (book.offlineCached || typeof this.audioEngine?.removeOfflineCopy === 'function') {
+          await this.audioEngine?.removeOfflineCopy?.(book).catch(() => null);
+        }
+      }
+    }
+
+    this.books = nextBooks;
+    if (this.state.detailBookKey && deletedKeys.includes(this.state.detailBookKey)) {
+      this.state.detailBookKey = this.books[0]?.bookKey || null;
+      if (this.state.desktopView === 'detail') this.state.desktopView = 'home';
+    }
+    if (this.state.activeBookKey && deletedKeys.includes(this.state.activeBookKey)) {
+      this.audioEngine?.pause?.();
+      this.state.activeBookKey = this.books[0]?.bookKey || null;
+      this.state.mobileSheetOpen = false;
+      if (this.state.activeBookKey) {
+        await this.selectBook(this.state.activeBookKey, false);
+      } else if (this.audioEngine) {
+        this.audioEngine.currentBook = null;
+      }
+    }
+
+    this._persistBooks();
+    if (this._hasCloudSyncAuth()) {
+      if (deletedKeys.length > 0) {
+        void this.syncService.deleteLibraryItems?.(deletedKeys).catch(() => null);
+      }
+      if (updatedHybrid.length > 0) {
+        void this._syncLibraryToCloud(updatedHybrid);
+      }
+    }
+    this.showStatusToast(
+      `Removed ${removals.length} deleted Drive audiobook${removals.length === 1 ? '' : 's'}`
+    );
+  }
+
+  dismissDriveRemovals() {
+    const removals = Array.isArray(this.state.pendingDriveRemovals)
+      ? this.state.pendingDriveRemovals
+      : [];
+    if (!this._dismissedDriveRemovalKeys) this._dismissedDriveRemovalKeys = new Set();
+    for (const b of removals) {
+      if (b?.bookKey) {
+        this._dismissedDriveRemovalKeys.add(b.bookKey);
+      }
+    }
+    this.state.pendingDriveRemovals = [];
+    this.render();
+  }
+
+  async runGoogleDriveSync(folderIdInput = '', tokenOrOptions = '', maybeOptions = {}) {
     if (this.state.driveModal.loading) return;
+    const options =
+      tokenOrOptions && typeof tokenOrOptions === 'object'
+        ? tokenOrOptions
+        : maybeOptions && typeof maybeOptions === 'object'
+          ? maybeOptions
+          : {};
+    const tokenInput = typeof tokenOrOptions === 'string' ? tokenOrOptions : '';
+    const silent = Boolean(options.silent);
+
     const cleanToken = (tokenInput || this.syncService.getGoogleAccessToken() || '').trim();
     const cleanFolderId = (folderIdInput || '').trim();
     if (!cleanToken) {
+      if (silent) return;
       const msg = 'Your Google Drive session is not connected. Click Continue with Google to authorize Drive.';
       this.state.driveModal = {
         ...this.state.driveModal,
@@ -3518,7 +4165,7 @@ class AudiobookApp {
 
     this.syncService.setGoogleAccessToken(cleanToken);
     this.audioEngine.setDriveAccessToken(cleanToken);
-    if (cleanFolderId) {
+    if (cleanFolderId && cleanFolderId !== 'root') {
       this._saveDriveFolderId(cleanFolderId);
       if (this._hasCloudSyncAuth()) {
         void this.syncService.syncDriveFolderConfig?.({ folderId: cleanFolderId }).catch(() => null);
@@ -3529,65 +4176,120 @@ class AudiobookApp {
     this.state.driveModal = {
       ...this.state.driveModal,
       token: cleanToken,
-      folderId: cleanFolderId,
+      folderId: cleanFolderId && cleanFolderId !== 'root' ? cleanFolderId : this.state.driveModal.folderId,
       loading: true,
       error: ''
     };
-    this.state.syncProgress = {
-      active: true,
-      phase: 'drive',
-      percent: 5,
-      currentFolder: 'Connecting to Google Drive...',
-      scannedFolders: 0,
-      discoveredFolders: 1,
-      booksFound: 0
-    };
-    this.render();
+    if (!silent) {
+      this.state.syncProgress = {
+        active: true,
+        phase: 'drive',
+        percent: 5,
+        currentFolder: 'Connecting to Google Drive...',
+        scannedFolders: 0,
+        discoveredFolders: 1,
+        booksFound: 0
+      };
+      this.render();
+    }
 
     try {
       const driveBooks = await scanGoogleDriveFolder(cleanToken, cleanFolderId, undefined, {
         signal: this._syncAbortController?.signal,
         timeoutMs: 15000,
         concurrency: 4,
-        onProgress: (p) => this._updateSyncProgress(p)
+        onProgress: silent ? undefined : (p) => this._updateSyncProgress(p)
       });
       this.state.syncProgress.active = false;
       this._syncAbortController = null;
+      this._lastAutoDriveSyncAt = Date.now();
 
-      if (driveBooks.length > 0) {
-        const normalizedDriveBooks = driveBooks.map((b) =>
-          this._normalizeBookRecord({
-            ...b,
-            ...(cleanFolderId ? { driveFolderId: cleanFolderId } : {})
-          })
+      const normalizedDriveBooks = (Array.isArray(driveBooks) ? driveBooks : []).map((b) =>
+        this._normalizeBookRecord({
+          ...b,
+          ...(cleanFolderId && cleanFolderId !== 'root' ? { driveFolderId: cleanFolderId } : {})
+        })
+      );
+
+      if (normalizedDriveBooks.length > 0 || this.books.some((b) => b?.sources?.includes('drive'))) {
+        const diff = diffDriveLibrarySync(
+          this.books,
+          normalizedDriveBooks,
+          cleanFolderId && cleanFolderId !== 'root' ? cleanFolderId : ''
         );
-        this.books = this._mergeSyncedBooks(this.books, normalizedDriveBooks);
+        const mergedBase = Array.isArray(diff?.mergedNonRemovedBooks)
+          ? diff.mergedNonRemovedBooks.map((b) => this._normalizeBookRecord(b))
+          : this._mergeSyncedBooks(this.books, normalizedDriveBooks);
+        const removedDriveBooks = Array.isArray(diff?.removedDriveBooks)
+          ? diff.removedDriveBooks
+          : [];
+        const addedBooks = Array.isArray(diff?.addedBooks) ? diff.addedBooks : [];
+
+        // If a previously kept book reappears in Drive, clear it from dismissed keys
+        if (this._dismissedDriveRemovalKeys?.size) {
+          for (const mb of mergedBase) {
+            if (mb?.bookKey && mb.sources?.includes('drive')) {
+              this._dismissedDriveRemovalKeys.delete(mb.bookKey);
+            }
+          }
+        }
+
+        const unacknowledgedRemovals = removedDriveBooks.filter(
+          (b) => b?.bookKey && !this._dismissedDriveRemovalKeys?.has(b.bookKey)
+        );
+
+        // Keep removedDriveBooks in library non-destructively until user confirms prompt
+        const combinedNext = [...mergedBase];
+        const existingKeys = new Set(combinedNext.map((b) => b.bookKey));
+        for (const rb of removedDriveBooks) {
+          if (rb && !existingKeys.has(rb.bookKey)) {
+            combinedNext.push(rb);
+            existingKeys.add(rb.bookKey);
+          }
+        }
+
+        this.books = combinedNext;
         this._persistBooks();
         this.state.driveModal.open = false;
         this.state.driveModal.loading = false;
-        if (!this.state.activeBookKey) {
-          await this.selectBook(normalizedDriveBooks[0].bookKey, false, { skipDeviceSync: true });
+
+        if (unacknowledgedRemovals.length > 0) {
+          this.state.pendingDriveRemovals = unacknowledgedRemovals;
+        }
+
+        if (!this.state.activeBookKey && this.books.length > 0) {
+          await this.selectBook(this.books[0].bookKey, false, { skipDeviceSync: true });
         } else {
           this.render();
         }
         if (this._hasCloudSyncAuth()) {
           await this._syncLibraryToCloud(this.books);
-          if (cleanFolderId) {
+          if (cleanFolderId && cleanFolderId !== 'root') {
             await this.syncService.syncDriveFolderConfig?.({ folderId: cleanFolderId }).catch(() => null);
           }
           await this._syncCurrentDevicePlaybackState();
         }
-        void this._runBackgroundMetadataEnrichment();
+        if (addedBooks.length > 0 || !silent) {
+          void this._runBackgroundMetadataEnrichment();
+        }
+        if (silent && addedBooks.length > 0) {
+          this.showStatusToast(
+            `Synced ${addedBooks.length} new audiobook${addedBooks.length === 1 ? '' : 's'} from Google Drive`
+          );
+        }
       } else {
         this.state.driveModal.loading = false;
-        const emptyMsg = 'No audio files (.m4b, .mp3, .m4a, .ogg, .flac) were found in that Google Drive folder or its subfolders.';
-        this.state.driveModal.error = emptyMsg;
-        this.showError('No Audiobooks Found', emptyMsg);
+        if (!silent) {
+          const emptyMsg = 'No audio files (.m4b, .mp3, .m4a, .ogg, .flac) were found in that Google Drive folder or its subfolders.';
+          this.state.driveModal.error = emptyMsg;
+          this.showError('No Audiobooks Found', emptyMsg);
+        }
       }
     } catch (err) {
       this.state.syncProgress.active = false;
       this.state.driveModal.loading = false;
       this._syncAbortController = null;
+      if (silent) return;
       if (err?.name === 'AbortError') {
         this.state.driveModal.error = 'Sync cancelled.';
         this.render();
@@ -3784,6 +4486,10 @@ class AudiobookApp {
     this.state.activeBookKey = null;
     this.state.detailBookKey = null;
     this.state.profileOpen = false;
+    this.state.settingsModalOpen = false;
+    this.state.contextMenu = null;
+    this.state.pendingDriveRemovals = [];
+    this._dismissedDriveRemovalKeys?.clear?.();
     this.state.driveModal.open = false;
     this.state.coverModal.open = false;
     this.state.desktopView = 'home';
@@ -3961,7 +4667,7 @@ class AudiobookApp {
             installing = false;
             statusText =
               evt.message ||
-              'Allow Install unknown apps for Audiobook Player, then tap Update Now again.';
+              'Allow Install unknown apps for MultiPlayer, then tap Update Now again.';
           } else if (status === 'error') {
             this._clearAndroidUpdateReturnListener();
             installing = false;
@@ -3990,7 +4696,7 @@ class AudiobookApp {
           installing: false,
           statusText:
             res.message ||
-            'Allow Install unknown apps for Audiobook Player, then tap Update Now again.'
+            'Allow Install unknown apps for MultiPlayer, then tap Update Now again.'
         };
         this.render();
         return;
@@ -4104,44 +4810,33 @@ class AudiobookApp {
     this.render();
   }
 
-  _renderSourceBadges(book, size = 14) {
-    const sources = book?.sources || [];
-    const badges = [];
-    if (this._isRemoteLocalOnlyBook(book)) {
-      const originLabel = book?.originDeviceName || 'Other Device';
-      badges.push(
-        `<span class="device-origin-badge truncate" title="Local audio stored on ${escapeHtml(originLabel)}">On ${escapeHtml(originLabel)}</span>`
-      );
-      return badges.join('');
-    }
-    if (book?.isPodcast || sources.includes('podcast')) {
-      badges.push(`<span class="inline-flex items-center shrink-0" title="Podcast">${FLUENT_3D_PODCAST(size)}</span>`);
-    }
-    if (sources.includes('local')) {
-      badges.push(`<span class="inline-flex items-center shrink-0" title="Local">${FLUENT_3D_FOLDER(size)}</span>`);
-    }
-    if (sources.includes('drive')) {
-      badges.push(`<span class="inline-flex items-center shrink-0" title="Drive">${FLUENT_3D_CLOUD(size)}</span>`);
-    }
-    return badges.join('');
+  _renderSourceBadges(_book, _size = 14) {
+    return '';
+  }
+
+  _renderRemoteOriginBadge(book) {
+    if (!this._isRemoteLocalOnlyBook(book)) return '';
+    const originLabel = book?.originDeviceName || 'Other Device';
+    return `<span class="device-origin-badge truncate" title="Local audio stored on ${escapeHtml(originLabel)}">On ${escapeHtml(originLabel)}</span>`;
+  }
+
+  _isBookSavedOffline(book) {
+    if (!book || this._isRemoteLocalOnlyBook(book)) return false;
+    const hasOfflineEp = Boolean(
+      book.hasOfflineEpisodes ||
+        (Array.isArray(book.chapters) && book.chapters.some((c) => Boolean(c?.offlineCached))) ||
+        (book.isPodcast &&
+          book.offlineEpisodes &&
+          Object.values(book.offlineEpisodes).some(Boolean))
+    );
+    return Boolean(book.isOffline || book.offlineCached || hasOfflineEp);
   }
 
   _renderDownloadedIcon(book, size = 14) {
-    if (this._isRemoteLocalOnlyBook(book)) {
+    if (!this._isBookSavedOffline(book)) {
       return '';
     }
-    const hasOfflineEp =
-      book?.hasOfflineEpisodes ||
-      (Array.isArray(book?.chapters) && book.chapters.some((c) => Boolean(c?.offlineCached)));
-    if (
-      book?.isOffline ||
-      book?.offlineCached ||
-      hasOfflineEp ||
-      book?.sources?.includes('local')
-    ) {
-      return `<span class="inline-flex items-center shrink-0">${ICON_DOWNLOADED(size)}</span>`;
-    }
-    return '';
+    return `<span class="inline-flex items-center shrink-0" data-offline-saved="true" title="Saved offline">${ICON_OFFLINE_CHECK(size)}</span>`;
   }
 
   _renderCoverImg(book, classes = 'w-full h-full object-cover', extra = '') {
@@ -4187,13 +4882,11 @@ class AudiobookApp {
     if (!this.state.profileOpen) return '';
     const user = this.getUserAccount();
     if (!user) return '';
-    const activeBook = this.getActiveBook();
     const {
       theme,
       activeOutputDevice,
       activeOutputDeviceId,
-      audioOutputs,
-      enrichingBookKey
+      audioOutputs
     } = this.state;
 
     return `
@@ -4236,39 +4929,6 @@ class AudiobookApp {
         </div>
 
         <div class="py-2 border-b border-[var(--border-subtle)] space-y-0.5">
-          ${
-            activeBook
-              ? `<button data-action="open-cover-search" data-book="${escapeHtml(activeBook.bookKey)}" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-                  <span class="truncate">Search Cover Images</span>
-                </button>
-                <button data-action="auto-match-tags" data-book="${escapeHtml(activeBook.bookKey)}" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-                  <span class="truncate">${enrichingBookKey ? 'Matching...' : 'Auto-Match Tags'}</span>
-                </button>`
-              : ''
-          }
-          <button data-action="trigger-local-folder" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            <span class="truncate">${this._isAndroidOrMobileViewport() ? 'Add Local Folder / Files' : 'Add Local Folder'}</span>
-          </button>
-          <button data-action="trigger-local-files" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            <span class="truncate">Add Audio Files</span>
-          </button>
-          <button data-action="connect-drive" class="btn-press w-full flex items-center justify-between px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            <span class="truncate">Sync Google Drive</span>
-          </button>
-          <button data-action="open-podcast-modal" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            <span class="inline-flex items-center gap-2 truncate">
-              ${FLUENT_3D_PODCAST(14)}
-              <span>Find Podcasts</span>
-            </span>
-          </button>
-          ${
-            this._getDriveSyncedBooksStats().totalDriveCount > 0
-              ? `<button data-action="open-wipe-synced-modal" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-red-500/10 text-left text-xs font-medium text-red-300">
-                  <span class="truncate">Wipe Synced Files</span>
-                  ${ICON_TRASH(13, 'shrink-0')}
-                </button>`
-              : ''
-          }
           <button data-action="open-devices-modal" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span class="inline-flex items-center gap-2 truncate">
               ${ICON_DEVICES(14, 'text-[#1ed760] shrink-0')}
@@ -4276,9 +4936,16 @@ class AudiobookApp {
             </span>
             <span class="text-[11px] shrink-0 text-[var(--text-muted)]">${(this.state.devices || []).length || 1}</span>
           </button>
+          <button data-action="open-settings-modal" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+            <span class="inline-flex items-center gap-2 truncate">
+              ${ICON_SETTINGS(14, 'text-[#1ed760] shrink-0')}
+              <span>Settings</span>
+            </span>
+            <span class="text-[11px] shrink-0 text-[var(--text-muted)]">${ICON_CHEVRON('right', 13)}</span>
+          </button>
           <button data-action="toggle-theme" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span>Theme</span>
-            <span class="text-[11px] font-semibold text-[#1ed760] shrink-0">${theme === 'pitch' ? 'Pitch' : 'Midnight'}</span>
+            <span class="text-[11px] font-semibold text-[#1ed760] shrink-0">${theme === 'amoled' ? 'True Black' : 'Pitch'}</span>
           </button>
           <button data-action="${this.state.updateState.updateAvailable ? 'install-update' : 'check-update'}" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span class="truncate">${
@@ -4311,6 +4978,216 @@ class AudiobookApp {
               : `<button data-action="login-google" class="btn-press w-full py-1.5 rounded-xl bg-[#1ed760] text-xs font-bold text-[#050506]">Continue with Google</button>
                  <button data-action="sign-out" class="btn-press w-full py-1.5 rounded-xl surface-card text-xs font-medium text-[var(--text-secondary)] hover:text-white">Return to Login</button>`
           }
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSettingsModal() {
+    if (!this.state.settingsModalOpen) return '';
+    const activeBook = this.getActiveBook();
+    const { theme, autoDriveSyncEnabled, advancedSettingsExpanded, enrichingBookKey } = this.state;
+    const driveStats = this._getDriveSyncedBooksStats();
+
+    return `
+      <div class="modal-backdrop fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="sheet-modal w-full max-w-md max-h-[85vh] rounded-3xl flex flex-col overflow-hidden">
+          <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
+            <div class="flex items-center gap-2 min-w-0">
+              ${ICON_SETTINGS(18, 'text-[#1ed760] shrink-0')}
+              <h2 class="text-base font-bold text-white truncate">Settings</h2>
+            </div>
+            <button type="button" data-action="close-settings-modal" aria-label="Close" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white">
+              ${ICON_CLOSE(18)}
+            </button>
+          </div>
+
+          <div class="flex-1 overflow-y-auto p-4 space-y-4">
+            <div class="surface-card rounded-2xl p-3.5 space-y-2.5">
+              <div class="text-xs font-bold text-white">Theme</div>
+              <div class="grid grid-cols-2 gap-2">
+                <button type="button" data-action="set-theme" data-theme="pitch" class="btn-press filter-pill px-3 py-2 rounded-xl text-xs font-semibold ${
+                  theme !== 'amoled'
+                    ? 'bg-[#1ed760] text-[#050506]'
+                    : 'surface-panel text-[var(--text-secondary)] hover:text-white'
+                }">Pitch</button>
+                <button type="button" data-action="set-theme" data-theme="amoled" class="btn-press filter-pill px-3 py-2 rounded-xl text-xs font-semibold ${
+                  theme === 'amoled'
+                    ? 'bg-[#1ed760] text-[#050506]'
+                    : 'surface-panel text-[var(--text-secondary)] hover:text-white'
+                }">True Black</button>
+              </div>
+            </div>
+
+            <div class="surface-card rounded-2xl p-3.5 flex items-center justify-between gap-3">
+              <div class="min-w-0">
+                <div class="text-xs font-bold text-white">Google Drive Auto-Sync</div>
+                <div class="text-[11px] text-[var(--text-secondary)]">Automatically scan your linked Drive folder for new or removed audiobooks</div>
+              </div>
+              <button type="button" data-action="toggle-auto-drive-sync" aria-pressed="${autoDriveSyncEnabled !== false ? 'true' : 'false'}" class="btn-press px-3 py-1.5 rounded-full text-xs font-bold shrink-0 ${
+                autoDriveSyncEnabled !== false
+                  ? 'bg-[#1ed760] text-[#050506]'
+                  : 'surface-panel text-[var(--text-secondary)] border border-[var(--border-subtle)]'
+              }">${autoDriveSyncEnabled !== false ? 'On' : 'Off'}</button>
+            </div>
+
+            <div class="surface-card rounded-2xl overflow-hidden">
+              <button type="button" data-action="toggle-advanced-settings" class="btn-press w-full px-3.5 py-3 flex items-center justify-between gap-2 text-left hover:bg-white/5">
+                <div class="min-w-0">
+                  <div class="text-xs font-bold text-white">Advanced Settings</div>
+                  <div class="text-[11px] text-[var(--text-secondary)]">Import folders, Drive sync, metadata tools &amp; storage</div>
+                </div>
+                <span class="text-[var(--text-secondary)] shrink-0">${ICON_CHEVRON(advancedSettingsExpanded ? 'down' : 'right', 15)}</span>
+              </button>
+              ${
+                advancedSettingsExpanded
+                  ? `<div class="px-2 pb-2 pt-1 border-t border-[var(--border-subtle)] space-y-1">
+                      <button type="button" data-action="trigger-local-folder" class="btn-press w-full flex items-center justify-between px-3 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+                        <span class="truncate">${this._isAndroidOrMobileViewport() ? 'Add Local Folder / Files' : 'Add Local Folder'}</span>
+                      </button>
+                      <button type="button" data-action="trigger-local-files" class="btn-press w-full flex items-center justify-between px-3 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+                        <span class="truncate">Add Audio Files</span>
+                      </button>
+                      <button type="button" data-action="connect-drive" class="btn-press w-full flex items-center justify-between px-3 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+                        <span class="truncate">Sync Google Drive</span>
+                      </button>
+                      <button type="button" data-action="open-cover-search" data-book="${escapeHtml(activeBook?.bookKey || '')}" ${activeBook ? '' : 'disabled'} class="btn-press w-full flex items-center justify-between px-3 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)] disabled:opacity-40">
+                        <span class="truncate">Search Cover Images</span>
+                      </button>
+                      <button type="button" data-action="auto-match-tags" data-book="${escapeHtml(activeBook?.bookKey || '')}" ${activeBook ? '' : 'disabled'} class="btn-press w-full flex items-center justify-between px-3 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)] disabled:opacity-40">
+                        <span class="truncate">${enrichingBookKey ? 'Matching...' : 'Auto-Match Tags'}</span>
+                      </button>
+                      <button type="button" data-action="open-wipe-synced-modal" class="btn-press w-full flex items-center justify-between gap-2 px-3 py-2 rounded-xl hover:bg-red-500/10 text-left text-xs font-medium text-red-300">
+                        <span class="truncate">Wipe Synced Files${driveStats.totalDriveCount > 0 ? ` (${driveStats.totalDriveCount})` : ''}</span>
+                        ${ICON_TRASH(13, 'shrink-0')}
+                      </button>
+                    </div>`
+                  : ''
+              }
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderContextMenuModal() {
+    const cm = this.state.contextMenu;
+    if (!cm) return '';
+    const book = cm.bookKey ? this.books.find((b) => b.bookKey === cm.bookKey) : null;
+    const isOffline = book ? this._isBookSavedOffline(book) : false;
+    const isMobileSheet = Boolean(cm.fromTouch || this.state.layoutMode === 'android');
+
+    let actionsHtml = '';
+    if (cm.targetType === 'podcast') {
+      actionsHtml = `
+        <button type="button" data-action="play-book" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-semibold text-white">Play / Resume</button>
+        <button type="button" data-action="refresh-podcast-feed" data-book-key="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Refresh Episodes</button>
+        <button type="button" data-action="mark-podcast-played" data-book-key="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Mark All as Played</button>
+        <button type="button" data-action="toggle-download" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">${isOffline ? 'Remove Offline' : 'Save Latest Offline'}</button>
+        <div class="my-1 border-t border-[var(--border-subtle)]"></div>
+        <button type="button" data-action="unsubscribe-podcast" data-book-key="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-red-500/15 text-left text-xs font-bold text-red-400">Unfollow Podcast</button>
+      `;
+    } else if (cm.targetType === 'series') {
+      actionsHtml = `
+        <button type="button" data-action="toggle-series-folder" data-series="${escapeHtml(cm.seriesKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-semibold text-white">${cm.isExpanded ? 'Collapse Series' : 'Expand Series'}</button>
+        ${
+          cm.bookKey
+            ? `<button type="button" data-action="auto-match-tags" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Auto-Match Tags</button>
+               <button type="button" data-action="open-cover-search" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Search Cover Image</button>`
+            : ''
+        }
+      `;
+    } else {
+      actionsHtml = `
+        <button type="button" data-action="play-book" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-semibold text-white">Play / Resume</button>
+        <button type="button" data-action="toggle-download" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">${isOffline ? 'Remove Offline Copy' : 'Save Offline'}</button>
+        <button type="button" data-action="mark-book-finished" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Mark as Finished</button>
+        <button type="button" data-action="reset-book-progress" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Reset Progress</button>
+        <button type="button" data-action="open-cover-search" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Search Cover Image</button>
+        <button type="button" data-action="auto-match-tags" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Auto-Match Tags</button>
+        <div class="my-1 border-t border-[var(--border-subtle)]"></div>
+        <button type="button" data-action="remove-book-library" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-red-500/15 text-left text-xs font-bold text-red-400">Remove from Library</button>
+      `;
+    }
+
+    if (isMobileSheet) {
+      return `
+        <div data-action="close-context-menu" class="modal-backdrop fixed inset-0 z-[75] bg-black/70 backdrop-blur-sm flex items-end justify-center p-3">
+          <div class="sheet-modal w-full max-w-md rounded-3xl overflow-hidden mobile-safe-bottom">
+            <div class="px-4 py-3.5 border-b border-[var(--border-subtle)] flex items-center justify-between gap-2">
+              <div class="min-w-0">
+                <div class="text-sm font-bold text-white truncate">${escapeHtml(cm.title)}</div>
+                <div class="text-[11px] text-[var(--text-secondary)] truncate">${escapeHtml(cm.subtitle || '')}</div>
+              </div>
+              <button type="button" data-action="close-context-menu" aria-label="Close" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white shrink-0">
+                ${ICON_CLOSE(16)}
+              </button>
+            </div>
+            <div class="p-2 space-y-0.5">${actionsHtml}</div>
+          </div>
+        </div>
+      `;
+    }
+
+    const winW = typeof window !== 'undefined' ? window.innerWidth || 1280 : 1280;
+    const winH = typeof window !== 'undefined' ? window.innerHeight || 720 : 720;
+    const left = Math.max(12, Math.min(winW - 248, Number(cm.x || 120)));
+    const top = Math.max(12, Math.min(winH - 320, Number(cm.y || 120)));
+
+    return `
+      <div data-action="close-context-menu" class="modal-backdrop fixed inset-0 z-[75] bg-black/25">
+        <div class="popover-menu fixed z-[76] w-60 rounded-2xl p-1.5 shadow-2xl" style="left:${Math.round(left)}px;top:${Math.round(top)}px;">
+          <div class="px-3 py-2 border-b border-[var(--border-subtle)] flex items-center justify-between gap-2">
+            <div class="min-w-0">
+              <div class="text-xs font-bold text-white truncate">${escapeHtml(cm.title)}</div>
+              <div class="text-[10px] text-[var(--text-secondary)] truncate">${escapeHtml(cm.subtitle || '')}</div>
+            </div>
+            <button type="button" data-action="close-context-menu" aria-label="Close" class="btn-press p-1 rounded-full hover:bg-white/10 text-[var(--text-muted)] hover:text-white shrink-0">
+              ${ICON_CLOSE(13)}
+            </button>
+          </div>
+          <div class="pt-1 space-y-0.5">${actionsHtml}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderDriveRemovalsModal() {
+    const removals = Array.isArray(this.state.pendingDriveRemovals)
+      ? this.state.pendingDriveRemovals
+      : [];
+    if (removals.length === 0) return '';
+    const count = removals.length;
+
+    return `
+      <div class="modal-backdrop fixed inset-0 z-[68] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="sheet-modal w-full max-w-md rounded-3xl overflow-hidden border border-amber-400/30">
+          <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
+            <h2 class="text-base font-bold text-white truncate">Files Removed from Google Drive</h2>
+            <button type="button" data-action="dismiss-drive-removals" aria-label="Close" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white">
+              ${ICON_CLOSE(18)}
+            </button>
+          </div>
+          <div class="p-5 space-y-4">
+            <p class="text-xs text-[var(--text-primary)] leading-relaxed">
+              ${count} audiobook${count === 1 ? '' : 's'} ${count === 1 ? 'was' : 'were'} removed from Google Drive. Do you want to remove ${count === 1 ? 'it' : 'them'} from your MultiPlayer library or keep ${count === 1 ? 'it' : 'them'}?
+            </p>
+            <div class="max-h-40 overflow-y-auto space-y-1.5 rounded-2xl bg-white/5 border border-[var(--border-subtle)] p-2.5">
+              ${removals
+                .map(
+                  (b) => `
+                <div class="text-xs text-white truncate px-1.5 py-1 rounded-lg bg-white/[0.03]">
+                  ${escapeHtml(b.title || b.bookKey)}
+                </div>`
+                )
+                .join('')}
+            </div>
+            <div class="flex items-center justify-end gap-2 pt-1">
+              <button type="button" data-action="dismiss-drive-removals" class="btn-press px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">Keep Files</button>
+              <button type="button" data-action="confirm-drive-removals" class="btn-press px-4 py-2 rounded-full bg-red-500 text-white text-xs font-bold hover:bg-red-400">Remove from Library</button>
+            </div>
+          </div>
         </div>
       </div>
     `;
@@ -4383,34 +5260,30 @@ class AudiobookApp {
   _renderContinueFromDeviceCard() {
     const prompt = this.state.remotePlaybackPrompt;
     if (!prompt || !prompt.device) return '';
-    const { device, book, title, chapterTitle, positionSec } = prompt;
+    const { device, book, title, positionSec } = prompt;
     const isLive = Boolean(device.isPlaying);
     const displayBook = book || { bookKey: prompt.bookKey, title, author: '' };
 
     return `
-      <div class="continue-device-card rounded-2xl p-3.5 flex items-center gap-3.5 min-w-0">
-        <div class="w-14 h-14 rounded-xl overflow-hidden shrink-0 shadow-lg">
+      <div class="continue-device-card rounded-xl flex items-center gap-2.5 min-w-0">
+        <div class="w-7 h-7 rounded-lg overflow-hidden shrink-0">
           ${this._renderCoverImg(displayBook)}
         </div>
-        <div class="min-w-0 flex-1 space-y-0.5">
-          <div class="flex items-center gap-2 min-w-0">
-            <span class="inline-flex items-center gap-1.5 text-[11px] font-bold ${isLive ? 'text-[#1ed760]' : 'text-[var(--text-secondary)]'}">
-              <span class="w-2 h-2 rounded-full ${isLive ? 'bg-[#1ed760] live-dot-pulse' : 'bg-[var(--text-muted)]'} shrink-0"></span>
-              <span>${isLive ? 'Playing now' : 'Last played'}</span>
-            </span>
-            <span class="text-[11px] text-[var(--text-muted)] truncate">on ${escapeHtml(device.deviceName)}</span>
-          </div>
-          <div class="text-sm font-bold text-white truncate">Continue from ${escapeHtml(device.deviceName)}</div>
-          <div class="text-xs text-[var(--text-secondary)] truncate">
-            ${escapeHtml(title)}${chapterTitle ? ` • ${escapeHtml(chapterTitle)}` : ''} • <span class="tabular-nums text-[#1ed760]">${formatClock(positionSec)}</span>
-          </div>
+        <span class="w-1.5 h-1.5 rounded-full ${isLive ? 'bg-[#1ed760] live-dot-pulse' : 'bg-[var(--text-muted)]'} shrink-0"></span>
+        <div class="min-w-0 flex-1 flex items-center gap-1.5 text-[11px] truncate">
+          <span class="font-semibold text-white shrink-0">Continue from ${escapeHtml(device.deviceName)}</span>
+          <span class="text-[var(--text-muted)] shrink-0">·</span>
+          <span class="text-[var(--text-secondary)] truncate">${escapeHtml(title)}</span>
+          <span class="tabular-nums text-[#1ed760] shrink-0">${formatClock(positionSec)}</span>
+          <span class="hidden sm:inline text-[10px] ${isLive ? 'text-[#1ed760]' : 'text-[var(--text-muted)]'} shrink-0">(${isLive ? 'Playing now' : 'Last played'})</span>
         </div>
-        <div class="flex items-center gap-1.5 shrink-0">
-          <button type="button" data-action="continue-remote-device" data-device-id="${escapeHtml(device.deviceId)}" class="btn-press px-3.5 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold whitespace-nowrap">
-            Continue Here
+        <div class="flex items-center gap-1 shrink-0">
+          <button type="button" data-action="continue-remote-device" data-device-id="${escapeHtml(device.deviceId)}" class="btn-press inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-[#1ed760] text-[#050506] text-[11px] font-bold whitespace-nowrap">
+            ${ICON_PLAY(11)}
+            <span>Play</span>
           </button>
-          <button type="button" data-action="dismiss-remote-prompt" aria-label="Dismiss" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-muted)] hover:text-white">
-            ${ICON_CLOSE(14)}
+          <button type="button" data-action="dismiss-remote-prompt" aria-label="Dismiss" class="btn-press p-1 rounded-full hover:bg-white/10 text-[var(--text-muted)] hover:text-white">
+            ${ICON_CLOSE(13)}
           </button>
         </div>
       </div>
@@ -4558,7 +5431,7 @@ class AudiobookApp {
               </svg>
             </div>
             <div class="space-y-1">
-              <h1 class="text-2xl font-bold tracking-tight text-white">Audiobook Player</h1>
+              <h1 class="text-2xl font-bold tracking-tight text-white">MultiPlayer</h1>
             </div>
           </div>
 
@@ -4636,9 +5509,9 @@ class AudiobookApp {
             <button data-action="connect-drive" class="btn-press px-4 py-2.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white text-xs font-semibold">
               Sync Google Drive
             </button>
-            <button data-action="open-podcast-modal" class="btn-press inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white text-xs font-semibold">
-              ${FLUENT_3D_PODCAST(14)}
-              <span>+ Find Podcasts</span>
+            <button data-action="open-search-modal" data-search-filter="podcasts" class="btn-press inline-flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white text-xs font-semibold">
+              ${ICON_SEARCH(14)}
+              <span>Search Podcasts</span>
             </button>
           </div>
         </div>
@@ -4853,7 +5726,7 @@ class AudiobookApp {
           <div class="flex items-center justify-between gap-2 min-w-0">
             <div class="flex items-center gap-2 min-w-0">
               <span class="w-4 h-4 rounded-full bg-white/15 text-[var(--text-secondary)] flex items-center justify-center shrink-0">${ICON_PLAY(9)}</span>
-              <span class="text-xs font-medium text-[var(--text-secondary)] truncate">Audiobook Player</span>
+              <span class="text-xs font-medium text-[var(--text-secondary)] truncate">MultiPlayer</span>
             </div>
             <button data-action="cycle-device" class="btn-press inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/10 text-[11px] font-medium text-white shrink-0 max-w-[165px]">
               ${ICON_SPEAKER(12, 'text-[#1ed760] shrink-0')}
@@ -4885,7 +5758,7 @@ class AudiobookApp {
         <div class="flex items-center justify-between gap-2 min-w-0">
           <div class="flex items-center gap-2 min-w-0">
             <span class="w-4 h-4 rounded-full bg-[#1ed760] text-[#050506] flex items-center justify-center shrink-0">${ICON_PLAY(9)}</span>
-            <span class="text-xs font-medium text-[var(--text-secondary)] truncate">Audiobook Player</span>
+            <span class="text-xs font-medium text-[var(--text-secondary)] truncate">MultiPlayer</span>
           </div>
           <button data-action="cycle-device" class="btn-press inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/10 text-[11px] font-medium text-white shrink-0 max-w-[165px]">
             ${ICON_SPEAKER(12, 'text-[#1ed760] shrink-0')}
@@ -4929,7 +5802,7 @@ class AudiobookApp {
         <main class="w-full min-h-screen flex flex-col items-center justify-center p-1 sm:p-4 bg-[var(--bg-canvas)]">
           <div class="relative w-[270px] h-[270px] rounded-full overflow-hidden surface-shell shadow-[0_24px_60px_rgba(0,0,0,0.75)] flex flex-col items-center justify-between text-center mx-auto p-6 select-none">
             <div data-testid="watchCoverBackdrop" class="watchCoverBackdrop absolute inset-0 pointer-events-none" style="background: radial-gradient(circle at 50% 35%, rgba(30,215,96,0.12) 0%, rgba(11,16,32,0.92) 60%, rgba(6,9,17,0.98) 100%);"></div>
-            <div class="relative z-10 mt-3 px-3 py-1 rounded-full bg-black/55 border border-white/10 text-xs font-semibold text-white">Audiobook Player</div>
+            <div class="relative z-10 mt-3 px-3 py-1 rounded-full bg-black/55 border border-white/10 text-xs font-semibold text-white">MultiPlayer</div>
             <div class="relative z-10 flex flex-col items-center gap-2 my-auto">
               <button disabled aria-label="Play or Pause" class="play-fab w-14 h-14 opacity-40 cursor-not-allowed">${ICON_PLAY(24)}</button>
               <span class="text-xs text-[var(--text-secondary)]">No audiobook playing</span>
@@ -5063,7 +5936,7 @@ class AudiobookApp {
     const isActive = activeBook?.bookKey === book.bookKey;
     const shownTitle = displayTitle || book.title;
     return `
-      <button data-action="open-detail" data-book="${escapeHtml(book.bookKey)}" class="btn-press w-full flex items-center gap-2.5 ${nested ? 'p-1.5 rounded-lg franchise-book-item' : 'p-2 rounded-xl'} text-left overflow-hidden min-w-0 ${
+      <button data-action="open-detail" data-book="${escapeHtml(book.bookKey)}" data-book-key="${escapeHtml(book.bookKey)}" class="library-context-target btn-press w-full flex items-center gap-2.5 ${nested ? 'p-1.5 rounded-lg franchise-book-item' : 'p-2 rounded-xl'} text-left overflow-hidden min-w-0 ${
         isActive ? 'bg-white/10' : 'hover:bg-white/5'
       }">
         <div class="${nested ? 'w-9 h-9' : 'w-11 h-11'} rounded-lg overflow-hidden shrink-0">
@@ -5081,7 +5954,7 @@ class AudiobookApp {
             <span class="truncate min-w-0">${escapeHtml(book.author)}</span>
           </div>
         </div>
-        <div class="flex items-center gap-1 shrink-0">${this._renderSourceBadges(book, 13)}</div>
+        <div class="flex items-center gap-1 shrink-0">${this._renderRemoteOriginBadge(book)}${this._renderSourceBadges(book, 13)}</div>
       </button>`;
   }
 
@@ -5089,7 +5962,7 @@ class AudiobookApp {
     const isActive = activeBook?.bookKey === book.bookKey;
     const shownTitle = displayTitle || book.title;
     return `
-      <div class="surface-card ${nested ? 'rounded-xl p-2 franchise-book-item' : 'rounded-2xl p-2.5'} flex items-center gap-3 overflow-hidden min-w-0 ${
+      <div data-book-key="${escapeHtml(book.bookKey)}" class="library-context-target surface-card ${nested ? 'rounded-xl p-2 franchise-book-item' : 'rounded-2xl p-2.5'} flex items-center gap-3 overflow-hidden min-w-0 ${
         isActive ? 'ring-1 ring-[#1ed760]/50' : ''
       }">
         <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="${nested ? 'w-11 h-11' : 'w-14 h-14'} rounded-xl overflow-hidden shrink-0">
@@ -5107,7 +5980,7 @@ class AudiobookApp {
           </div>
         </button>
         <div class="flex items-center gap-1.5 shrink-0">
-          ${this._renderSourceBadges(book, 15)}
+          ${this._renderRemoteOriginBadge(book)}${this._renderSourceBadges(book, 15)}
         </div>
       </div>`;
   }
@@ -5157,7 +6030,7 @@ class AudiobookApp {
         if (variant === 'mobile') {
           return `
             <div class="space-y-1">
-              <button data-action="toggle-series-folder" data-series="${escapeHtml(entry.seriesKey)}" class="franchise-folder-header btn-press w-full surface-card rounded-2xl p-2.5 flex items-center gap-3 text-left overflow-hidden min-w-0 ${
+              <button data-action="toggle-series-folder" data-series="${escapeHtml(entry.seriesKey)}" class="library-context-target franchise-folder-header btn-press w-full surface-card rounded-2xl p-2.5 flex items-center gap-3 text-left overflow-hidden min-w-0 ${
                 entry.containsActive ? 'border-[#1ed760]/40' : ''
               }">
                 <div class="franchise-cover-stack w-13 h-13 w-[52px] h-[52px] rounded-xl shrink-0">
@@ -5178,7 +6051,7 @@ class AudiobookApp {
 
         return `
           <div class="space-y-0.5">
-            <button data-action="toggle-series-folder" data-series="${escapeHtml(entry.seriesKey)}" class="franchise-folder-header btn-press w-full flex items-center gap-2.5 p-2 rounded-xl text-left overflow-hidden min-w-0 border border-transparent ${
+            <button data-action="toggle-series-folder" data-series="${escapeHtml(entry.seriesKey)}" class="library-context-target franchise-folder-header btn-press w-full flex items-center gap-2.5 p-2 rounded-xl text-left overflow-hidden min-w-0 border border-transparent ${
               entry.containsActive ? 'bg-white/10 border-[#1ed760]/30' : 'bg-white/[0.03] hover:bg-white/[0.07]'
             }">
               <div class="franchise-cover-stack w-11 h-11 rounded-lg shrink-0">
@@ -5317,7 +6190,7 @@ class AudiobookApp {
   }
 
   _renderNewEpisodesShelf(variant = 'desktop') {
-    if (this.state.filterSource !== 'all' && this.state.filterSource !== 'podcasts') {
+    if (this.state.filterSource !== 'podcasts') {
       return '';
     }
     const recentEpisodes = this.getRecentPodcastEpisodes(8);
@@ -5409,9 +6282,9 @@ class AudiobookApp {
               <p class="text-[11px] text-[var(--text-secondary)] truncate">Search shows, hosts, topics, or browse categories</p>
             </div>
           </div>
-          <button type="button" data-action="open-podcast-modal" data-query="${escapeHtml(q)}" class="btn-press filter-pill inline-flex items-center justify-center gap-2 px-4 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold shrink-0">
+          <button type="button" data-action="open-search-modal" data-search-filter="podcasts" data-query="${escapeHtml(q)}" class="btn-press filter-pill inline-flex items-center justify-center gap-2 px-4 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold shrink-0">
             ${ICON_SEARCH(13)}
-            <span>${q ? `Search '${escapeHtml(q)}' in Podcasts` : 'Find Podcasts'}</span>
+            <span>${q ? `Search '${escapeHtml(q)}' in Podcasts` : 'Search Podcasts'}</span>
           </button>
         </div>
         <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
@@ -5450,13 +6323,13 @@ class AudiobookApp {
                   </button>`
                 : ''
             }
-            <button type="button" data-action="open-podcast-modal" class="btn-press inline-flex items-center gap-1.5 px-4 py-2.5 rounded-full ${
+            <button type="button" data-action="open-search-modal" data-search-filter="podcasts" class="btn-press inline-flex items-center gap-1.5 px-4 py-2.5 rounded-full ${
               q
                 ? 'surface-panel border border-[var(--border-subtle)] hover:bg-white/10 text-white font-semibold'
                 : 'bg-[#1ed760] text-[#050506] font-bold'
             } text-xs">
-              ${ICON_PODCAST(14)}
-              <span>+ Find Podcasts</span>
+              ${ICON_SEARCH(14)}
+              <span>Search Podcasts</span>
             </button>
           </div>
         </div>
@@ -5529,55 +6402,29 @@ class AudiobookApp {
 
   _renderAndroidMobileView(activeBook, snap) {
     const filtered = this.getFilteredBooks();
-    const driveCount = this._getDriveSyncedBooksStats().totalDriveCount;
-    const shadeVisible = this.state.shadeOpen;
+    const isPodcastTab = this.state.filterSource === 'podcasts';
     const duration = Math.max(1, snap.durationSec || activeBook?.totalDurationSec || 1);
     const pos = Math.max(0, Math.min(duration, snap.positionSec || 0));
     const pct = Math.min(100, Math.max(0, (pos / duration) * 100));
 
-    const chip = (id, label) => {
-      const active = this.state.filterSource === id;
-      return `<button data-action="set-filter" data-filter="${id}" class="btn-press filter-pill px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap ${
+    const chip = (id, label, active) => `
+      <button data-action="set-filter" data-filter="${id}" class="btn-press filter-pill px-3.5 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap ${
         active
           ? 'bg-[#1ed760] text-[#050506]'
           : 'surface-card text-[var(--text-primary)]'
       }">${label}</button>`;
-    };
 
     return `
       <main class="relative w-full h-screen h-[100dvh] ambient-surface overflow-hidden flex flex-col">
         <!-- Mobile Top Header -->
         <div class="px-4 pb-2 mobile-safe-top flex items-center justify-between gap-2">
           <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar min-w-0">
-            ${chip('all', 'All')}
-            ${chip('local', 'Local')}
-            ${chip('drive', 'Drive')}
-            ${chip('podcasts', 'Podcasts')}
-            ${chip('downloaded', 'Saved')}
-            <button data-action="toggle-group-series" title="Group by Series" class="btn-press filter-pill inline-flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-medium whitespace-nowrap ${
-              this.state.groupBySeries
-                ? 'bg-[#1ed760]/20 text-[#1ed760] border border-[#1ed760]/40'
-                : 'surface-card text-[var(--text-secondary)]'
-            }">
-              ${ICON_LAYERS(12)}
-              <span>Series</span>
-            </button>
-            ${
-              driveCount > 0
-                ? `<button data-action="open-wipe-synced-modal" class="btn-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-full bg-red-500/15 border border-red-500/30 text-xs font-medium text-red-300 whitespace-nowrap">
-                    ${ICON_TRASH(12)}
-                    <span>Wipe Synced</span>
-                  </button>`
-                : ''
-            }
+            ${chip('audiobooks', 'Audiobooks', !isPodcastTab)}
+            ${chip('podcasts', 'Podcasts', isPodcastTab)}
           </div>
           <div class="flex items-center gap-2 shrink-0">
-            <button data-action="open-podcast-modal" aria-label="Find Podcasts" title="Find Podcasts" class="btn-press filter-pill inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[#1ed760]/15 border border-[#1ed760]/40 text-xs font-bold text-[#1ed760] hover:bg-[#1ed760]/25 shrink-0">
-              ${FLUENT_3D_PODCAST(14)}
-              <span>Find Podcasts</span>
-            </button>
-            <button data-action="toggle-shade" aria-label="Notification Shade" class="btn-press w-9 h-9 rounded-full surface-card flex items-center justify-center text-[var(--text-secondary)] hover:text-white">
-              ${ICON_CHEVRON(shadeVisible ? 'up' : 'down', 15)}
+            <button type="button" data-action="open-search-modal" aria-label="Search" title="Search Audiobooks & Podcasts" class="btn-press filter-pill w-9 h-9 rounded-full surface-card hover:bg-white/10 flex items-center justify-center text-[var(--text-primary)] hover:text-[#1ed760] shrink-0">
+              ${ICON_SEARCH(16)}
             </button>
             ${this._renderAvatarButton()}
           </div>
@@ -5585,18 +6432,12 @@ class AudiobookApp {
 
         ${this._renderWorkspaceBanners()}
 
-        ${
-          shadeVisible
-            ? `<div class="px-3 pb-3 pt-1">${this._renderNotificationShade(activeBook, snap)}</div>`
-            : ''
-        }
-
         <!-- Mobile Scrollable Content -->
         <div id="mobileMainScroll" class="ui-view-enter flex-1 overflow-y-auto px-4 pb-24 mobile-safe-scroll-bottom space-y-6 min-w-0 flex flex-col">
           ${this._renderContinueFromDeviceCard()}
           ${this._renderPodcastDiscoveryHub('mobile')}
           ${
-            this.state.filterSource === 'podcasts' && filtered.length === 0
+            isPodcastTab && filtered.length === 0
               ? this._renderPodcastEmptyStateCard()
               : this.books.length === 0
                 ? this._renderEmptyLibraryCard()
@@ -5620,7 +6461,7 @@ class AudiobookApp {
               .slice(0, 4)
               .map(
                 (book) => `
-              <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="btn-press surface-card rounded-xl p-1.5 flex items-center gap-2.5 text-left overflow-hidden min-w-0 ${
+              <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" data-book-key="${escapeHtml(book.bookKey)}" class="library-context-target btn-press surface-card rounded-xl p-1.5 flex items-center gap-2.5 text-left overflow-hidden min-w-0 ${
                   activeBook?.bookKey === book.bookKey ? 'ring-1 ring-[#1ed760]/60' : ''
                 }">
                 <div class="w-12 h-12 rounded-lg overflow-hidden shrink-0">
@@ -5643,7 +6484,7 @@ class AudiobookApp {
               ${filtered
                 .map(
                   (book) => `
-                <div class="w-36 shrink-0 surface-card rounded-2xl p-2.5 space-y-2 overflow-hidden min-w-0">
+                <div data-book-key="${escapeHtml(book.bookKey)}" class="library-context-target w-36 shrink-0 surface-card rounded-2xl p-2.5 space-y-2 overflow-hidden min-w-0">
                   <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="w-full aspect-square rounded-xl overflow-hidden block relative group">
                     ${this._renderCoverImg(book)}
                   </button>
@@ -5651,7 +6492,7 @@ class AudiobookApp {
                     <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" class="text-left text-xs font-semibold text-[var(--text-primary)] clamp-2 leading-snug w-full">${escapeHtml(book.title)}</button>
                     <div class="flex items-center justify-between gap-1 min-w-0">
                       <span class="text-[11px] text-[var(--text-secondary)] truncate min-w-0">${escapeHtml(book.author)}</span>
-                      <div class="flex items-center gap-1 shrink-0">${this._renderSourceBadges(book, 12)}</div>
+                      <div class="flex items-center gap-1 shrink-0">${this._renderRemoteOriginBadge(book)}${this._renderSourceBadges(book, 12)}</div>
                     </div>
                     <div class="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">
                       ${this._renderDownloadedIcon(book, 14)}
@@ -5668,14 +6509,6 @@ class AudiobookApp {
           <section class="ui-view-enter space-y-2.5">
             <div class="flex items-center justify-between gap-2">
               <h2 class="text-lg font-bold tracking-tight text-[var(--text-primary)]">Library</h2>
-              ${
-                driveCount > 0
-                  ? `<button data-action="open-wipe-synced-modal" class="btn-press inline-flex items-center gap-1 px-2.5 py-1 rounded-full surface-card text-[11px] font-medium text-red-300 hover:bg-red-500/15">
-                      ${ICON_TRASH(11)}
-                      <span>Wipe Synced Files</span>
-                    </button>`
-                  : ''
-              }
             </div>
             <div class="ui-stagger-grid space-y-2">
               ${this._renderGroupedLibraryEntries(filtered, activeBook, 'mobile')}
@@ -5745,13 +6578,18 @@ class AudiobookApp {
     return `
       <div id="mobileSheetScroll" class="sheet-modal${noAnimCls} ambient-surface absolute inset-0 z-30 flex flex-col px-5 mobile-safe-sheet-top mobile-safe-bottom overflow-y-auto">
         <div class="flex items-center justify-between gap-2 pb-4">
-          <button data-action="close-mobile-sheet" aria-label="Close" class="btn-press p-2 rounded-full hover:bg-white/10 text-white">
+          <button data-action="close-mobile-sheet" aria-label="Minimize Player" class="btn-press p-2 rounded-full hover:bg-white/10 text-white">
             ${ICON_CHEVRON('down', 20)}
           </button>
           <span class="text-xs font-semibold text-[var(--text-secondary)] truncate">${escapeHtml(book.series || book.author)}</span>
-          <button data-action="open-cover-search" data-book="${escapeHtml(book.bookKey)}" aria-label="Search Cover" class="btn-press p-2 rounded-full hover:bg-white/10 text-white">
-            ${ICON_COVER_IMAGE(18)}
-          </button>
+          <div class="flex items-center gap-1 shrink-0">
+            <button data-action="open-cover-search" data-book="${escapeHtml(book.bookKey)}" aria-label="Search Cover" class="btn-press p-2 rounded-full hover:bg-white/10 text-white">
+              ${ICON_COVER_IMAGE(17)}
+            </button>
+            <button data-action="close-mobile-sheet" aria-label="Close" class="btn-press p-2 rounded-full hover:bg-white/10 text-white">
+              ${ICON_CLOSE(18)}
+            </button>
+          </div>
         </div>
 
         <button data-action="open-cover-search" data-book="${escapeHtml(book.bookKey)}" class="w-full max-w-[270px] aspect-square mx-auto rounded-2xl overflow-hidden shadow-2xl shrink-0">
@@ -5847,8 +6685,8 @@ class AudiobookApp {
   _renderDesktopView(activeBook, snap) {
     const filtered = this.getFilteredBooks();
     const detailBook = this.getDetailBook();
-    const driveCount = this._getDriveSyncedBooksStats().totalDriveCount;
     const { sidebarCollapsed, rightPanelOpen, desktopView, filterSource, searchQuery } = this.state;
+    const isPodcastTab = filterSource === 'podcasts';
     const duration = Math.max(1, snap.durationSec || activeBook?.totalDurationSec || 1);
     const pos = Math.max(0, Math.min(duration, snap.positionSec || 0));
     const pct = Math.min(100, Math.max(0, (pos / duration) * 100));
@@ -5876,20 +6714,8 @@ class AudiobookApp {
                   sidebarCollapsed
                     ? ''
                     : `<div class="flex items-center gap-1 shrink-0">
-                        ${
-                          driveCount > 0
-                            ? `<button data-action="open-wipe-synced-modal" aria-label="Wipe Synced Files" title="Wipe Synced Files" class="btn-press inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-[10px] font-semibold text-red-300 shrink-0">
-                                ${ICON_TRASH(12)}
-                                <span>Wipe</span>
-                              </button>`
-                            : ''
-                        }
-                        <button data-action="open-podcast-modal" aria-label="Find Podcasts" title="Find Podcasts" class="btn-press inline-flex items-center gap-1 px-2 py-1 rounded-lg surface-card hover:bg-white/10 text-[10px] font-semibold text-white shrink-0">
-                          ${FLUENT_3D_PODCAST(13)}
-                          <span>+ Podcast</span>
-                        </button>
-                        <button data-action="trigger-local-folder" aria-label="Add Local Folder" title="Add Local Folder" class="btn-press p-1.5 rounded-lg hover:bg-white/10 text-[var(--text-secondary)] hover:text-white shrink-0">
-                          ${FLUENT_3D_FOLDER(16)}
+                        <button type="button" data-action="open-search-modal" aria-label="Search" title="Search Audiobooks & Podcasts" class="btn-press p-1.5 rounded-lg surface-card hover:bg-white/10 text-[var(--text-primary)] hover:text-[#1ed760] shrink-0">
+                          ${ICON_SEARCH(15)}
                         </button>
                       </div>`
                 }
@@ -5897,27 +6723,17 @@ class AudiobookApp {
               ${
                 sidebarCollapsed
                   ? ''
-                  : `<div class="flex items-center justify-between gap-1 pt-1">
-                      <div class="flex items-center gap-1 overflow-x-auto no-scrollbar min-w-0">
-                        ${['all', 'local', 'drive', 'podcasts', 'downloaded']
-                          .map(
-                            (f) =>
-                              `<button data-action="set-filter" data-filter="${f}" class="btn-press filter-pill px-2.5 py-1 rounded-full text-[11px] font-medium capitalize whitespace-nowrap ${
-                                filterSource === f
-                                  ? 'bg-[#1ed760] text-[#050506]'
-                                  : 'surface-card text-[var(--text-secondary)] hover:text-white'
-                              }">${f === 'downloaded' ? 'Saved' : f}</button>`
-                          )
-                          .join('')}
-                      </div>
-                      <button data-action="toggle-group-series" title="Group by Franchise / Series" class="btn-press filter-pill inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium shrink-0 ${
-                        this.state.groupBySeries
-                          ? 'bg-[#1ed760]/20 text-[#1ed760] border border-[#1ed760]/40'
+                  : `<div class="grid grid-cols-2 gap-1.5 pt-1">
+                      <button data-action="set-filter" data-filter="audiobooks" class="btn-press filter-pill px-2.5 py-1.5 rounded-full text-[11px] font-semibold whitespace-nowrap ${
+                        !isPodcastTab
+                          ? 'bg-[#1ed760] text-[#050506]'
                           : 'surface-card text-[var(--text-secondary)] hover:text-white'
-                      }">
-                        ${ICON_LAYERS(11)}
-                        <span>Series</span>
-                      </button>
+                      }">Audiobooks</button>
+                      <button data-action="set-filter" data-filter="podcasts" class="btn-press filter-pill px-2.5 py-1.5 rounded-full text-[11px] font-semibold whitespace-nowrap ${
+                        isPodcastTab
+                          ? 'bg-[#1ed760] text-[#050506]'
+                          : 'surface-card text-[var(--text-secondary)] hover:text-white'
+                      }">Podcasts</button>
                     </div>`
               }
             </div>
@@ -5932,15 +6748,15 @@ class AudiobookApp {
                         <button data-action="trigger-local-files" class="btn-press w-full py-1.5 px-3 rounded-full surface-card text-[11px] font-semibold text-white hover:bg-white/10">
                           + Add Audio Files
                         </button>
-                        <button data-action="open-podcast-modal" class="btn-press w-full py-1.5 px-3 rounded-full surface-card text-[11px] font-semibold text-white hover:bg-white/10">
-                          + Find Podcasts
+                        <button data-action="open-search-modal" class="btn-press w-full py-1.5 px-3 rounded-full surface-card text-[11px] font-semibold text-white hover:bg-white/10">
+                          Search &amp; Discover
                         </button>
                       </div>`
                   : sidebarCollapsed
                     ? filtered
                         .map(
                           (book) => `
-                  <button data-action="open-detail" data-book="${escapeHtml(book.bookKey)}" class="btn-press w-full flex items-center justify-center p-2 rounded-xl overflow-hidden ${
+                  <button data-action="open-detail" data-book="${escapeHtml(book.bookKey)}" data-book-key="${escapeHtml(book.bookKey)}" class="library-context-target btn-press w-full flex items-center justify-center p-2 rounded-xl overflow-hidden ${
                             activeBook?.bookKey === book.bookKey ? 'bg-white/10' : 'hover:bg-white/5'
                           }">
                     <div class="w-11 h-11 rounded-lg overflow-hidden shrink-0">
@@ -5962,19 +6778,20 @@ class AudiobookApp {
                   <span class="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)] pointer-events-none">${ICON_SEARCH(15)}</span>
                   <input id="desktopSearchInput" data-action="search-input" type="search" value="${escapeHtml(searchQuery)}" placeholder="Search audiobooks, podcasts, authors..." class="w-full pl-9 pr-3 py-1.5 rounded-full bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
                 </div>
-                <button type="button" data-action="open-podcast-modal" data-query="${escapeHtml(searchQuery.trim())}" class="btn-press filter-pill inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full ${
+                <button type="button" data-action="open-search-modal" data-query="${escapeHtml(searchQuery.trim())}" aria-label="Search Audiobooks & Podcasts" title="Search Audiobooks & Podcasts" class="btn-press filter-pill inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full ${
                   searchQuery.trim()
                     ? 'bg-[#1ed760] text-[#050506] font-bold'
-                    : 'bg-[#1ed760]/15 border border-[#1ed760]/40 text-[#1ed760] hover:bg-[#1ed760]/25 font-semibold'
+                    : 'surface-card hover:bg-white/10 text-[var(--text-primary)] hover:text-[#1ed760] font-semibold'
                 } text-xs shrink-0 whitespace-nowrap">
-                  ${FLUENT_3D_PODCAST(14)}
-                  <span>${searchQuery.trim() ? `Search '${escapeHtml(searchQuery.trim())}' in Podcasts` : 'Find Podcasts'}</span>
+                  ${ICON_SEARCH(14)}
+                  <span>${searchQuery.trim() ? `Search '${escapeHtml(searchQuery.trim())}'` : 'Search'}</span>
                 </button>
               </div>
               <div class="flex items-center gap-2 shrink-0">
                 ${
                   desktopView === 'detail'
-                    ? `<button data-action="desktop-home" class="btn-press px-3 py-1.5 rounded-full surface-card text-xs font-medium text-white flex items-center gap-1">${ICON_CHEVRON('left', 14)} Back</button>`
+                    ? `<button data-action="desktop-home" class="btn-press px-3 py-1.5 rounded-full surface-card text-xs font-medium text-white flex items-center gap-1">${ICON_CHEVRON('left', 14)} Back</button>
+                       <button data-action="desktop-home" aria-label="Close Detail" class="btn-press p-2 rounded-full surface-card text-[var(--text-secondary)] hover:text-white">${ICON_CLOSE(15)}</button>`
                     : ''
                 }
                 <button data-action="toggle-right-panel" aria-label="Toggle Now Playing Panel" class="btn-press p-2 rounded-full surface-card ${rightPanelOpen ? 'text-[#1ed760]' : 'text-[var(--text-secondary)]'}">
@@ -6195,7 +7012,7 @@ class AudiobookApp {
           .slice(0, 6)
           .map(
             (book) => `
-          <div class="surface-card rounded-xl flex items-center gap-3 pr-3 overflow-hidden min-w-0 group ${
+          <div data-book-key="${escapeHtml(book.bookKey)}" class="library-context-target surface-card rounded-xl flex items-center gap-3 pr-3 overflow-hidden min-w-0 group ${
               activeBook?.bookKey === book.bookKey ? 'ring-1 ring-[#1ed760]/50' : ''
             }">
             <button data-action="open-detail" data-book="${escapeHtml(book.bookKey)}" class="w-16 h-16 shrink-0 overflow-hidden">
@@ -6206,7 +7023,7 @@ class AudiobookApp {
               <div class="flex items-center gap-1.5 mt-1 text-[11px] text-[var(--text-secondary)] min-w-0">
                 ${this._renderDownloadedIcon(book, 13)}
                 <span class="truncate min-w-0">${escapeHtml(book.author)}</span>
-                ${this._renderSourceBadges(book, 12)}
+                ${this._renderRemoteOriginBadge(book)}${this._renderSourceBadges(book, 12)}
               </div>
             </button>
             <button data-action="play-book" data-book="${escapeHtml(book.bookKey)}" aria-label="Play" class="play-fab w-9 h-9 shrink-0 opacity-90 group-hover:opacity-100">
@@ -6243,7 +7060,7 @@ class AudiobookApp {
   _renderDesktopShelfCard(book, activeBook) {
     const isPlayingThis = activeBook?.bookKey === book.bookKey && this.state.snapshot.playing;
     return `
-      <div class="surface-card rounded-2xl p-3 space-y-2.5 overflow-hidden min-w-0 group">
+      <div data-book-key="${escapeHtml(book.bookKey)}" class="library-context-target surface-card rounded-2xl p-3 space-y-2.5 overflow-hidden min-w-0 group">
         <div class="relative aspect-square rounded-xl overflow-hidden">
           <button data-action="open-detail" data-book="${escapeHtml(book.bookKey)}" class="w-full h-full block">
             ${this._renderCoverImg(book)}
@@ -6258,7 +7075,7 @@ class AudiobookApp {
           </button>
           <div class="flex items-center justify-between gap-1.5 min-w-0">
             <span class="text-xs text-[var(--text-secondary)] truncate min-w-0">${escapeHtml(book.author)}</span>
-            <div class="flex items-center gap-1 shrink-0">${this._renderSourceBadges(book, 13)}</div>
+            <div class="flex items-center gap-1 shrink-0">${this._renderRemoteOriginBadge(book)}${this._renderSourceBadges(book, 13)}</div>
           </div>
           <div class="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">
             ${this._renderDownloadedIcon(book, 14)}
@@ -6348,103 +7165,222 @@ class AudiobookApp {
     `;
   }
 
-  _renderPodcastModal() {
-    const { open, query, activeCategory, loading, subscribingId, error, results } =
+  _renderSearchModalResultsInnerHtml() {
+    const { query, searchFilter = 'all', activeCategory, loading, subscribingId, error, results } =
       this.state.podcastModal || {};
-    if (!open) return '';
-
     const categories = Array.isArray(PODCAST_CATEGORIES) ? PODCAST_CATEGORIES : [];
     const items = Array.isArray(results) ? results : [];
+    const q = String(query || '').trim().toLowerCase();
+
+    const showAudiobooks = searchFilter === 'all' || searchFilter === 'audiobooks';
+    const showPodcasts = searchFilter === 'all' || searchFilter === 'podcasts';
+
+    const matchingAudiobooks = showAudiobooks
+      ? this.books.filter((b) => {
+          if (!b || b.isPodcast || b.sources?.includes('podcast')) return false;
+          if (!q) return true;
+          const hay = `${b.title || ''} ${b.author || ''} ${b.narrator || ''} ${b.series || ''}`.toLowerCase();
+          return hay.includes(q);
+        })
+      : [];
+
+    const displayedAudiobooks =
+      searchFilter === 'audiobooks' || q
+        ? matchingAudiobooks
+        : matchingAudiobooks.slice(0, 6);
+
+    const matchingFollowedPodcasts =
+      showPodcasts && q
+        ? this.books.filter((b) => {
+            if (!b || !(b.isPodcast || b.sources?.includes('podcast'))) return false;
+            const epTitles = (b.chapters || []).map((c) => c?.title || '').join(' ');
+            const hay = `${b.title || ''} ${b.author || ''} ${epTitles}`.toLowerCase();
+            return hay.includes(q);
+          })
+        : [];
+
+    const filterPill = (id, label) => {
+      const active = searchFilter === id;
+      return `<button type="button" data-action="set-search-filter" data-search-filter="${id}" class="btn-press filter-pill px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap ${
+        active
+          ? 'bg-[#1ed760] text-[#050506]'
+          : 'surface-card text-[var(--text-secondary)] hover:text-white'
+      }">${label}</button>`;
+    };
+
+    return `
+      <div class="px-5 py-2.5 border-b border-[var(--border-subtle)] space-y-2.5 shrink-0">
+        <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
+          ${filterPill('all', 'All')}
+          ${filterPill('audiobooks', 'Audiobooks')}
+          ${filterPill('podcasts', 'Podcasts to Follow')}
+        </div>
+        ${
+          showPodcasts
+            ? `<div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
+                ${categories
+                  .map((cat) => {
+                    const isActive = !query && activeCategory === cat.id;
+                    return `<button type="button" data-action="select-podcast-category" data-category-id="${escapeHtml(cat.id)}" class="btn-press filter-pill px-3 py-1 rounded-full text-xs font-medium whitespace-nowrap ${
+                      isActive
+                        ? 'bg-[#1ed760]/20 text-[#1ed760] border border-[#1ed760]/40 font-bold'
+                        : 'surface-card text-[var(--text-secondary)] hover:text-white'
+                    }">${escapeHtml(cat.label)}</button>`;
+                  })
+                  .join('')}
+              </div>`
+            : ''
+        }
+      </div>
+
+      ${
+        error
+          ? `<div class="mx-5 mt-3 rounded-xl bg-red-500/10 border border-red-500/30 px-3 py-2 text-xs text-red-300 shrink-0">${escapeHtml(error)}</div>`
+          : ''
+      }
+
+      <div class="flex-1 overflow-y-auto p-5 space-y-5">
+        ${
+          showAudiobooks
+            ? displayedAudiobooks.length > 0
+              ? `<section class="space-y-2.5">
+                  <div class="text-xs font-bold uppercase tracking-wider text-[var(--text-secondary)]">Audiobooks (${matchingAudiobooks.length})</div>
+                  <div class="ui-stagger-grid grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    ${displayedAudiobooks
+                      .map(
+                        (book) => `
+                      <button type="button" data-action="search-select-book" data-book="${escapeHtml(book.bookKey)}" class="btn-press surface-card rounded-2xl p-2.5 flex items-center gap-3 text-left overflow-hidden min-w-0 hover:border-[#1ed760]/40">
+                        <div class="w-12 h-12 rounded-xl overflow-hidden shrink-0 bg-black/30">
+                          ${this._renderCoverImg(book)}
+                        </div>
+                        <div class="min-w-0 flex-1 space-y-0.5">
+                          <div class="text-xs sm:text-sm font-bold text-white truncate">${escapeHtml(book.title)}</div>
+                          <div class="flex items-center gap-1.5 text-[11px] text-[var(--text-secondary)] min-w-0">
+                            ${this._renderDownloadedIcon(book, 12)}
+                            <span class="truncate">${escapeHtml(book.author || book.series || 'Audiobook')}</span>
+                          </div>
+                        </div>
+                      </button>`
+                      )
+                      .join('')}
+                  </div>
+                </section>`
+              : searchFilter === 'audiobooks'
+                ? `<div class="py-10 text-center text-xs text-[var(--text-secondary)]">${q ? `No audiobooks match '${escapeHtml(query)}'.` : 'No audiobooks in your library yet.'}</div>`
+                : ''
+            : ''
+        }
+
+        ${
+          matchingFollowedPodcasts.length > 0
+            ? `<section class="space-y-2.5">
+                <div class="text-xs font-bold uppercase tracking-wider text-[var(--text-secondary)]">Followed Podcasts (${matchingFollowedPodcasts.length})</div>
+                <div class="ui-stagger-grid grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  ${matchingFollowedPodcasts
+                    .map(
+                      (pod) => `
+                    <button type="button" data-action="search-select-book" data-book="${escapeHtml(pod.bookKey)}" class="btn-press surface-card rounded-2xl p-2.5 flex items-center gap-3 text-left overflow-hidden min-w-0 border border-[#1ed760]/30">
+                      <div class="w-12 h-12 rounded-xl overflow-hidden shrink-0 bg-black/30">
+                        ${this._renderCoverImg(pod)}
+                      </div>
+                      <div class="min-w-0 flex-1 space-y-0.5">
+                        <div class="text-xs sm:text-sm font-bold text-white truncate">${escapeHtml(pod.title)}</div>
+                        <div class="text-[11px] text-[var(--text-secondary)] truncate">${escapeHtml(pod.author || 'Podcast')}</div>
+                      </div>
+                    </button>`
+                    )
+                    .join('')}
+                </div>
+              </section>`
+            : ''
+        }
+
+        ${
+          showPodcasts
+            ? `<section class="space-y-2.5">
+                <div class="text-xs font-bold uppercase tracking-wider text-[var(--text-secondary)]">Podcasts to Follow</div>
+                ${
+                  loading && items.length === 0
+                    ? `<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">${Array.from({ length: 6 })
+                        .map(() => `<div class="h-24 rounded-2xl surface-card animate-pulse"></div>`)
+                        .join('')}</div>`
+                    : items.length === 0
+                      ? `<div class="py-10 text-center text-xs text-[var(--text-secondary)]">No matching podcasts found.</div>`
+                      : `<div class="ui-stagger-grid grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          ${items
+                            .map((item, idx) => {
+                              const existing = this._findSubscribedPodcastByFeedUrl(item.feedUrl);
+                              const subKey = String(item.id || item.feedUrl || idx);
+                              const isSubscribing = subscribingId === subKey;
+                              const coverBook = {
+                                bookKey: `podcast:${subKey}`,
+                                title: item.title || 'Podcast',
+                                author: item.author || 'Podcast',
+                                coverUrl: item.coverUrl || ''
+                              };
+                              return `
+                                <div class="surface-card rounded-2xl p-3 flex items-center gap-3 overflow-hidden min-w-0 ${
+                                  existing ? 'border border-[#1ed760]/40' : ''
+                                }">
+                                  <div class="w-16 h-16 rounded-xl overflow-hidden shrink-0 bg-black/30">
+                                    ${this._renderCoverImg(coverBook)}
+                                  </div>
+                                  <div class="min-w-0 flex-1 space-y-1">
+                                    <div class="text-sm font-bold text-white truncate">${escapeHtml(item.title || 'Podcast')}</div>
+                                    <div class="text-xs text-[var(--text-secondary)] truncate">${escapeHtml(item.author || 'Podcast')}</div>
+                                    <div class="flex items-center gap-1.5 min-w-0">
+                                      <span class="px-2 py-0.5 rounded-full bg-white/5 border border-[var(--border-subtle)] text-[10px] font-medium text-[var(--text-secondary)] truncate">${escapeHtml(item.genre || 'Podcast')}</span>
+                                    </div>
+                                  </div>
+                                  <button type="button" data-action="subscribe-podcast" data-podcast-index="${idx}" ${isSubscribing ? 'disabled' : ''} class="btn-press px-3.5 py-1.5 rounded-full text-xs font-bold shrink-0 ${
+                                    existing
+                                      ? 'bg-[#1ed760]/15 text-[#1ed760] border border-[#1ed760]/40'
+                                      : 'bg-[#1ed760] text-[#050506]'
+                                  } disabled:opacity-60">
+                                    ${existing ? 'Following' : isSubscribing ? 'Following...' : 'Follow'}
+                                  </button>
+                                </div>
+                              `;
+                            })
+                            .join('')}
+                        </div>`
+                }
+              </section>`
+            : ''
+        }
+      </div>
+    `;
+  }
+
+  _renderPodcastModal() {
+    const { open, query } = this.state.podcastModal || {};
+    if (!open) return '';
 
     return `
       <div class="modal-backdrop fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
         <div class="sheet-modal w-full max-w-3xl max-h-[86vh] rounded-3xl flex flex-col overflow-hidden">
-          <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
+          <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3 shrink-0">
             <div class="flex items-center gap-2.5 min-w-0">
-              ${FLUENT_3D_PODCAST(20)}
-              <h2 class="text-base font-bold text-white truncate">Podcasts</h2>
+              ${ICON_SEARCH(18, 'text-[#1ed760] shrink-0')}
+              <h2 class="text-base font-bold text-white truncate">Search</h2>
             </div>
             <button type="button" data-action="close-podcast-modal" aria-label="Close" class="btn-press p-1.5 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white">
               ${ICON_CLOSE(18)}
             </button>
           </div>
 
-          <form id="podcastSearchForm" class="px-5 pt-3.5 pb-2.5 border-b border-[var(--border-subtle)] space-y-3">
+          <form id="podcastSearchForm" class="px-5 pt-3.5 pb-3 border-b border-[var(--border-subtle)] shrink-0">
             <div class="flex items-center gap-2">
               <div class="relative flex-1 min-w-0">
                 <span class="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--text-muted)] pointer-events-none">${ICON_SEARCH(15)}</span>
-                <input id="podcastSearchInput" data-action="podcast-search-input" type="search" value="${escapeHtml(query || '')}" placeholder="Search podcasts, hosts, or topics..." class="w-full pl-9 pr-3 py-2 rounded-xl bg-white/5 border border-[var(--border-subtle)] text-sm text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
+                <input id="podcastSearchInput" data-action="podcast-search-input" type="search" value="${escapeHtml(query || '')}" placeholder="Search audiobooks, podcasts, hosts, or topics..." class="w-full pl-9 pr-3 py-2 rounded-xl bg-white/5 border border-[var(--border-subtle)] text-sm text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
               </div>
               <button type="submit" class="btn-press px-4 py-2 rounded-xl bg-[#1ed760] text-[#050506] text-xs font-bold shrink-0">Search</button>
             </div>
-
-            <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
-              ${categories
-                .map((cat) => {
-                  const isActive = !query && activeCategory === cat.id;
-                  return `<button type="button" data-action="select-podcast-category" data-category-id="${escapeHtml(cat.id)}" class="btn-press filter-pill px-3 py-1 rounded-full text-xs font-medium whitespace-nowrap ${
-                    isActive
-                      ? 'bg-[#1ed760] text-[#050506] font-bold'
-                      : 'surface-card text-[var(--text-secondary)] hover:text-white'
-                  }">${escapeHtml(cat.label)}</button>`;
-                })
-                .join('')}
-            </div>
           </form>
 
-          ${
-            error
-              ? `<div class="mx-5 mt-3 rounded-xl bg-red-500/10 border border-red-500/30 px-3 py-2 text-xs text-red-300">${escapeHtml(error)}</div>`
-              : ''
-          }
-
-          <div class="flex-1 overflow-y-auto p-5">
-            ${
-              loading && items.length === 0
-                ? `<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">${Array.from({ length: 6 })
-                    .map(() => `<div class="h-24 rounded-2xl surface-card animate-pulse"></div>`)
-                    .join('')}</div>`
-                : items.length === 0
-                  ? `<div class="py-12 text-center text-xs text-[var(--text-secondary)]">No matching podcasts found.</div>`
-                  : `<div class="ui-stagger-grid grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      ${items
-                        .map((item, idx) => {
-                          const existing = this._findSubscribedPodcastByFeedUrl(item.feedUrl);
-                          const subKey = String(item.id || item.feedUrl || idx);
-                          const isSubscribing = subscribingId === subKey;
-                          const coverBook = {
-                            bookKey: `podcast:${subKey}`,
-                            title: item.title || 'Podcast',
-                            author: item.author || 'Podcast',
-                            coverUrl: item.coverUrl || ''
-                          };
-                          return `
-                            <div class="surface-card rounded-2xl p-3 flex items-center gap-3 overflow-hidden min-w-0 ${
-                              existing ? 'border border-[#1ed760]/40' : ''
-                            }">
-                              <div class="w-16 h-16 rounded-xl overflow-hidden shrink-0 bg-black/30">
-                                ${this._renderCoverImg(coverBook)}
-                              </div>
-                              <div class="min-w-0 flex-1 space-y-1">
-                                <div class="text-sm font-bold text-white truncate">${escapeHtml(item.title || 'Podcast')}</div>
-                                <div class="text-xs text-[var(--text-secondary)] truncate">${escapeHtml(item.author || 'Podcast')}</div>
-                                <div class="flex items-center gap-1.5 min-w-0">
-                                  <span class="px-2 py-0.5 rounded-full bg-white/5 border border-[var(--border-subtle)] text-[10px] font-medium text-[var(--text-secondary)] truncate">${escapeHtml(item.genre || 'Podcast')}</span>
-                                </div>
-                              </div>
-                              <button type="button" data-action="subscribe-podcast" data-podcast-index="${idx}" ${isSubscribing ? 'disabled' : ''} class="btn-press px-3.5 py-1.5 rounded-full text-xs font-bold shrink-0 ${
-                                existing
-                                  ? 'bg-[#1ed760]/15 text-[#1ed760] border border-[#1ed760]/40'
-                                  : 'bg-[#1ed760] text-[#050506]'
-                              } disabled:opacity-60">
-                                ${existing ? 'Following' : isSubscribing ? 'Following...' : 'Follow'}
-                              </button>
-                            </div>
-                          `;
-                        })
-                        .join('')}
-                    </div>`
-            }
+          <div id="podcastModalResultsRegion" class="flex-1 flex flex-col min-h-0 overflow-hidden">
+            ${this._renderSearchModalResultsInnerHtml()}
           </div>
         </div>
       </div>
@@ -6508,7 +7444,7 @@ class AudiobookApp {
 
   _applyNoEnterAnimHtml(html) {
     return String(html || '').replace(
-      /class="([^"]*\b(?:sheet-modal|notif-shade|popover-menu)\b[^"]*)"/g,
+      /class="([^"]*\b(?:sheet-modal|notif-shade|popover-menu|modal-backdrop|ui-view-enter|ui-stagger-grid|ui-stagger-item)\b[^"]*)"/g,
       (match, classes) =>
         classes.includes('no-enter-anim') ? match : `class="${classes} no-enter-anim"`
     );
@@ -6540,11 +7476,14 @@ class AudiobookApp {
       <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
         <div id="appMainLayer" class="flex-1 flex flex-col min-h-0"></div>
         <div id="appOverlayProfile"></div>
+        <div id="appOverlaySettings"></div>
         <div id="appOverlayCover"></div>
         <div id="appOverlayPodcast"></div>
         <div id="appOverlayDrive"></div>
+        <div id="appOverlayDriveRemovals"></div>
         <div id="appOverlayDevices"></div>
         <div id="appOverlayWipe"></div>
+        <div id="appOverlayContextMenu"></div>
         <div id="appOverlaySyncProgress"></div>
         <div id="appOverlayToast"></div>
         <div id="appOverlayError"></div>
@@ -6554,16 +7493,20 @@ class AudiobookApp {
     this._shellEls = {
       main: this.rootEl.querySelector('#appMainLayer'),
       profile: this.rootEl.querySelector('#appOverlayProfile'),
+      settings: this.rootEl.querySelector('#appOverlaySettings'),
       cover: this.rootEl.querySelector('#appOverlayCover'),
       podcast: this.rootEl.querySelector('#appOverlayPodcast'),
       drive: this.rootEl.querySelector('#appOverlayDrive'),
+      driveRemovals: this.rootEl.querySelector('#appOverlayDriveRemovals'),
       devices: this.rootEl.querySelector('#appOverlayDevices'),
       wipe: this.rootEl.querySelector('#appOverlayWipe'),
+      contextMenu: this.rootEl.querySelector('#appOverlayContextMenu'),
       syncProgress: this.rootEl.querySelector('#appOverlaySyncProgress'),
       toast: this.rootEl.querySelector('#appOverlayToast'),
       error: this.rootEl.querySelector('#appOverlayError')
     };
     this._lastMainHtml = null;
+    this._lastMainViewSignature = null;
     this._prevMainViewMeta = null;
     this._overlayState = {};
     return this._shellEls;
@@ -6651,48 +7594,31 @@ class AudiobookApp {
       return false;
     }
 
-    let podcastFocusSnap = null;
+    // Android keystroke stability fix: when Unified Search modal is already open,
+    // NEVER replace slotEl.innerHTML (which destroys/blurs #podcastSearchInput & jumps Android keyboard).
+    // Instead patch ONLY #podcastModalResultsRegion in-place!
     if (
       slotName === 'podcast' &&
-      typeof document !== 'undefined' &&
-      document.activeElement &&
-      (document.activeElement.id === 'podcastSearchInput' ||
-        document.activeElement.dataset?.action === 'podcast-search-input')
+      prev.open &&
+      slotEl.querySelector?.('#podcastSearchInput') &&
+      !rawHtml.includes('data-closing')
     ) {
-      const activeEl = document.activeElement;
-      podcastFocusSnap = {
-        val: activeEl.value,
-        start: activeEl.selectionStart,
-        end: activeEl.selectionEnd
-      };
+      const existingRegion = slotEl.querySelector?.('#podcastModalResultsRegion');
+      if (existingRegion) {
+        const nextRegionHtml = this._applyNoEnterAnimHtml(this._renderSearchModalResultsInnerHtml());
+        if (existingRegion.innerHTML !== nextRegionHtml) {
+          existingRegion.innerHTML = nextRegionHtml;
+          this._bindContainerEvents(existingRegion);
+        }
+        this._overlayState[slotName] = { open: true, rawHtml, sig: nextSig };
+        return true;
+      }
     }
 
     const finalHtml = prev.open ? this._applyNoEnterAnimHtml(rawHtml) : rawHtml;
     slotEl.innerHTML = finalHtml;
     this._overlayState[slotName] = { open: true, rawHtml, sig: nextSig };
     this._bindContainerEvents(slotEl);
-
-    if (podcastFocusSnap) {
-      const nextInput =
-        slotEl.querySelector?.('#podcastSearchInput') ||
-        (typeof document !== 'undefined' ? document.getElementById('podcastSearchInput') : null);
-      if (nextInput) {
-        if (typeof podcastFocusSnap.val === 'string') {
-          nextInput.value = podcastFocusSnap.val;
-        }
-        nextInput.focus?.();
-        try {
-          if (
-            typeof podcastFocusSnap.start === 'number' &&
-            typeof podcastFocusSnap.end === 'number'
-          ) {
-            nextInput.setSelectionRange?.(podcastFocusSnap.start, podcastFocusSnap.end);
-          }
-        } catch {
-          // ignore
-        }
-      }
-    }
     return true;
   }
 
@@ -6812,11 +7738,14 @@ class AudiobookApp {
         <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
           ${bodyView}
           ${this._renderProfilePopover()}
+          ${this._renderSettingsModal()}
           ${this._renderCoverSearchModal()}
           ${this._renderPodcastModal()}
           ${this._renderDriveSyncModal()}
+          ${this._renderDriveRemovalsModal()}
           ${this._renderDevicesModal()}
           ${this._renderWipeSyncedModal()}
+          ${this._renderContextMenuModal()}
           ${this._renderSyncProgressOverlay()}
           ${this._renderStatusToast()}
           ${this._renderErrorModal()}
@@ -6874,13 +7803,23 @@ class AudiobookApp {
       };
     }
 
+    const desktopViewKey =
+      nextViewMeta.layoutMode === 'desktop' ? nextViewMeta.desktopView : 'home';
+    const nextViewSignature = `${isLoggedIn}:${nextViewMeta.layoutMode}:${desktopViewKey}:${nextViewMeta.filterSource}:${Boolean(nextViewMeta.mobileSheetOpen)}:${Boolean(this._initializingAuth)}`;
+    const sameMainView =
+      this._lastMainViewSignature !== null && this._lastMainViewSignature === nextViewSignature;
+    const renderedBodyView = sameMainView ? this._applyNoEnterAnimHtml(bodyView) : bodyView;
+
     if (this._lastMainHtml !== bodyView) {
       const prevMeta = this._prevMainViewMeta;
       const scrollSnap = this._snapshotMainScroll(shell.main);
-      shell.main.innerHTML = bodyView;
+      shell.main.innerHTML = renderedBodyView;
       this._lastMainHtml = bodyView;
+      this._lastMainViewSignature = nextViewSignature;
       this._bindContainerEvents(shell.main);
       this._restoreMainScroll(shell.main, prevMeta, nextViewMeta, scrollSnap);
+    } else {
+      this._lastMainViewSignature = nextViewSignature;
     }
     this._prevMainViewMeta = nextViewMeta;
 
@@ -6889,6 +7828,12 @@ class AudiobookApp {
       shell.profile,
       isLoggedIn && Boolean(this.state.profileOpen),
       () => this._renderProfilePopover()
+    );
+    this._syncOverlaySlot(
+      'settings',
+      shell.settings,
+      isLoggedIn && Boolean(this.state.settingsModalOpen),
+      () => this._renderSettingsModal()
     );
     this._syncOverlaySlot(
       'cover',
@@ -6910,6 +7855,12 @@ class AudiobookApp {
       { isDriveSlot: true, sig: this._getDriveOverlaySignature() }
     );
     this._syncOverlaySlot(
+      'driveRemovals',
+      shell.driveRemovals,
+      isLoggedIn && Array.isArray(this.state.pendingDriveRemovals) && this.state.pendingDriveRemovals.length > 0,
+      () => this._renderDriveRemovalsModal()
+    );
+    this._syncOverlaySlot(
       'devices',
       shell.devices,
       isLoggedIn && Boolean(this.state.devicesModalOpen),
@@ -6917,6 +7868,12 @@ class AudiobookApp {
     );
     this._syncOverlaySlot('wipe', shell.wipe, Boolean(this.state.showWipeSyncedModal), () =>
       this._renderWipeSyncedModal()
+    );
+    this._syncOverlaySlot(
+      'contextMenu',
+      shell.contextMenu,
+      isLoggedIn && Boolean(this.state.contextMenu),
+      () => this._renderContextMenuModal()
     );
     this._syncOverlaySlot(
       'syncProgress',
@@ -6939,6 +7896,61 @@ class AudiobookApp {
 
   _bindContainerEvents(containerEl) {
     if (!containerEl || typeof containerEl.querySelector !== 'function') return;
+
+    const isContextOverlay = containerEl.id === 'appOverlayContextMenu';
+    if (!isContextOverlay && !containerEl._abContextBound && typeof containerEl.addEventListener === 'function') {
+      containerEl._abContextBound = true;
+      const cancelLongPress = () => {
+        if (this._longPressTimer) {
+          clearTimeout(this._longPressTimer);
+          this._longPressTimer = null;
+        }
+        this._longPressStart = null;
+      };
+
+      containerEl.addEventListener('contextmenu', (e) => {
+        const hit = closestByAttr(e.target, ['data-book-key', 'data-series', 'data-book']);
+        if (!hit) return;
+        e.preventDefault?.();
+        e.stopPropagation?.();
+        this.openContextMenuForTarget(hit, {
+          x: Number(e.clientX || 120),
+          y: Number(e.clientY || 120),
+          fromTouch: false
+        });
+      });
+
+      containerEl.addEventListener('touchstart', (e) => {
+        cancelLongPress();
+        const hit = closestByAttr(e.target, ['data-book-key', 'data-series', 'data-book']);
+        if (!hit) return;
+        const touch = e.touches?.[0] || e.changedTouches?.[0] || { clientX: 0, clientY: 0 };
+        this._longPressStart = { x: Number(touch.clientX || 0), y: Number(touch.clientY || 0) };
+        this._longPressTimer = setTimeout(() => {
+          this._longPressTimer = null;
+          this._suppressNextClickUntil = Date.now() + 450;
+          this.openContextMenuForTarget(hit, {
+            x: this._longPressStart?.x || 0,
+            y: this._longPressStart?.y || 0,
+            fromTouch: true
+          });
+        }, 480);
+      });
+
+      containerEl.addEventListener('touchmove', (e) => {
+        if (!this._longPressTimer || !this._longPressStart) return;
+        const touch = e.touches?.[0] || e.changedTouches?.[0];
+        if (!touch) return;
+        const dx = Number(touch.clientX || 0) - this._longPressStart.x;
+        const dy = Number(touch.clientY || 0) - this._longPressStart.y;
+        if (Math.hypot(dx, dy) > 10) {
+          cancelLongPress();
+        }
+      });
+
+      containerEl.addEventListener('touchend', cancelLongPress);
+      containerEl.addEventListener('touchcancel', cancelLongPress);
+    }
 
     const searchInput = containerEl.querySelector('#desktopSearchInput');
     if (searchInput) {
@@ -6998,15 +8010,19 @@ class AudiobookApp {
       podcastInput.addEventListener('input', (e) => {
         const val = e.target.value;
         this.state.podcastModal.query = val;
+        // Immediately refresh local audiobook/followed results in-place without touching #podcastSearchInput
+        this.render();
         if (this._podcastSearchDebounceTimer) {
           clearTimeout(this._podcastSearchDebounceTimer);
         }
-        this._podcastSearchDebounceTimer = setTimeout(() => {
-          this._podcastSearchDebounceTimer = null;
-          if (!this._destroyed && this.state.podcastModal?.open) {
-            void this.runPodcastSearch(val);
-          }
-        }, 180);
+        if (this.state.podcastModal.searchFilter !== 'audiobooks') {
+          this._podcastSearchDebounceTimer = setTimeout(() => {
+            this._podcastSearchDebounceTimer = null;
+            if (!this._destroyed && this.state.podcastModal?.open) {
+              void this.runPodcastSearch(val);
+            }
+          }, 180);
+        }
       });
     }
 
@@ -7052,16 +8068,25 @@ class AudiobookApp {
       }
 
       el.addEventListener('click', (e) => {
+        if (!isContextOverlay && Date.now() < (this._suppressNextClickUntil || 0)) {
+          e.preventDefault?.();
+          e.stopPropagation?.();
+          return;
+        }
         e.stopPropagation();
+        if (isContextOverlay && action !== 'close-context-menu') {
+          this.state.contextMenu = null;
+          this.render();
+        }
         switch (action) {
           case 'toggle-theme': {
-            const nextTheme = this.state.theme === 'pitch' ? 'midnight' : 'pitch';
+            const nextTheme = this.state.theme === 'amoled' ? 'pitch' : 'amoled';
             this._saveTheme(nextTheme);
             this.render();
             break;
           }
           case 'set-theme': {
-            const nextTheme = el.dataset.theme === 'pitch' ? 'pitch' : 'midnight';
+            const nextTheme = el.dataset.theme === 'amoled' ? 'amoled' : 'pitch';
             this._saveTheme(nextTheme);
             this.render();
             break;
@@ -7135,7 +8160,7 @@ class AudiobookApp {
               this._showRemoteLocalOnlyNotice(targetBook);
               break;
             }
-            if (key === this.state.activeBookKey) {
+            if (key === this.state.activeBookKey && this.audioEngine?.currentBook?.bookKey === key) {
               void this.audioEngine.togglePlay();
             } else {
               void this.selectBook(key, true);
@@ -7145,22 +8170,17 @@ class AudiobookApp {
           case 'open-detail': {
             const key = el.dataset.book;
             this.state.detailBookKey = key;
-            this.state.desktopView = 'detail';
-            const detailTarget = this.state.books.find((b) => b.bookKey === key);
-            const franchiseKey = this._getBookSeriesKey(detailTarget);
-            if (franchiseKey) {
-              this.state.expandedSeries.add(franchiseKey);
-            }
-            if (
+            const isMobile =
               this._isAndroidOrMobileViewport() ||
               this.state.layoutMode === 'android' ||
-              this.state.layoutMode === 'mobile'
-            ) {
+              this.state.layoutMode === 'mobile';
+            if (isMobile) {
               void this.selectBook(key, false).then(() => {
                 this.state.mobileSheetOpen = true;
-                this._runWithViewTransition(() => this.render());
+                this.render();
               });
             } else {
+              this.state.desktopView = 'detail';
               this._runWithViewTransition(() => this.render());
             }
             void this._enrichSingleBookInBackground(key);
@@ -7222,7 +8242,11 @@ class AudiobookApp {
               } else {
                 this.state.expandedSeries.add(seriesKey);
               }
-              this._runWithViewTransition(() => this.render());
+              if (this._isAndroidOrMobileViewport()) {
+                this.render();
+              } else {
+                this._runWithViewTransition(() => this.render());
+              }
             }
             break;
           }
@@ -7250,6 +8274,7 @@ class AudiobookApp {
           }
           case 'open-wipe-synced-modal': {
             this.state.profileOpen = false;
+            this.state.settingsModalOpen = false;
             this.state.showWipeSyncedModal = true;
             this.render();
             break;
@@ -7309,6 +8334,7 @@ class AudiobookApp {
             break;
           }
           case 'open-cover-search': {
+            this.state.settingsModalOpen = false;
             void this.openCoverSearchModal(el.dataset.book);
             break;
           }
@@ -7331,6 +8357,8 @@ class AudiobookApp {
           }
           case 'trigger-local-folder': {
             this.state.profileOpen = false;
+            this.state.settingsModalOpen = false;
+            this.render();
             if (!this._isAndroidOrMobileViewport() && typeof window.showDirectoryPicker === 'function') {
               void (async () => {
                 try {
@@ -7363,6 +8391,8 @@ class AudiobookApp {
           }
           case 'trigger-local-files': {
             this.state.profileOpen = false;
+            this.state.settingsModalOpen = false;
+            this.render();
             const filesInput = document.getElementById('localAudioFilesInput');
             if (filesInput) filesInput.click();
             break;
@@ -7385,7 +8415,7 @@ class AudiobookApp {
             break;
           }
           case 'clear-filters': {
-            this.state.filterSource = 'all';
+            this.state.filterSource = 'audiobooks';
             this.state.searchQuery = '';
             this.render();
             break;
@@ -7396,6 +8426,7 @@ class AudiobookApp {
             break;
           }
           case 'connect-drive': {
+            this.state.settingsModalOpen = false;
             void this.handleConnectGoogleDrive();
             break;
           }
@@ -7427,9 +8458,67 @@ class AudiobookApp {
             break;
           }
           case 'dismiss-remote-prompt': {
-            this._dismissedRemotePromptSig = this.state.remotePlaybackPrompt?.sig || null;
+            const dismissedSig = this.state.remotePlaybackPrompt?.sig || null;
+            this._dismissedRemotePromptSig = dismissedSig;
+            if (dismissedSig) {
+              if (!this._dismissedRemotePromptSigs) this._dismissedRemotePromptSigs = new Set();
+              this._dismissedRemotePromptSigs.add(dismissedSig);
+              this._saveDismissedContinueSigs();
+            }
             this.state.remotePlaybackPrompt = null;
             this.render();
+            break;
+          }
+          case 'open-settings-modal': {
+            this.state.profileOpen = false;
+            this.state.settingsModalOpen = true;
+            this.render();
+            break;
+          }
+          case 'close-settings-modal': {
+            this.state.settingsModalOpen = false;
+            this.render();
+            break;
+          }
+          case 'toggle-advanced-settings': {
+            this.state.advancedSettingsExpanded = !this.state.advancedSettingsExpanded;
+            this.render();
+            break;
+          }
+          case 'toggle-auto-drive-sync': {
+            this._saveAutoDriveSyncEnabled(this.state.autoDriveSyncEnabled === false);
+            this.render();
+            break;
+          }
+          case 'close-context-menu': {
+            if (el.classList?.contains?.('modal-backdrop') && e.target && e.target !== el) {
+              break;
+            }
+            this.closeContextMenu();
+            break;
+          }
+          case 'mark-podcast-played': {
+            void this.markPodcastAllPlayed(el.dataset.bookKey || el.dataset.book);
+            break;
+          }
+          case 'mark-book-finished': {
+            void this.markBookFinished(el.dataset.book || el.dataset.bookKey);
+            break;
+          }
+          case 'reset-book-progress': {
+            void this.resetBookProgress(el.dataset.book || el.dataset.bookKey);
+            break;
+          }
+          case 'remove-book-library': {
+            void this.removeBookFromLibrary(el.dataset.book || el.dataset.bookKey);
+            break;
+          }
+          case 'confirm-drive-removals': {
+            void this.confirmDriveRemovals();
+            break;
+          }
+          case 'dismiss-drive-removals': {
+            this.dismissDriveRemovals();
             break;
           }
           case 'open-devices-modal': {
@@ -7451,11 +8540,42 @@ class AudiobookApp {
             break;
           }
           case 'auto-match-tags': {
+            this.state.settingsModalOpen = false;
             void this.handleAutoMatchTags(el.dataset.book);
+            break;
+          }
+          case 'open-search-modal': {
+            void this.openSearchModal(
+              el.dataset.query || '',
+              el.dataset.searchFilter || 'all',
+              el.dataset.categoryId || ''
+            );
             break;
           }
           case 'open-podcast-modal': {
             void this.openPodcastModal(el.dataset.query || '');
+            break;
+          }
+          case 'set-search-filter': {
+            this.setSearchFilter(el.dataset.searchFilter || 'all');
+            break;
+          }
+          case 'search-select-book': {
+            const key = el.dataset.book;
+            this.closePodcastModal();
+            if (key) {
+              this.state.detailBookKey = key;
+              const isMobile =
+                this._isAndroidOrMobileViewport() ||
+                this.state.layoutMode === 'android' ||
+                this.state.layoutMode === 'mobile';
+              if (isMobile) {
+                this.state.mobileSheetOpen = true;
+              } else {
+                this.state.desktopView = 'detail';
+              }
+              void this.selectBook(key, true);
+            }
             break;
           }
           case 'open-podcast-category': {

@@ -632,6 +632,46 @@ function mapBookmarkRowToClient(row) {
   };
 }
 
+const GOOGLE_TOKEN_SYNC_MAX_AGE_MS = 50 * 60 * 1000;
+
+function encodeDriveFolderNameEnvelope({ folderName = '', googleAccessToken = '', googleTokenObtainedAt = 0 } = {}) {
+  const cleanName = String(folderName || '').trim();
+  const cleanToken = typeof googleAccessToken === 'string' ? googleAccessToken.trim() : '';
+  const obtainedAt = Number(googleTokenObtainedAt || 0) || 0;
+  const ageMs = obtainedAt > 0 ? Date.now() - obtainedAt : 0;
+  if (cleanToken && obtainedAt > 0 && ageMs < GOOGLE_TOKEN_SYNC_MAX_AGE_MS) {
+    return JSON.stringify({
+      folderName: cleanName,
+      googleAccessToken: cleanToken,
+      googleTokenObtainedAt: obtainedAt
+    });
+  }
+  return cleanName;
+}
+
+function decodeDriveFolderNameEnvelope(rawDriveFolderName) {
+  const raw = String(rawDriveFolderName || '').trim();
+  if (raw.startsWith('{') && raw.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && typeof parsed.folderName === 'string') {
+        return {
+          folderName: parsed.folderName.trim(),
+          googleAccessToken: typeof parsed.googleAccessToken === 'string' ? parsed.googleAccessToken.trim() : '',
+          googleTokenObtainedAt: Number(parsed.googleTokenObtainedAt || 0) || 0
+        };
+      }
+    } catch {
+      // Fall through to plain folder name
+    }
+  }
+  return {
+    folderName: raw,
+    googleAccessToken: '',
+    googleTokenObtainedAt: 0
+  };
+}
+
 /**
  * Coordinates Google OAuth authentication, Supabase REST persistence,
  * Google Drive appDataFolder cloud sync, Realtime WebSocket / BroadcastChannel
@@ -708,6 +748,8 @@ export class SupabaseSyncService {
       this.session?.googleAccessToken ||
       this._loadManualGoogleToken() ||
       null;
+    this.googleTokenObtainedAt = Number(this.session?.googleTokenObtainedAt || 0) || 0;
+    this._lastGoogleTokenFromRemote = false;
     this._bridgeInFlight = new Map();
     this._bridgeFailedEmails = new Set();
     this._silentGoogleRefreshInFlight = null;
@@ -964,8 +1006,10 @@ export class SupabaseSyncService {
         this.session?.googleAccessToken ||
         this._loadManualGoogleToken() ||
         null;
+      this.googleTokenObtainedAt = Number(this.session?.googleTokenObtainedAt || 0) || 0;
     } else {
       this.googleAccessToken = this._loadManualGoogleToken() || null;
+      this.googleTokenObtainedAt = 0;
     }
 
     return this.session?.user ? this.session : null;
@@ -1137,6 +1181,11 @@ export class SupabaseSyncService {
       session?.googleAccessToken ||
       this._loadManualGoogleToken() ||
       null;
+    const sessionObtainedAt = Number(session?.googleTokenObtainedAt || 0);
+    this.googleTokenObtainedAt =
+      Number.isFinite(sessionObtainedAt) && sessionObtainedAt > 0
+        ? sessionObtainedAt
+        : (this.googleAccessToken ? Date.now() : 0);
   }
 
   _loadManualGoogleToken() {
@@ -1164,10 +1213,10 @@ export class SupabaseSyncService {
     };
   }
 
-  _emitGoogleTokenChange(token) {
+  _emitGoogleTokenChange(token, meta = {}) {
     for (const listener of this._googleTokenListeners) {
       try {
-        listener(token || null);
+        listener(token || null, meta);
       } catch {
         // Isolate subscriber errors
       }
@@ -1177,11 +1226,17 @@ export class SupabaseSyncService {
   /**
    * Persists a Google OAuth provider token for Google Drive API v3 calls.
    * @param {string|null} token
+   * @param {{ obtainedAt?: number, fromRemote?: boolean }} [options]
    */
-  setGoogleAccessToken(token) {
+  setGoogleAccessToken(token, options = {}) {
     const clean = typeof token === 'string' ? token.trim() : '';
-    const obtainedAt = clean ? Date.now() : null;
+    const parsedObtainedAt = Number(options?.obtainedAt || 0);
+    const obtainedAt = clean
+      ? (Number.isFinite(parsedObtainedAt) && parsedObtainedAt > 0 ? parsedObtainedAt : Date.now())
+      : null;
     this.googleAccessToken = clean || null;
+    this.googleTokenObtainedAt = obtainedAt || 0;
+    this._lastGoogleTokenFromRemote = Boolean(options?.fromRemote);
     if (clean) {
       this.needsDriveSyncReauth = false;
       this.needsDriveConsent = false;
@@ -1210,7 +1265,7 @@ export class SupabaseSyncService {
         googleTokenObtainedAt: obtainedAt
       });
     }
-    this._emitGoogleTokenChange(this.googleAccessToken);
+    this._emitGoogleTokenChange(this.googleAccessToken, { fromRemote: this._lastGoogleTokenFromRemote });
   }
 
   /**
@@ -3521,11 +3576,19 @@ export class SupabaseSyncService {
   }
 
   /**
-   * Persists the linked Google Drive folder configuration across Supabase and/or Drive appDataFolder.
-   * @param {{ folderId?: string, folderName?: string, lastActiveBookKey?: string|null, updatedAt?: string }} [config]
+   * Persists the linked Google Drive folder configuration across Supabase and/or Drive appDataFolder,
+   * safely enveloping fresh Google OAuth token metadata for cross-device adoption.
+   * @param {{ folderId?: string, folderName?: string, lastActiveBookKey?: string|null, updatedAt?: string, googleAccessToken?: string, googleTokenObtainedAt?: number }} [config]
    * @returns {Promise<{ folderId: string, folderName: string, lastActiveBookKey: string|null, updatedAt: string }|null>}
    */
-  async syncDriveFolderConfig({ folderId = '', folderName = '', lastActiveBookKey = null, updatedAt } = {}) {
+  async syncDriveFolderConfig({
+    folderId = '',
+    folderName = '',
+    lastActiveBookKey = null,
+    updatedAt,
+    googleAccessToken,
+    googleTokenObtainedAt
+  } = {}) {
     const cleanConfig = {
       folderId: String(folderId || '').trim(),
       folderName: String(folderName || '').trim(),
@@ -3536,6 +3599,31 @@ export class SupabaseSyncService {
     if (!this._isOnline() || !this.hasCloudSyncAuth()) {
       return null;
     }
+
+    const tokenToSync =
+      typeof googleAccessToken === 'string'
+        ? googleAccessToken.trim()
+        : (this.getGoogleAccessToken() || '');
+    const rawObtainedAt = Number(
+      googleTokenObtainedAt ||
+      this.googleTokenObtainedAt ||
+      this.session?.googleTokenObtainedAt ||
+      0
+    );
+    const obtainedAtToSync = tokenToSync
+      ? (Number.isFinite(rawObtainedAt) && rawObtainedAt > 0 ? rawObtainedAt : Date.now())
+      : 0;
+    const isFreshToken = Boolean(
+      tokenToSync &&
+      obtainedAtToSync > 0 &&
+      Date.now() - obtainedAtToSync < GOOGLE_TOKEN_SYNC_MAX_AGE_MS
+    );
+
+    const encodedFolderName = encodeDriveFolderNameEnvelope({
+      folderName: cleanConfig.folderName,
+      googleAccessToken: isFreshToken ? tokenToSync : '',
+      googleTokenObtainedAt: isFreshToken ? obtainedAtToSync : 0
+    });
 
     let supaSaved = false;
     if (this.isAuthenticated()) {
@@ -3548,21 +3636,47 @@ export class SupabaseSyncService {
           body: {
             user_id: this.session.user.id,
             drive_folder_id: cleanConfig.folderId,
-            drive_folder_name: cleanConfig.folderName,
+            drive_folder_name: encodedFolderName,
             last_active_book_key: cleanConfig.lastActiveBookKey,
             updated_at: cleanConfig.updatedAt
           }
         });
         supaSaved = true;
-      } catch {
-        // Continue to Drive appDataFolder
+      } catch (err) {
+        const msg = String(err?.message || '');
+        if (/PGRST204|column/i.test(msg)) {
+          try {
+            await this._rest('audiobook_user_settings?on_conflict=user_id', {
+              method: 'POST',
+              headers: {
+                Prefer: 'resolution=merge-duplicates,return=representation'
+              },
+              body: {
+                user_id: this.session.user.id,
+                drive_folder_id: cleanConfig.folderId,
+                last_active_book_key: cleanConfig.lastActiveBookKey,
+                updated_at: cleanConfig.updatedAt
+              }
+            });
+            supaSaved = true;
+          } catch {
+            // Continue to Drive appDataFolder
+          }
+        }
       }
     }
 
     let driveSaved = false;
     if (this.hasDriveSyncToken()) {
+      const drivePayloadConfig = isFreshToken
+        ? {
+            ...cleanConfig,
+            googleAccessToken: tokenToSync,
+            googleTokenObtainedAt: obtainedAtToSync
+          }
+        : cleanConfig;
       const written = await this._writeDriveSyncPayload({
-        driveFolder: cleanConfig
+        driveFolder: drivePayloadConfig
       }).catch(() => null);
       driveSaved = Boolean(written);
     }
@@ -3577,17 +3691,25 @@ export class SupabaseSyncService {
     }
 
     let supaConfig = null;
+    let supaTokenInfo = null;
     if (this.isAuthenticated()) {
       try {
         const rows = await this._rest('audiobook_user_settings?select=*&limit=1');
         const row = Array.isArray(rows) ? rows[0] : null;
         if (row) {
+          const decoded = decodeDriveFolderNameEnvelope(row.drive_folder_name);
           supaConfig = {
             folderId: String(row.drive_folder_id || ''),
-            folderName: String(row.drive_folder_name || ''),
+            folderName: decoded.folderName,
             lastActiveBookKey: row.last_active_book_key || null,
             updatedAt: row.updated_at || null
           };
+          if (decoded.googleAccessToken && decoded.googleTokenObtainedAt > 0) {
+            supaTokenInfo = {
+              googleAccessToken: decoded.googleAccessToken,
+              googleTokenObtainedAt: decoded.googleTokenObtainedAt
+            };
+          }
         }
       } catch {
         // Continue to Drive
@@ -3595,6 +3717,7 @@ export class SupabaseSyncService {
     }
 
     let driveConfig = null;
+    let driveTokenInfo = null;
     if (preloadedDrivePayload !== undefined ? Boolean(preloadedDrivePayload) : this.hasDriveSyncToken()) {
       try {
         const drivePayload =
@@ -3602,16 +3725,51 @@ export class SupabaseSyncService {
             ? preloadedDrivePayload
             : (await this._readDriveSyncPayload()).payload;
         if (drivePayload?.driveFolder && typeof drivePayload.driveFolder === 'object') {
+          const decoded = decodeDriveFolderNameEnvelope(drivePayload.driveFolder.folderName);
           driveConfig = {
             folderId: String(drivePayload.driveFolder.folderId || ''),
-            folderName: String(drivePayload.driveFolder.folderName || ''),
+            folderName: decoded.folderName,
             lastActiveBookKey: drivePayload.driveFolder.lastActiveBookKey || null,
             updatedAt: drivePayload.driveFolder.updatedAt || null
           };
+          const dfToken =
+            typeof drivePayload.driveFolder.googleAccessToken === 'string'
+              ? drivePayload.driveFolder.googleAccessToken.trim()
+              : decoded.googleAccessToken;
+          const dfObtainedAt =
+            Number(drivePayload.driveFolder.googleTokenObtainedAt || decoded.googleTokenObtainedAt || 0) || 0;
+          if (dfToken && dfObtainedAt > 0) {
+            driveTokenInfo = {
+              googleAccessToken: dfToken,
+              googleTokenObtainedAt: dfObtainedAt
+            };
+          }
         }
       } catch {
         // Ignore
       }
+    }
+
+    const tokenCandidates = [supaTokenInfo, driveTokenInfo].filter(
+      (c) =>
+        c &&
+        c.googleAccessToken &&
+        c.googleTokenObtainedAt > 0 &&
+        Date.now() - c.googleTokenObtainedAt < GOOGLE_TOKEN_SYNC_MAX_AGE_MS
+    );
+    tokenCandidates.sort((a, b) => b.googleTokenObtainedAt - a.googleTokenObtainedAt);
+    const freshestRemoteToken = tokenCandidates[0] || null;
+    const localObtainedAt =
+      Number(this.googleTokenObtainedAt || this.session?.googleTokenObtainedAt || 0) || 0;
+    if (
+      freshestRemoteToken &&
+      freshestRemoteToken.googleTokenObtainedAt > localObtainedAt &&
+      freshestRemoteToken.googleAccessToken !== this.getGoogleAccessToken()
+    ) {
+      this.setGoogleAccessToken(freshestRemoteToken.googleAccessToken, {
+        obtainedAt: freshestRemoteToken.googleTokenObtainedAt,
+        fromRemote: true
+      });
     }
 
     if (!supaConfig && !driveConfig) return null;

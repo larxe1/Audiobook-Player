@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'audiobook-player-v2';
+const CACHE_VERSION = 'multiplayer-v3';
 
 const APP_SHELL_ASSETS = [
   './',
@@ -7,6 +7,10 @@ const APP_SHELL_ASSETS = [
   './src/styles/theme.css',
   './public/manifest.json',
   './public/icon.svg',
+  './public/icon-192.png',
+  './public/icon-512.png',
+  './public/apple-touch-icon.png',
+  './public/favicon.ico',
   './src/ui/app.js',
   './src/ui/icons.js',
   './src/player/audio-engine.js',

@@ -1,21 +1,22 @@
-/* Audiobook Player — Theme Tokens, Surfaces & Spring Motion */
+/* MultiPlayer — Theme Tokens, Surfaces & Spring Motion */
 
 :root,
-body.theme-midnight,
-.theme-midnight {
-  --bg-canvas: #060911;
-  --bg-shell: #080c16;
-  --bg-panel: #0d1322;
-  --bg-card: #131b2e;
-  --bg-card-hover: #1b2640;
-  --border-subtle: rgba(148, 163, 184, 0.12);
-  --text-primary: #f8fafc;
-  --text-secondary: #94a3b8;
-  --text-muted: #64748b;
+body,
+body.theme-pitch,
+.theme-pitch {
+  --bg-canvas: #050506;
+  --bg-shell: #08080a;
+  --bg-panel: #101012;
+  --bg-card: #161619;
+  --bg-card-hover: #202025;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --text-primary: #fafafa;
+  --text-secondary: #a1a1aa;
+  --text-muted: #71717a;
   --accent: #1ed760;
   --accent-hover: #1fdf64;
-  --ambient-color: rgba(30, 215, 96, 0.18);
-  --range-track: rgba(148, 163, 184, 0.22);
+  --ambient-color: rgba(30, 215, 96, 0.16);
+  --range-track: rgba(255, 255, 255, 0.18);
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
   --dur-fast: 160ms;
@@ -35,20 +36,20 @@ body.theme-midnight,
   }
 }
 
-body.theme-pitch,
-.theme-pitch {
-  --bg-canvas: #050506;
-  --bg-shell: #08080a;
-  --bg-panel: #101012;
-  --bg-card: #161619;
-  --bg-card-hover: #202025;
-  --border-subtle: rgba(255, 255, 255, 0.08);
-  --text-primary: #fafafa;
+body.theme-amoled,
+.theme-amoled {
+  --bg-canvas: #000000;
+  --bg-shell: #040405;
+  --bg-panel: #0a0a0c;
+  --bg-card: #111114;
+  --bg-card-hover: #1a1a1f;
+  --border-subtle: rgba(255, 255, 255, 0.09);
+  --text-primary: #ffffff;
   --text-secondary: #a1a1aa;
   --text-muted: #71717a;
   --accent: #1ed760;
   --accent-hover: #1fdf64;
-  --ambient-color: rgba(30, 215, 96, 0.16);
+  --ambient-color: rgba(30, 215, 96, 0.14);
   --range-track: rgba(255, 255, 255, 0.18);
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
@@ -210,14 +211,14 @@ body {
 }
 
 @starting-style {
-  .ui-view-enter {
+  .ui-view-enter:not(.no-enter-anim) {
     opacity: 0;
     translate: 0 10px;
   }
 }
 
-.ui-stagger-grid > *,
-.ui-stagger-item {
+.ui-stagger-grid:not(.no-enter-anim) > *,
+.ui-stagger-item:not(.no-enter-anim) {
   animation: uiViewRise 320ms var(--ease-out-expo) both;
 }
 
@@ -265,7 +266,7 @@ body {
 }
 
 @starting-style {
-  .modal-backdrop {
+  .modal-backdrop:not(.no-enter-anim) {
     opacity: 0;
   }
 }
@@ -328,7 +329,7 @@ body {
       var(--ambient-color) 0%,
       transparent 70%
     ),
-    rgba(13, 19, 34, 0.94);
+    rgba(16, 16, 18, 0.95);
   backdrop-filter: blur(22px);
   -webkit-backdrop-filter: blur(22px);
   border: 1px solid var(--border-subtle);
@@ -339,16 +340,6 @@ body {
     translate 280ms var(--ease-out-expo),
     scale 280ms var(--ease-out-expo),
     opacity 240ms var(--ease-out-expo);
-}
-
-.theme-pitch .notif-shade {
-  background:
-    radial-gradient(
-      110% 90% at 15% 15%,
-      var(--ambient-color) 0%,
-      transparent 70%
-    ),
-    rgba(16, 16, 18, 0.95);
 }
 
 /* Gmail Profile & Settings Popover */
@@ -379,9 +370,9 @@ body {
 }
 
 @starting-style {
-  .sheet-modal,
-  .notif-shade,
-  .popover-menu {
+  .sheet-modal:not(.no-enter-anim),
+  .notif-shade:not(.no-enter-anim),
+  .popover-menu:not(.no-enter-anim) {
     opacity: 0;
     translate: 0 18px;
     scale: 0.98;
@@ -406,8 +397,23 @@ body {
 
 .sheet-modal.no-enter-anim,
 .notif-shade.no-enter-anim,
-.popover-menu.no-enter-anim {
+.popover-menu.no-enter-anim,
+.modal-backdrop.no-enter-anim,
+.ui-view-enter.no-enter-anim,
+.ui-stagger-grid.no-enter-anim > *,
+.ui-stagger-item.no-enter-anim {
   animation: none !important;
+}
+
+.modal-backdrop.no-enter-anim {
+  transition: none !important;
+}
+
+/* Long-Press & Right-Click Context Target */
+.library-context-target {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 /* Strict 2-Line Clamping & Text Containment */
@@ -509,34 +515,27 @@ input[type="range"]::-moz-range-thumb {
 
 /* Workspace Update & Cloud Sync Banners */
 .update-banner {
-  background: linear-gradient(90deg, rgba(30, 215, 96, 0.14) 0%, rgba(13, 19, 34, 0.92) 70%);
+  background: linear-gradient(90deg, rgba(30, 215, 96, 0.12) 0%, rgba(16, 16, 18, 0.95) 70%);
   border-bottom: 1px solid rgba(30, 215, 96, 0.28);
 }
 
-.theme-pitch .update-banner {
-  background: linear-gradient(90deg, rgba(30, 215, 96, 0.12) 0%, rgba(16, 16, 18, 0.95) 70%);
-}
-
 .sync-reauth-banner {
-  background: linear-gradient(90deg, rgba(96, 165, 250, 0.14) 0%, rgba(13, 19, 34, 0.92) 70%);
+  background: linear-gradient(90deg, rgba(96, 165, 250, 0.12) 0%, rgba(16, 16, 18, 0.95) 70%);
   border-bottom: 1px solid rgba(96, 165, 250, 0.28);
 }
 
-.theme-pitch .sync-reauth-banner {
-  background: linear-gradient(90deg, rgba(96, 165, 250, 0.12) 0%, rgba(16, 16, 18, 0.95) 70%);
-}
-
-/* Continue Playing on Another Device Card */
+/* Compact Continue Playing on Another Device Pill/Bar */
 .continue-device-card {
+  padding: 6px 10px;
   background:
-    radial-gradient(110% 100% at 0% 0%, rgba(30, 215, 96, 0.16) 0%, transparent 65%),
+    radial-gradient(110% 100% at 0% 0%, rgba(30, 215, 96, 0.14) 0%, transparent 65%),
     var(--bg-card);
-  border: 1px solid rgba(30, 215, 96, 0.32);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.32);
+  border: 1px solid rgba(30, 215, 96, 0.3);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
   transition:
-    border-color 220ms var(--ease-spring),
-    transform 220ms var(--ease-spring),
-    background-color 220ms var(--ease-spring);
+    border-color 200ms var(--ease-spring),
+    transform 200ms var(--ease-spring),
+    background-color 200ms var(--ease-spring);
 }
 
 .continue-device-card:hover {

@@ -1,6 +1,6 @@
-export const LOCAL_VERSION = '1.0.18';
-export const LOCAL_BUILD = 19;
-const LOCAL_BUILD_VERSION = '1.0.18';
+export const LOCAL_VERSION = '1.0.19';
+export const LOCAL_BUILD = 20;
+const LOCAL_BUILD_VERSION = '1.0.19';
 
 /**
  * Detect the runtime platform for update delivery.
@@ -172,8 +172,14 @@ function normalizeManifest(payload, defaults = {}) {
   // GitHub Releases API shape
   if (typeof payload.tag_name === 'string') {
     const assets = Array.isArray(payload.assets) ? payload.assets : [];
-    const apkAsset = assets.find((a) => String(a?.name || '').toLowerCase().endsWith('.apk'));
-    const exeAsset = assets.find((a) => String(a?.name || '').toLowerCase().endsWith('.exe'));
+    const apkAsset =
+      assets.find((a) => /^multiplayer.*\.apk$/i.test(String(a?.name || ''))) ||
+      assets.find((a) => /^audiobook-player.*\.apk$/i.test(String(a?.name || ''))) ||
+      assets.find((a) => String(a?.name || '').toLowerCase().endsWith('.apk'));
+    const exeAsset =
+      assets.find((a) => /^multiplayer.*\.exe$/i.test(String(a?.name || ''))) ||
+      assets.find((a) => /^audiobook-player.*\.exe$/i.test(String(a?.name || ''))) ||
+      assets.find((a) => String(a?.name || '').toLowerCase().endsWith('.exe'));
     const webBundleAsset =
       assets.find((a) => String(a?.name || '').toLowerCase() === 'web-bundle.zip') ||
       assets.find((a) => {
@@ -526,16 +532,15 @@ export class SelfUpdaterService {
     const useWebOta = !isWindows && this._canUseAndroidWebOta(activeManifest, win);
     const deliveryMode = isWindows ? 'exe' : useWebOta ? 'web-ota' : 'apk';
     const expectedExt = isWindows ? '.exe' : useWebOta ? '.zip' : '.apk';
-    const expectedAssetFilename = isWindows
-      ? 'Audiobook-Player.exe'
-      : useWebOta
-        ? 'web-bundle.zip'
-        : 'Audiobook-Player.apk';
     const rawUrl = isWindows
       ? activeManifest.exeDownloadUrl || this.exeDownloadUrl || ''
       : useWebOta
         ? activeManifest.webBundleUrl || this.webBundleUrl || DEFAULT_WEB_BUNDLE_URL
         : activeManifest.apkDownloadUrl || this.apkDownloadUrl || '';
+    const rawFilenameMatch = String(rawUrl || '').match(/\/([^/?#]+(?:\.exe|\.apk|\.zip))(?:[?#]|$)/i);
+    const expectedAssetFilename = useWebOta
+      ? 'web-bundle.zip'
+      : rawFilenameMatch?.[1] || (isWindows ? 'Audiobook-Player.exe' : 'Audiobook-Player.apk');
 
     if (!rawUrl) {
       return { ready: false, url: '', deliveryMode, reason: 'missing-url' };
@@ -569,7 +574,14 @@ export class SelfUpdaterService {
               const name = String(a?.name || '').toLowerCase();
               return name.endsWith('.zip') && name.includes('web-bundle');
             })
-          : assets.find((a) =>
+          : assets.find((a) => String(a?.name || '').toLowerCase() === expectedAssetFilename.toLowerCase()) ||
+            assets.find((a) =>
+              new RegExp(`^multiplayer.*\\${expectedExt}$`, 'i').test(String(a?.name || ''))
+            ) ||
+            assets.find((a) =>
+              new RegExp(`^audiobook-player.*\\${expectedExt}$`, 'i').test(String(a?.name || ''))
+            ) ||
+            assets.find((a) =>
               String(a?.name || '')
                 .toLowerCase()
                 .endsWith(expectedExt)
@@ -735,7 +747,7 @@ export class SelfUpdaterService {
       subtitle.id = 'mandatory-update-subtitle';
       subtitle.style.cssText = 'margin: 0; font-size: 13.5px; line-height: 1.5; color: #cbd5e1;';
       subtitle.textContent =
-        'Please wait while Audiobook Player downloads and applies the latest update to keep your library and cloud sync bug-free.';
+        'Please wait while MultiPlayer downloads and applies the latest update to keep your library and cloud sync bug-free.';
 
       const progressWrap = doc.createElement('div');
       progressWrap.id = 'mandatory-update-progress';
@@ -1109,7 +1121,7 @@ export class SelfUpdaterService {
             } else if (status === 'permission_required') {
               gate?.updateStatus(
                 evt.message ||
-                  "Allow 'Install unknown apps' for Audiobook Player, then return here or tap 'Install Update Now' below.",
+                  "Allow 'Install unknown apps' for MultiPlayer, then return here or tap 'Install Update Now' below.",
                 50,
                 true
               );

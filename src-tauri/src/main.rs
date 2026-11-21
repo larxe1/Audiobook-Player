@@ -316,7 +316,7 @@ async fn desktop_start_google_oauth(
     let app_for_nav = app.clone();
 
     let mut builder = WebviewWindowBuilder::new(&app, win_label, WebviewUrl::External(parsed_url))
-        .title("Continue with Google — Audiobook Player")
+        .title("Continue with Google — MultiPlayer")
         .inner_size(500.0, 680.0)
         .center()
         .visible(!is_silent)
@@ -725,11 +725,11 @@ fn build_main_window(
     data_directory: Option<PathBuf>,
 ) -> tauri::Result<WebviewWindow> {
     let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
-        .title("Audiobook Player")
+        .title("MultiPlayer")
         .inner_size(1280.0, 820.0)
         .min_inner_size(900.0, 620.0)
         .resizable(true)
-        .background_color(Color(6, 9, 17, 255))
+        .background_color(Color(0, 0, 0, 255))
         .visible(true)
         .focused(true);
 
@@ -831,5 +831,5 @@ fn main() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running Audiobook Player");
+        .expect("error while running MultiPlayer");
 }
