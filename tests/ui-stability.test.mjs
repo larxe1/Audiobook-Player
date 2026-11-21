@@ -1287,15 +1287,35 @@ test('podcasts filter chip, + Podcast trigger, Podcast Finder modal stability, s
     app.state.activeBookKey = app.books[0].bookKey;
     app.render();
 
-    // 1. Desktop sidebar renders Podcasts filter chip and + Podcast button
+    // 1. Desktop sidebar & main header render Podcasts filter chip, prominent Find Podcasts button, and zero standalone Devices clutter in transport bar
     const desktopPodcastChip = env.rootEl.querySelector('[data-action="set-filter"][data-filter="podcasts"]');
     const desktopOpenPodcastBtn = env.rootEl.querySelector('[data-action="open-podcast-modal"]');
     assert.ok(desktopPodcastChip, 'Desktop sidebar must render Podcasts filter chip');
-    assert.ok(desktopOpenPodcastBtn, 'Desktop sidebar must render + Podcast button');
+    assert.ok(desktopPodcastChip.classList.contains('filter-pill'), 'Filter chip must carry filter-pill animation class');
+    assert.ok(desktopOpenPodcastBtn, 'Desktop must render Find Podcasts button');
+    assert.equal(
+      env.rootEl.querySelector('#appMainLayer')?.querySelector('[data-action="open-devices-modal"]'),
+      null,
+      'Standalone open-devices-modal button must not clutter Desktop bottom transport bar'
+    );
 
-    // Switch to Podcasts filter with 0 podcasts and search query -> renders 1-tap Live Podcasts search button
+    // Profile popover still retains Devices entry
+    app.state.profileOpen = true;
+    app.render();
+    assert.ok(
+      env.rootEl.querySelector('#appOverlayProfile')?.querySelector('[data-action="open-devices-modal"]'),
+      'Devices action must remain accessible inside Profile Avatar popover'
+    );
+    app.state.profileOpen = false;
+    app.render();
+
+    // Switch to Podcasts filter -> renders inline Podcast Discovery Hub (open-podcast-category) and 1-tap Live Podcasts search button
     desktopPodcastChip.click();
     assert.equal(app.state.filterSource, 'podcasts');
+    assert.ok(
+      env.rootEl.querySelector('[data-action="open-podcast-category"][data-category-id="trending"]'),
+      'Inline Podcast Discovery Hub must render 1-tap category pills when filterSource === podcasts'
+    );
     app.state.searchQuery = 'Hard Fork';
     app.render();
     const liveSearchBtn = env.rootEl.querySelector('[data-action="open-podcast-modal"][data-query="Hard Fork"]');
@@ -1327,6 +1347,8 @@ test('podcasts filter chip, + Podcast trigger, Podcast Finder modal stability, s
     const podcastSlot = env.rootEl.querySelector('#appOverlayPodcast');
     const initialPodcastModal = podcastSlot.querySelector('.sheet-modal');
     assert.ok(initialPodcastModal, 'Podcast Finder modal should mount in #appOverlayPodcast');
+    assert.ok(podcastSlot.querySelector('.modal-backdrop'), 'Podcast Finder modal backdrop must carry modal-backdrop class');
+    assert.ok(podcastSlot.querySelector('.ui-stagger-grid'), 'Podcast Finder results must carry ui-stagger-grid class');
     assert.ok(podcastSlot.querySelector('[data-action="podcast-search-input"]'), 'Podcast search input must render');
     assert.ok(
       podcastSlot.querySelector('[data-action="select-podcast-category"][data-category-id="tech"]'),
@@ -1438,12 +1460,23 @@ test('podcasts filter chip, + Podcast trigger, Podcast Finder modal stability, s
       'downloaded filter must include podcasts with offlineCached episodes'
     );
 
-    // 5. Switch to Android Mobile viewport (< 768px) -> verifies mobile Podcasts chip, + Podcast button, and New Episodes shelf
+    // 5. Switch to Android Mobile viewport (< 768px) -> verifies mobile Podcasts chip, pinned Find Podcasts button, inline Discovery Hub, animation classes, and zero standalone Devices clutter
     app.state.filterSource = 'podcasts';
     env.mockWindow.innerWidth = 390;
     app.render();
     assert.ok(env.rootEl.querySelector('[data-action="set-filter"][data-filter="podcasts"]'));
     assert.ok(env.rootEl.querySelector('[data-action="open-podcast-modal"]'));
+    assert.ok(
+      env.rootEl.querySelector('[data-action="open-podcast-category"][data-category-id="tech"]'),
+      'Inline Podcast Discovery Hub must render on Mobile even when podcasts are already followed'
+    );
+    assert.equal(
+      env.rootEl.querySelector('#appMainLayer')?.querySelector('[data-action="open-devices-modal"]'),
+      null,
+      'Standalone open-devices-modal button must not clutter Mobile top header'
+    );
+    assert.ok(env.rootEl.querySelector('.ui-view-enter'), 'Main sections must carry ui-view-enter class');
+    assert.ok(env.rootEl.querySelector('.ui-stagger-grid'), 'Card grids must carry ui-stagger-grid class');
     assert.match(env.rootEl.querySelector('#mobileMainScroll').textContent, /New Episodes/);
   } finally {
     app?.destroy?.();

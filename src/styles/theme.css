@@ -16,7 +16,11 @@ body.theme-midnight,
   --accent-hover: #1fdf64;
   --ambient-color: rgba(30, 215, 96, 0.18);
   --range-track: rgba(148, 163, 184, 0.22);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 160ms;
+  --dur-normal: 260ms;
+  --dur-slow: 360ms;
   --android-safe-top: 0px;
   --android-safe-bottom: 0px;
   color-scheme: dark;
@@ -46,8 +50,43 @@ body.theme-pitch,
   --accent-hover: #1fdf64;
   --ambient-color: rgba(30, 215, 96, 0.16);
   --range-track: rgba(255, 255, 255, 0.18);
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 160ms;
+  --dur-normal: 260ms;
+  --dur-slow: 360ms;
   color-scheme: dark;
+}
+
+/* Same-Document View Transitions */
+@keyframes vtFadeOut {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.995);
+  }
+}
+
+@keyframes vtFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.995);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+::view-transition-old(root) {
+  animation: vtFadeOut 180ms var(--ease-out-expo) both;
+}
+
+::view-transition-new(root) {
+  animation: vtFadeIn 260ms var(--ease-out-expo) both;
 }
 
 html,
@@ -85,14 +124,20 @@ body {
   background-color: var(--bg-card);
   border: 1px solid var(--border-subtle);
   transition:
-    background-color 240ms var(--ease-spring),
-    border-color 240ms var(--ease-spring),
-    transform 260ms var(--ease-spring),
-    box-shadow 260ms var(--ease-spring);
+    background-color 240ms var(--ease-out-expo),
+    border-color 240ms var(--ease-out-expo),
+    transform 260ms var(--ease-out-expo),
+    translate 260ms var(--ease-out-expo),
+    box-shadow 260ms var(--ease-out-expo);
 }
 
 .surface-card:hover {
   background-color: var(--bg-card-hover);
+}
+
+.surface-card.card-interactive:hover,
+.ui-stagger-grid > .surface-card:hover {
+  translate: 0 -2px;
 }
 
 .ambient-surface {
@@ -130,16 +175,104 @@ body {
   transform: scale(0.94);
 }
 
-/* Tactile Spring Button Feedback */
-.btn-press {
+/* Tactile Spring Button Feedback & Filter Pills */
+.btn-press,
+.filter-pill {
   transition:
-    transform 200ms var(--ease-spring),
-    background-color 180ms var(--ease-spring),
-    opacity 180ms var(--ease-spring);
+    background-color 220ms var(--ease-out-expo),
+    color 220ms var(--ease-out-expo),
+    border-color 220ms var(--ease-out-expo),
+    box-shadow 220ms var(--ease-out-expo),
+    transform 220ms var(--ease-out-expo),
+    translate 220ms var(--ease-out-expo),
+    opacity 180ms var(--ease-out-expo);
 }
 
-.btn-press:active {
-  transform: scale(0.94);
+.btn-press:active,
+.filter-pill:active {
+  transform: scale(0.95);
+}
+
+/* Choreographed Section Entrances & Sibling Card Stagger */
+@keyframes uiViewRise {
+  from {
+    opacity: 0;
+    translate: 0 10px;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+
+.ui-view-enter {
+  animation: uiViewRise 300ms var(--ease-out-expo) both;
+}
+
+@starting-style {
+  .ui-view-enter {
+    opacity: 0;
+    translate: 0 10px;
+  }
+}
+
+.ui-stagger-grid > *,
+.ui-stagger-item {
+  animation: uiViewRise 320ms var(--ease-out-expo) both;
+}
+
+.ui-stagger-item {
+  animation-delay: calc(min(var(--stagger-idx, 0), 8) * 25ms);
+}
+
+.ui-stagger-grid > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+
+.ui-stagger-grid > *:nth-child(2) {
+  animation-delay: 25ms;
+}
+
+.ui-stagger-grid > *:nth-child(3) {
+  animation-delay: 50ms;
+}
+
+.ui-stagger-grid > *:nth-child(4) {
+  animation-delay: 75ms;
+}
+
+.ui-stagger-grid > *:nth-child(5) {
+  animation-delay: 100ms;
+}
+
+.ui-stagger-grid > *:nth-child(6) {
+  animation-delay: 125ms;
+}
+
+.ui-stagger-grid > *:nth-child(7) {
+  animation-delay: 150ms;
+}
+
+.ui-stagger-grid > *:nth-child(n+8) {
+  animation-delay: 175ms;
+}
+
+/* Declarative Entry (@starting-style) & Exit ([data-closing], [hidden]) Transitions */
+.modal-backdrop {
+  opacity: 1;
+  transition: opacity 220ms var(--ease-out-expo), display 220ms, overlay 220ms;
+  transition-behavior: allow-discrete;
+}
+
+@starting-style {
+  .modal-backdrop {
+    opacity: 0;
+  }
+}
+
+.modal-backdrop:where([hidden], [data-closing]) {
+  opacity: 0;
+  transition-duration: 160ms;
 }
 
 /* Slide-Up Full-Screen Now Playing Sheet & Modals */
@@ -154,13 +287,26 @@ body {
   }
 }
 
+@keyframes overlayExitOut {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+}
+
 .sheet-modal {
   background-color: var(--bg-panel);
   border: 1px solid var(--border-subtle);
-  animation: sheetSlideUp 320ms var(--ease-spring) both;
+  animation: sheetSlideUp 320ms var(--ease-out-expo) both;
   transition:
-    transform 340ms var(--ease-spring),
-    opacity 260ms var(--ease-spring);
+    transform 340ms var(--ease-out-expo),
+    translate 320ms var(--ease-out-expo),
+    scale 320ms var(--ease-out-expo),
+    opacity 260ms var(--ease-out-expo);
 }
 
 /* Android Notification Shade MediaStyle Mini-Player */
@@ -187,7 +333,12 @@ body {
   -webkit-backdrop-filter: blur(22px);
   border: 1px solid var(--border-subtle);
   box-shadow: 0 22px 48px rgba(0, 0, 0, 0.56);
-  animation: shadeDropIn 280ms var(--ease-spring) both;
+  animation: shadeDropIn 280ms var(--ease-out-expo) both;
+  transition:
+    transform 280ms var(--ease-out-expo),
+    translate 280ms var(--ease-out-expo),
+    scale 280ms var(--ease-out-expo),
+    opacity 240ms var(--ease-out-expo);
 }
 
 .theme-pitch .notif-shade {
@@ -219,7 +370,38 @@ body {
   backdrop-filter: blur(18px);
   -webkit-backdrop-filter: blur(18px);
   transform-origin: top right;
-  animation: popoverScaleIn 220ms var(--ease-spring) both;
+  animation: popoverScaleIn 220ms var(--ease-out-expo) both;
+  transition:
+    transform 220ms var(--ease-out-expo),
+    translate 220ms var(--ease-out-expo),
+    scale 220ms var(--ease-out-expo),
+    opacity 200ms var(--ease-out-expo);
+}
+
+@starting-style {
+  .sheet-modal,
+  .notif-shade,
+  .popover-menu {
+    opacity: 0;
+    translate: 0 18px;
+    scale: 0.98;
+  }
+}
+
+.sheet-modal:where([hidden], [data-closing]),
+.notif-shade:where([hidden], [data-closing]),
+.popover-menu:where([hidden], [data-closing]),
+[data-closing] .sheet-modal,
+[data-closing] .notif-shade,
+[data-closing] .popover-menu {
+  opacity: 0;
+  translate: 0 12px;
+  scale: 0.985;
+  animation: overlayExitOut 160ms var(--ease-out-expo) both;
+  transition:
+    opacity 160ms var(--ease-out-expo),
+    translate 160ms var(--ease-out-expo),
+    scale 160ms var(--ease-out-expo);
 }
 
 .sheet-modal.no-enter-anim,
@@ -422,11 +604,30 @@ input[type="range"]::-moz-range-thumb {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
+  }
+
+  .sheet-modal,
+  .notif-shade,
+  .popover-menu,
+  .ui-view-enter,
+  .ui-stagger-grid > *,
+  .ui-stagger-item,
+  .surface-card,
+  .btn-press,
+  .filter-pill,
+  .play-fab {
+    animation: none !important;
+    translate: none !important;
+    transform: none !important;
+    scale: 1 !important;
+    transition-duration: 120ms !important;
+  }
+
+  .live-dot-pulse {
+    animation: none !important;
   }
 }

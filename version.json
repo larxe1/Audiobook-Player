@@ -1,13 +1,13 @@
 {
-  "version": "1.0.17",
-  "build": 18,
+  "version": "1.0.18",
+  "build": 19,
   "minNativeBuild": 15,
   "channel": "stable",
-  "publishedAt": "2026-11-21T14:45:00Z",
+  "publishedAt": "2026-11-21T15:18:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "webBundleUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Add Spotify-style live podcasts with automatic show search, category discovery, background RSS episode refresh, on-demand episode streaming, and per-episode offline downloads across Windows and Android"
+  "releaseNotes": "Remove cluttered top and bottom Devices buttons, pin Find Podcasts with an inline Podcast Discovery Hub, and add fluid View Transitions, staggered card entrances, and smooth modal exit animations across Windows and Android"
 }

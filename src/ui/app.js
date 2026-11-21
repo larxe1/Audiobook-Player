@@ -2563,12 +2563,13 @@ class AudiobookApp {
     );
   }
 
-  async openPodcastModal(initialQuery = '') {
+  async openPodcastModal(initialQuery = '', categoryId = '') {
     const cleanQuery = String(initialQuery || '').trim();
     const defaultCat = PODCAST_CATEGORIES?.[0]?.id || 'trending';
-    const activeCategory = cleanQuery
-      ? this.state.podcastModal?.activeCategory || defaultCat
-      : this.state.podcastModal?.activeCategory || defaultCat;
+    const activeCategory =
+      String(categoryId || '').trim() ||
+      this.state.podcastModal?.activeCategory ||
+      defaultCat;
     this.state.profileOpen = false;
     this.state.podcastModal = {
       ...this.state.podcastModal,
@@ -4173,6 +4174,11 @@ class AudiobookApp {
               : `<span>${escapeHtml(initials)}</span>`
           }
         </button>
+        ${
+          this.state.remotePlaybackPrompt?.device?.isPlaying
+            ? '<span class="absolute top-0 right-0 w-2.5 h-2.5 rounded-full bg-[#1ed760] ring-2 ring-[var(--bg-panel)] live-dot-pulse"></span>'
+            : ''
+        }
       </div>
     `;
   }
@@ -4444,7 +4450,7 @@ class AudiobookApp {
           ].filter(Boolean);
 
     return `
-      <div class="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+      <div class="modal-backdrop fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
         <div class="sheet-modal w-full max-w-lg max-h-[82vh] rounded-3xl flex flex-col overflow-hidden">
           <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
             <div class="flex items-center gap-2 min-w-0">
@@ -4680,7 +4686,7 @@ class AudiobookApp {
     if (!open) return '';
 
     return `
-      <div class="fixed inset-0 z-[70] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+      <div class="modal-backdrop fixed inset-0 z-[70] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
         <div class="sheet-modal w-full max-w-sm rounded-3xl overflow-hidden border border-red-500/30">
           <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
             <h2 class="text-sm font-bold text-red-300 truncate">${escapeHtml(title || 'Error')}</h2>
@@ -4711,7 +4717,7 @@ class AudiobookApp {
     const driveStats = this._getDriveSyncedBooksStats();
 
     return `
-      <div class="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+      <div class="modal-backdrop fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
         <div class="sheet-modal w-full max-w-md rounded-3xl overflow-hidden">
           <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
             <h2 class="text-base font-bold text-white truncate">Sync Google Drive</h2>
@@ -4772,7 +4778,7 @@ class AudiobookApp {
     const wipeInProgress = Boolean(this.state.wipeInProgress);
 
     return `
-      <div class="fixed inset-0 z-[65] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+      <div class="modal-backdrop fixed inset-0 z-[65] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
         <div class="sheet-modal w-full max-w-md rounded-3xl overflow-hidden border border-red-500/30">
           <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
             <div class="flex items-center gap-2 min-w-0">
@@ -5252,7 +5258,7 @@ class AudiobookApp {
       return `<div class="text-xs text-[var(--text-muted)] py-2">No episodes available</div>`;
     }
 
-    return chapters
+    const itemsHtml = chapters
       .map((ch, idx) => {
         const chIdx = typeof ch?.index === 'number' ? ch.index : idx;
         const isActiveEp = isCurrent && Number(this.state.snapshot?.chapterIndex || 0) === chIdx;
@@ -5306,6 +5312,8 @@ class AudiobookApp {
         `;
       })
       .join('');
+
+    return `<div class="ui-stagger-grid space-y-1.5">${itemsHtml}</div>`;
   }
 
   _renderNewEpisodesShelf(variant = 'desktop') {
@@ -5364,9 +5372,9 @@ class AudiobookApp {
 
     if (variant === 'mobile') {
       return `
-        <section class="space-y-3">
+        <section class="ui-view-enter space-y-3">
           <h2 class="text-lg font-bold tracking-tight text-[var(--text-primary)]">New Episodes</h2>
-          <div class="flex gap-3 overflow-x-auto pb-1 no-scrollbar">
+          <div class="ui-stagger-grid flex gap-3 overflow-x-auto pb-1 no-scrollbar">
             ${cardsHtml}
           </div>
         </section>
@@ -5374,10 +5382,47 @@ class AudiobookApp {
     }
 
     return `
-      <section class="space-y-3">
+      <section class="ui-view-enter space-y-3">
         <h2 class="text-xl font-bold tracking-tight text-white">New Episodes</h2>
-        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+        <div class="ui-stagger-grid grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
           ${cardsHtml}
+        </div>
+      </section>
+    `;
+  }
+
+  _renderPodcastDiscoveryHub(variant = 'desktop') {
+    if (this.state.filterSource !== 'podcasts') return '';
+    const categories = Array.isArray(PODCAST_CATEGORIES) ? PODCAST_CATEGORIES : [];
+    const q = String(this.state.searchQuery || '').trim();
+    const isMobile = variant === 'mobile';
+
+    return `
+      <section class="ui-view-enter surface-card rounded-2xl ${isMobile ? 'p-3.5 space-y-3' : 'p-4 space-y-3.5'} border border-[#1ed760]/25">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+          <div class="flex items-center gap-2.5 min-w-0">
+            <div class="w-9 h-9 rounded-xl bg-[#1ed760]/15 border border-[#1ed760]/35 flex items-center justify-center shrink-0">
+              ${FLUENT_3D_PODCAST(18)}
+            </div>
+            <div class="min-w-0">
+              <h2 class="text-sm font-bold text-white truncate">Discover Live Podcasts</h2>
+              <p class="text-[11px] text-[var(--text-secondary)] truncate">Search shows, hosts, topics, or browse categories</p>
+            </div>
+          </div>
+          <button type="button" data-action="open-podcast-modal" data-query="${escapeHtml(q)}" class="btn-press filter-pill inline-flex items-center justify-center gap-2 px-4 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold shrink-0">
+            ${ICON_SEARCH(13)}
+            <span>${q ? `Search '${escapeHtml(q)}' in Podcasts` : 'Find Podcasts'}</span>
+          </button>
+        </div>
+        <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
+          ${categories
+            .map(
+              (cat) => `
+            <button type="button" data-action="open-podcast-category" data-category-id="${escapeHtml(cat.id)}" class="btn-press filter-pill px-3 py-1.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:border-[#1ed760]/40 text-xs font-medium text-[var(--text-primary)] hover:text-white whitespace-nowrap">
+              ${escapeHtml(cat.label)}
+            </button>`
+            )
+            .join('')}
         </div>
       </section>
     `;
@@ -5492,7 +5537,7 @@ class AudiobookApp {
 
     const chip = (id, label) => {
       const active = this.state.filterSource === id;
-      return `<button data-action="set-filter" data-filter="${id}" class="btn-press px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap ${
+      return `<button data-action="set-filter" data-filter="${id}" class="btn-press filter-pill px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap ${
         active
           ? 'bg-[#1ed760] text-[#050506]'
           : 'surface-card text-[var(--text-primary)]'
@@ -5509,11 +5554,7 @@ class AudiobookApp {
             ${chip('drive', 'Drive')}
             ${chip('podcasts', 'Podcasts')}
             ${chip('downloaded', 'Saved')}
-            <button data-action="open-podcast-modal" title="Find Podcasts" class="btn-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-full surface-card text-xs font-medium text-[var(--text-primary)] whitespace-nowrap">
-              ${FLUENT_3D_PODCAST(13)}
-              <span>+ Podcast</span>
-            </button>
-            <button data-action="toggle-group-series" title="Group by Series" class="btn-press inline-flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-medium whitespace-nowrap ${
+            <button data-action="toggle-group-series" title="Group by Series" class="btn-press filter-pill inline-flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-medium whitespace-nowrap ${
               this.state.groupBySeries
                 ? 'bg-[#1ed760]/20 text-[#1ed760] border border-[#1ed760]/40'
                 : 'surface-card text-[var(--text-secondary)]'
@@ -5531,18 +5572,10 @@ class AudiobookApp {
             }
           </div>
           <div class="flex items-center gap-2 shrink-0">
-            ${
-              this._hasCloudSyncAuth() || (this.state.devices || []).length > 0
-                ? `<button data-action="open-devices-modal" aria-label="Devices" class="btn-press relative w-9 h-9 rounded-full surface-card flex items-center justify-center text-[var(--text-secondary)] hover:text-white">
-                    ${ICON_DEVICES(15)}
-                    ${
-                      this.state.remotePlaybackPrompt?.device?.isPlaying
-                        ? '<span class="absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#1ed760] live-dot-pulse"></span>'
-                        : ''
-                    }
-                  </button>`
-                : ''
-            }
+            <button data-action="open-podcast-modal" aria-label="Find Podcasts" title="Find Podcasts" class="btn-press filter-pill inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[#1ed760]/15 border border-[#1ed760]/40 text-xs font-bold text-[#1ed760] hover:bg-[#1ed760]/25 shrink-0">
+              ${FLUENT_3D_PODCAST(14)}
+              <span>Find Podcasts</span>
+            </button>
             <button data-action="toggle-shade" aria-label="Notification Shade" class="btn-press w-9 h-9 rounded-full surface-card flex items-center justify-center text-[var(--text-secondary)] hover:text-white">
               ${ICON_CHEVRON(shadeVisible ? 'up' : 'down', 15)}
             </button>
@@ -5559,8 +5592,9 @@ class AudiobookApp {
         }
 
         <!-- Mobile Scrollable Content -->
-        <div id="mobileMainScroll" class="flex-1 overflow-y-auto px-4 pb-24 mobile-safe-scroll-bottom space-y-6 min-w-0 flex flex-col">
+        <div id="mobileMainScroll" class="ui-view-enter flex-1 overflow-y-auto px-4 pb-24 mobile-safe-scroll-bottom space-y-6 min-w-0 flex flex-col">
           ${this._renderContinueFromDeviceCard()}
+          ${this._renderPodcastDiscoveryHub('mobile')}
           ${
             this.state.filterSource === 'podcasts' && filtered.length === 0
               ? this._renderPodcastEmptyStateCard()
@@ -5581,7 +5615,7 @@ class AudiobookApp {
                     </div>`
                   : `
           <!-- 2-Column Quick-Resume Grid -->
-          <div class="grid grid-cols-2 gap-2.5">
+          <div class="ui-stagger-grid grid grid-cols-2 gap-2.5">
             ${filtered
               .slice(0, 4)
               .map(
@@ -5603,9 +5637,9 @@ class AudiobookApp {
           ${this._renderNewEpisodesShelf('mobile')}
 
           <!-- Jump back in (zero subtitle!) -->
-          <section class="space-y-3">
+          <section class="ui-view-enter space-y-3">
             <h2 class="text-lg font-bold tracking-tight text-[var(--text-primary)]">Jump back in</h2>
-            <div id="mobileJumpStrip" class="flex gap-3 overflow-x-auto pb-1">
+            <div id="mobileJumpStrip" class="ui-stagger-grid flex gap-3 overflow-x-auto pb-1">
               ${filtered
                 .map(
                   (book) => `
@@ -5631,7 +5665,7 @@ class AudiobookApp {
           </section>
 
           <!-- Library (Franchise Folders + Books) -->
-          <section class="space-y-2.5">
+          <section class="ui-view-enter space-y-2.5">
             <div class="flex items-center justify-between gap-2">
               <h2 class="text-lg font-bold tracking-tight text-[var(--text-primary)]">Library</h2>
               ${
@@ -5643,7 +5677,7 @@ class AudiobookApp {
                   : ''
               }
             </div>
-            <div class="space-y-2">
+            <div class="ui-stagger-grid space-y-2">
               ${this._renderGroupedLibraryEntries(filtered, activeBook, 'mobile')}
             </div>
           </section>`
@@ -5868,7 +5902,7 @@ class AudiobookApp {
                         ${['all', 'local', 'drive', 'podcasts', 'downloaded']
                           .map(
                             (f) =>
-                              `<button data-action="set-filter" data-filter="${f}" class="btn-press px-2.5 py-1 rounded-full text-[11px] font-medium capitalize whitespace-nowrap ${
+                              `<button data-action="set-filter" data-filter="${f}" class="btn-press filter-pill px-2.5 py-1 rounded-full text-[11px] font-medium capitalize whitespace-nowrap ${
                                 filterSource === f
                                   ? 'bg-[#1ed760] text-[#050506]'
                                   : 'surface-card text-[var(--text-secondary)] hover:text-white'
@@ -5876,7 +5910,7 @@ class AudiobookApp {
                           )
                           .join('')}
                       </div>
-                      <button data-action="toggle-group-series" title="Group by Franchise / Series" class="btn-press inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium shrink-0 ${
+                      <button data-action="toggle-group-series" title="Group by Franchise / Series" class="btn-press filter-pill inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium shrink-0 ${
                         this.state.groupBySeries
                           ? 'bg-[#1ed760]/20 text-[#1ed760] border border-[#1ed760]/40'
                           : 'surface-card text-[var(--text-secondary)] hover:text-white'
@@ -5928,14 +5962,14 @@ class AudiobookApp {
                   <span class="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)] pointer-events-none">${ICON_SEARCH(15)}</span>
                   <input id="desktopSearchInput" data-action="search-input" type="search" value="${escapeHtml(searchQuery)}" placeholder="Search audiobooks, podcasts, authors..." class="w-full pl-9 pr-3 py-1.5 rounded-full bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
                 </div>
-                ${
-                  filterSource === 'podcasts' && searchQuery.trim()
-                    ? `<button type="button" data-action="open-podcast-modal" data-query="${escapeHtml(searchQuery.trim())}" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold shrink-0 whitespace-nowrap">
-                        ${ICON_SEARCH(13)}
-                        <span>Search '${escapeHtml(searchQuery.trim())}' in Live Podcasts</span>
-                      </button>`
-                    : ''
-                }
+                <button type="button" data-action="open-podcast-modal" data-query="${escapeHtml(searchQuery.trim())}" class="btn-press filter-pill inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full ${
+                  searchQuery.trim()
+                    ? 'bg-[#1ed760] text-[#050506] font-bold'
+                    : 'bg-[#1ed760]/15 border border-[#1ed760]/40 text-[#1ed760] hover:bg-[#1ed760]/25 font-semibold'
+                } text-xs shrink-0 whitespace-nowrap">
+                  ${FLUENT_3D_PODCAST(14)}
+                  <span>${searchQuery.trim() ? `Search '${escapeHtml(searchQuery.trim())}' in Podcasts` : 'Find Podcasts'}</span>
+                </button>
               </div>
               <div class="flex items-center gap-2 shrink-0">
                 ${
@@ -6078,15 +6112,6 @@ class AudiobookApp {
               ${ICON_SLEEP(13)}
               <span>${snap.sleepTimerMode ? (snap.sleepTimerMode === 'chapter' ? 'Ch' : `${snap.sleepTimerMode}m`) : 'Sleep'}</span>
             </button>
-            <button data-action="open-devices-modal" title="Signed-in Devices" aria-label="Devices" class="btn-press relative inline-flex items-center gap-1 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white">
-              ${ICON_DEVICES(13, this.state.remotePlaybackPrompt?.device?.isPlaying ? 'text-[#1ed760] shrink-0' : 'shrink-0')}
-              <span>Devices</span>
-              ${
-                this.state.remotePlaybackPrompt?.device?.isPlaying
-                  ? '<span class="w-1.5 h-1.5 rounded-full bg-[#1ed760] live-dot-pulse"></span>'
-                  : ''
-              }
-            </button>
             <button data-action="cycle-device" class="btn-press inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white max-w-[120px]">
               ${ICON_SPEAKER(13, 'text-[#1ed760] shrink-0')}
               <span class="truncate">${escapeHtml(this.state.activeOutputDevice)}</span>
@@ -6122,10 +6147,6 @@ class AudiobookApp {
 
           <div class="hidden md:flex items-center justify-end gap-2 w-72 shrink-0">
             <button data-action="cycle-speed" class="btn-press px-2.5 py-1 rounded-full surface-card text-xs font-semibold text-white tabular-nums">${formatPlaybackRate(snap.playbackRate)}</button>
-            <button data-action="open-devices-modal" title="Signed-in Devices" aria-label="Devices" class="btn-press relative inline-flex items-center gap-1 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white">
-              ${ICON_DEVICES(13, this.state.remotePlaybackPrompt?.device?.isPlaying ? 'text-[#1ed760] shrink-0' : 'shrink-0')}
-              <span>Devices</span>
-            </button>
             <button data-action="cycle-device" class="btn-press inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white max-w-[120px]">
               ${ICON_SPEAKER(13, 'text-[#1ed760] shrink-0')}
               <span class="truncate">${escapeHtml(this.state.activeOutputDevice)}</span>
@@ -6139,8 +6160,9 @@ class AudiobookApp {
 
   _renderDesktopHome(filtered, activeBook) {
     const continueCard = this._renderContinueFromDeviceCard();
+    const podcastHub = this._renderPodcastDiscoveryHub('desktop');
     if (this.state.filterSource === 'podcasts' && filtered.length === 0) {
-      return `${continueCard}${this._renderPodcastEmptyStateCard()}`;
+      return `${continueCard}${podcastHub}${this._renderPodcastEmptyStateCard()}`;
     }
     if (this.books.length === 0) {
       return `${continueCard}${this._renderEmptyLibraryCard()}`;
@@ -6149,7 +6171,8 @@ class AudiobookApp {
       const q = String(this.state.searchQuery || '').trim();
       return `
         ${continueCard}
-        <div class="flex-1 min-h-[280px] flex flex-col items-center justify-center text-center space-y-3">
+        ${podcastHub}
+        <div class="ui-view-enter flex-1 min-h-[280px] flex flex-col items-center justify-center text-center space-y-3">
           <div class="text-sm font-semibold text-white">No matching audiobooks</div>
           ${
             q
@@ -6165,8 +6188,9 @@ class AudiobookApp {
     }
     return `
       ${continueCard}
+      ${podcastHub}
       <!-- Quick-Resume Grid -->
-      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+      <div class="ui-view-enter ui-stagger-grid grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
         ${filtered
           .slice(0, 6)
           .map(
@@ -6196,9 +6220,9 @@ class AudiobookApp {
       ${this._renderNewEpisodesShelf('desktop')}
 
       <!-- Jump back in (zero subtitle!) -->
-      <section class="space-y-3">
+      <section class="ui-view-enter space-y-3">
         <h2 class="text-xl font-bold tracking-tight text-white">Jump back in</h2>
-        <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-4">
+        <div class="ui-stagger-grid grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-4">
           ${filtered
             .slice(0, 5)
             .map((book) => this._renderDesktopShelfCard(book, activeBook))
@@ -6207,9 +6231,9 @@ class AudiobookApp {
       </section>
 
       <!-- Library (zero subtitle!) -->
-      <section class="space-y-3">
+      <section class="ui-view-enter space-y-3">
         <h2 class="text-xl font-bold tracking-tight text-white">Library</h2>
-        <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-4">
+        <div class="ui-stagger-grid grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-4">
           ${filtered.map((book) => this._renderDesktopShelfCard(book, activeBook)).join('')}
         </div>
       </section>
@@ -6254,7 +6278,7 @@ class AudiobookApp {
     const isRefreshing = this.state.refreshingPodcastKeys.has(book.bookKey);
 
     return `
-      <div class="space-y-6 min-w-0">
+      <div class="ui-view-enter space-y-6 min-w-0">
         <div class="flex flex-col sm:flex-row gap-5 items-start min-w-0">
           <button data-action="open-cover-search" data-book="${escapeHtml(book.bookKey)}" class="w-44 h-44 rounded-2xl overflow-hidden shadow-2xl shrink-0 relative group">
             ${this._renderCoverImg(book)}
@@ -6333,7 +6357,7 @@ class AudiobookApp {
     const items = Array.isArray(results) ? results : [];
 
     return `
-      <div class="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+      <div class="modal-backdrop fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
         <div class="sheet-modal w-full max-w-3xl max-h-[86vh] rounded-3xl flex flex-col overflow-hidden">
           <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
             <div class="flex items-center gap-2.5 min-w-0">
@@ -6358,7 +6382,7 @@ class AudiobookApp {
               ${categories
                 .map((cat) => {
                   const isActive = !query && activeCategory === cat.id;
-                  return `<button type="button" data-action="select-podcast-category" data-category-id="${escapeHtml(cat.id)}" class="btn-press px-3 py-1 rounded-full text-xs font-medium whitespace-nowrap ${
+                  return `<button type="button" data-action="select-podcast-category" data-category-id="${escapeHtml(cat.id)}" class="btn-press filter-pill px-3 py-1 rounded-full text-xs font-medium whitespace-nowrap ${
                     isActive
                       ? 'bg-[#1ed760] text-[#050506] font-bold'
                       : 'surface-card text-[var(--text-secondary)] hover:text-white'
@@ -6382,7 +6406,7 @@ class AudiobookApp {
                     .join('')}</div>`
                 : items.length === 0
                   ? `<div class="py-12 text-center text-xs text-[var(--text-secondary)]">No matching podcasts found.</div>`
-                  : `<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  : `<div class="ui-stagger-grid grid grid-cols-1 sm:grid-cols-2 gap-3">
                       ${items
                         .map((item, idx) => {
                           const existing = this._findSubscribedPodcastByFeedUrl(item.feedUrl);
@@ -6432,7 +6456,7 @@ class AudiobookApp {
     if (!open) return '';
 
     return `
-      <div class="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+      <div class="modal-backdrop fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
         <div class="sheet-modal w-full max-w-2xl max-h-[85vh] rounded-3xl flex flex-col overflow-hidden">
           <div class="px-5 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
             <h2 class="text-base font-bold text-white truncate">Search Cover Images</h2>
@@ -6545,16 +6569,65 @@ class AudiobookApp {
     return this._shellEls;
   }
 
+  _runWithViewTransition(fn, focusSelector = null) {
+    if (
+      typeof document !== 'undefined' &&
+      typeof document.startViewTransition === 'function' &&
+      document.activeElement?.tagName !== 'INPUT' &&
+      document.activeElement?.tagName !== 'TEXTAREA'
+    ) {
+      const vt = document.startViewTransition(() => {
+        fn();
+      });
+      vt?.finished?.finally?.(() => {
+        if (focusSelector) {
+          this.rootEl?.querySelector?.(focusSelector)?.focus?.({ preventScroll: true });
+        }
+      });
+      return;
+    }
+    fn();
+    if (focusSelector) {
+      this.rootEl?.querySelector?.(focusSelector)?.focus?.({ preventScroll: true });
+    }
+  }
+
+  _closeOverlaySlotWithExit(slotName, slotEl, prev) {
+    this._overlayState[slotName] = { open: false, rawHtml: '', sig: null };
+    if (!prev.open && !slotEl.innerHTML) {
+      return false;
+    }
+    const firstChild = slotEl.firstElementChild || slotEl.children?.[0] || null;
+    if (typeof window !== 'undefined' && typeof firstChild?.getAnimations === 'function') {
+      firstChild.setAttribute?.('data-closing', '');
+      const innerModal = slotEl.querySelector?.('.sheet-modal, .popover-menu, .notif-shade');
+      innerModal?.setAttribute?.('data-closing', '');
+      const anims = [
+        ...(firstChild.getAnimations?.() || []),
+        ...(innerModal?.getAnimations?.() || [])
+      ];
+      if (anims.length > 0) {
+        void Promise.race([
+          Promise.allSettled(anims.map((a) => a.finished)),
+          new Promise((r) => setTimeout(r, 220))
+        ]).then(() => {
+          if (!this._overlayState[slotName]?.open) {
+            slotEl.innerHTML = '';
+          }
+        });
+        return false;
+      }
+    }
+    slotEl.innerHTML = '';
+    return false;
+  }
+
   _syncOverlaySlot(slotName, slotEl, shouldShow, renderFn, options = {}) {
     if (!slotEl) return false;
     const prev = this._overlayState[slotName] || { open: false, rawHtml: '', sig: null };
 
     if (!shouldShow) {
-      if (prev.open || slotEl.innerHTML) {
-        slotEl.innerHTML = '';
-      }
-      this._overlayState[slotName] = { open: false, rawHtml: '', sig: null };
-      return false;
+      return this._closeOverlaySlotWithExit(slotName, slotEl, prev);
     }
 
     // Preserve active progress DOM when drive modal is loading or floating sync progress is mounted
@@ -6570,11 +6643,7 @@ class AudiobookApp {
 
     const rawHtml = renderFn();
     if (!rawHtml) {
-      if (prev.open || slotEl.innerHTML) {
-        slotEl.innerHTML = '';
-      }
-      this._overlayState[slotName] = { open: false, rawHtml: '', sig: null };
-      return false;
+      return this._closeOverlaySlotWithExit(slotName, slotEl, prev);
     }
 
     const nextSig = options.sig ?? null;
@@ -6582,10 +6651,48 @@ class AudiobookApp {
       return false;
     }
 
+    let podcastFocusSnap = null;
+    if (
+      slotName === 'podcast' &&
+      typeof document !== 'undefined' &&
+      document.activeElement &&
+      (document.activeElement.id === 'podcastSearchInput' ||
+        document.activeElement.dataset?.action === 'podcast-search-input')
+    ) {
+      const activeEl = document.activeElement;
+      podcastFocusSnap = {
+        val: activeEl.value,
+        start: activeEl.selectionStart,
+        end: activeEl.selectionEnd
+      };
+    }
+
     const finalHtml = prev.open ? this._applyNoEnterAnimHtml(rawHtml) : rawHtml;
     slotEl.innerHTML = finalHtml;
     this._overlayState[slotName] = { open: true, rawHtml, sig: nextSig };
     this._bindContainerEvents(slotEl);
+
+    if (podcastFocusSnap) {
+      const nextInput =
+        slotEl.querySelector?.('#podcastSearchInput') ||
+        (typeof document !== 'undefined' ? document.getElementById('podcastSearchInput') : null);
+      if (nextInput) {
+        if (typeof podcastFocusSnap.val === 'string') {
+          nextInput.value = podcastFocusSnap.val;
+        }
+        nextInput.focus?.();
+        try {
+          if (
+            typeof podcastFocusSnap.start === 'number' &&
+            typeof podcastFocusSnap.end === 'number'
+          ) {
+            nextInput.setSelectionRange?.(podcastFocusSnap.start, podcastFocusSnap.end);
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
     return true;
   }
 
@@ -7051,17 +7158,17 @@ class AudiobookApp {
             ) {
               void this.selectBook(key, false).then(() => {
                 this.state.mobileSheetOpen = true;
-                this.render();
+                this._runWithViewTransition(() => this.render());
               });
             } else {
-              this.render();
+              this._runWithViewTransition(() => this.render());
             }
             void this._enrichSingleBookInBackground(key);
             break;
           }
           case 'desktop-home': {
             this.state.desktopView = 'home';
-            this.render();
+            this._runWithViewTransition(() => this.render());
             break;
           }
           case 'jump-chapter': {
@@ -7106,6 +7213,7 @@ class AudiobookApp {
             }
             break;
           }
+          case 'toggle-series-group':
           case 'toggle-series-folder': {
             const seriesKey = el.dataset.series;
             if (seriesKey) {
@@ -7114,13 +7222,13 @@ class AudiobookApp {
               } else {
                 this.state.expandedSeries.add(seriesKey);
               }
-              this.render();
+              this._runWithViewTransition(() => this.render());
             }
             break;
           }
           case 'toggle-group-series': {
             this.state.groupBySeries = !this.state.groupBySeries;
-            this.render();
+            this._runWithViewTransition(() => this.render());
             break;
           }
           case 'toggle-chapter-section': {
@@ -7168,17 +7276,17 @@ class AudiobookApp {
           }
           case 'set-filter': {
             this.state.filterSource = el.dataset.filter || 'all';
-            this.render();
+            this._runWithViewTransition(() => this.render());
             break;
           }
           case 'toggle-sidebar': {
             this.state.sidebarCollapsed = !this.state.sidebarCollapsed;
-            this.render();
+            this._runWithViewTransition(() => this.render());
             break;
           }
           case 'toggle-right-panel': {
             this.state.rightPanelOpen = !this.state.rightPanelOpen;
-            this.render();
+            this._runWithViewTransition(() => this.render());
             break;
           }
           case 'toggle-shade': {
@@ -7348,6 +7456,10 @@ class AudiobookApp {
           }
           case 'open-podcast-modal': {
             void this.openPodcastModal(el.dataset.query || '');
+            break;
+          }
+          case 'open-podcast-category': {
+            void this.openPodcastModal('', el.dataset.categoryId || 'trending');
             break;
           }
           case 'close-podcast-modal': {

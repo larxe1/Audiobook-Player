@@ -9,6 +9,16 @@ Every bug report, UI change, or fix applied to the Windows desktop version (`Aud
 
 Never ship a Windows-only or Android-only fix without auditing auth redirects, OAuth popups, WebView constraints, local file pickers (`webkitdirectory` vs `accept="audio/*" multiple`), responsive layout, and OTA/update behavior across both platforms.
 
+## Mandatory Fluid UI Animation & Uncluttered Navigation Rule (`.agents/skills/ui-motion-craft/SKILL.md`)
+
+1. **All UI Must Be Fluidly Animated (Zero Snappy / Abrupt DOM Swaps):**
+   - Every view transition (`Home <-> Detail`, filter switches `All / Local / Drive / Podcasts / Saved`), modal/sheet/popover open **and close** (`[data-closing]` exit transition + `@starting-style` entry), card grid reveal (`.ui-stagger-item`), and interactive pill/button state MUST be fluidly animated using spring/exponential deceleration (`cubic-bezier(0.16, 1, 0.3, 1)` / `var(--ease-spring)`) and progressive View Transitions (`document.startViewTransition` when not typing in an input).
+   - Overlays must animate out on close (`[data-closing]` before removal) rather than disappearing instantaneously in `0ms`.
+   - Handle `@media (prefers-reduced-motion: reduce)` on a case-by-case basis by dampening spatial movement (`translate: none`) while keeping smooth opacity/color feedback — never use a global `transition-duration: 0.01ms !important` override.
+2. **Uncluttered Header & Always-Visible Podcast Discovery:**
+   - Never place a standalone `Devices` (`open-devices-modal`) button in the Mobile top header or Desktop bottom transport bar where it eats horizontal space (keep `Devices` tucked inside the Profile Avatar menu, alongside the automatic remote-handoff card when another device plays).
+   - Keep Podcast search/discovery immediately accessible and impossible to lose: show an inline Podcast Search & Category Discovery bar at the top of the `Podcasts` view (even when podcasts are already subscribed), a prominent `Discover Podcasts` trigger next to the main search bar on Desktop, and a pinned/visible `Find Podcasts` trigger on Mobile.
+
 ## Mandatory Dual-Platform Subagent Parity Gate
 
 Unless a task is explicitly requested for one platform only, every implementation round **MUST** be audited in parallel by two separate platform verifiers before building or pushing a release:
