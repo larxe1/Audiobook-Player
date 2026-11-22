@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'multiplayer-v4';
+const CACHE_VERSION = 'multiplayer-v5';
 
 const APP_SHELL_ASSETS = [
   '../',

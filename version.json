@@ -1,13 +1,12 @@
 {
-  "version": "1.0.22",
-  "build": 23,
-  "minNativeBuild": 21,
+  "version": "1.0.23",
+  "build": 24,
+  "minNativeBuild": 24,
   "channel": "stable",
-  "publishedAt": "2026-11-22T02:05:00Z",
-  "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
+  "publishedAt": "2026-11-22T02:35:00Z",
+  "manifestUrl": "https://api.github.com/repos/larxe1/Audiobook-Player/releases/latest",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
-  "webBundleUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Added True Black default theme, volume and mute controls, podcast New Episodes and progress reset with listening hours tracking, sidebar search isolation, Android device deduplication, and Web OTA fallback on APK 404"
+  "releaseNotes": "Removed update lockout, added background download with restart prompt for Windows and Web updates, and switched Android APK updates to Obtainium and GitHub Releases."
 }

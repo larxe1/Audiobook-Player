@@ -463,12 +463,14 @@ class AudiobookApp {
         checking: false,
         checked: false,
         updateAvailable: false,
+        downloading: false,
+        readyToRestart: false,
+        installing: false,
         latestVersion: LOCAL_VERSION,
         releaseNotes: '',
-        installing: false,
-        progress: 0,
-        statusText: '',
+        releasePageUrl: '',
         dismissed: false,
+        statusText: '',
         manifest: null
       },
       bookmarksByBook: {},
@@ -525,7 +527,6 @@ class AudiobookApp {
     this._capacitorBackListener = null;
     this._userBackGuardHandler = null;
     this._globalInputsBound = false;
-    this._androidUpdateReturnCleanup = null;
     this._destroyed = false;
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
@@ -768,7 +769,6 @@ class AudiobookApp {
     return Boolean(
       window.Capacitor ||
         window.AudiobookOAuthNative ||
-        window.AudiobookUpdaterNative ||
         window.AudiobookInsetsNative ||
         protocol === 'capacitor:' ||
         /^capacitor:\/\//i.test(origin) ||
@@ -1736,7 +1736,6 @@ class AudiobookApp {
       this._unsubRemotePlayback();
       this._unsubRemotePlayback = null;
     }
-    this._clearAndroidUpdateReturnListener();
     this.syncService?.destroy?.();
     this.audioEngine?.destroy?.();
   }
@@ -4832,6 +4831,14 @@ class AudiobookApp {
 
   async handleCheckForUpdate(options = {}) {
     const silent = Boolean(options?.silent);
+    const platform =
+      typeof this.updaterService?.detectPlatform === 'function'
+        ? this.updaterService.detectPlatform()
+        : 'web';
+
+    if (platform === 'android-apk' && silent) {
+      return;
+    }
     if (this.state.updateState.checking) return;
     this.state.updateState.checking = true;
     if (!silent) {
@@ -4841,47 +4848,109 @@ class AudiobookApp {
     try {
       const result = await this.updaterService.checkForUpdate();
       const nextVersion = result?.latestVersion || LOCAL_VERSION;
+      const manifest = this.updaterService.lastManifest || result || null;
+      const releasePageUrl = result?.releasePageUrl || manifest?.releasePageUrl || '';
+      const isPartialWindowsRelease =
+        platform === 'windows-tauri' &&
+        Boolean(result?.updateAvailable) &&
+        !result?.exeDownloadUrl;
+
+      if (isPartialWindowsRelease) {
+        this.state.updateState = {
+          ...this.state.updateState,
+          checking: false,
+          checked: true,
+          updateAvailable: false,
+          downloading: false,
+          readyToRestart: false,
+          latestVersion: LOCAL_VERSION,
+          releaseNotes: '',
+          releasePageUrl,
+          manifest: null
+        };
+        if (!silent) {
+          this.showStatusToast('Windows update is still building — try again shortly');
+          this.render();
+        }
+        return;
+      }
+
+      const hasActionableUpdate =
+        Boolean(result?.updateAvailable) &&
+        (platform !== 'android-apk' || Boolean(result?.apkDownloadUrl || releasePageUrl));
+
+      if (!hasActionableUpdate) {
+        this.state.updateState = {
+          ...this.state.updateState,
+          checking: false,
+          checked: true,
+          updateAvailable: false,
+          downloading: false,
+          readyToRestart: false,
+          latestVersion: nextVersion,
+          releaseNotes: result?.releaseNotes || '',
+          releasePageUrl,
+          manifest
+        };
+        if (!silent) {
+          this.showStatusToast(
+            platform === 'android-apk'
+              ? `You're on the latest version (v${LOCAL_VERSION}) — managed by Obtainium`
+              : `You're on the latest version (v${LOCAL_VERSION})`
+          );
+          this.render();
+        }
+        return;
+      }
+
+      if (platform === 'android-apk') {
+        this.state.updateState = {
+          ...this.state.updateState,
+          checking: false,
+          checked: true,
+          updateAvailable: true,
+          downloading: false,
+          readyToRestart: false,
+          latestVersion: nextVersion,
+          releaseNotes: result?.releaseNotes || '',
+          releasePageUrl,
+          dismissed: false,
+          statusText: 'Update via Obtainium or GitHub Releases',
+          manifest
+        };
+        this.render();
+        return;
+      }
+
+      const isSameReadyVersion =
+        this.state.updateState.readyToRestart &&
+        this.state.updateState.latestVersion === nextVersion;
       const prevDismissed =
         silent &&
         this.state.updateState.dismissed &&
         this.state.updateState.latestVersion === nextVersion;
-      const manifest = this.updaterService.lastManifest || result || null;
 
       this.state.updateState = {
         ...this.state.updateState,
         checking: false,
         checked: true,
-        updateAvailable: Boolean(result?.updateAvailable),
+        updateAvailable: true,
+        readyToRestart: isSameReadyVersion,
         latestVersion: nextVersion,
         releaseNotes: result?.releaseNotes || '',
-        dismissed: prevDismissed,
+        releasePageUrl,
+        dismissed: isSameReadyVersion ? prevDismissed : true,
         manifest
       };
 
-      if (result?.updateAvailable) {
-        if (this.audioEngine?.playing) {
-          this.audioEngine.pause();
-        }
-        if (!silent) {
-          this.render();
-          if (typeof this.updaterService.enforceMandatoryUpdate === 'function') {
-            await this.updaterService.enforceMandatoryUpdate(result);
-            return;
-          }
-          await this.handleInstallUpdate();
-          return;
-        }
-        if (!prevDismissed) {
-          this.render();
-        }
-        if (typeof this.updaterService.enforceMandatoryUpdate === 'function') {
-          void this.updaterService.enforceMandatoryUpdate(result);
-        }
-        return;
-      }
-      if (!silent && !result?.updateAvailable) {
-        this.showStatusToast(`You're on the latest version (v${LOCAL_VERSION})`);
-        return;
+      if (!isSameReadyVersion) {
+        await this._stageBackgroundUpdate(result, { silent, platform, manifest });
+      } else if (!silent) {
+        this.state.updateState = {
+          ...this.state.updateState,
+          dismissed: false
+        };
+        this.render();
       }
     } catch (err) {
       this.state.updateState.checking = false;
@@ -4891,10 +4960,107 @@ class AudiobookApp {
     }
   }
 
-  _clearAndroidUpdateReturnListener() {
-    if (typeof this._androidUpdateReturnCleanup === 'function') {
-      this._androidUpdateReturnCleanup();
-      this._androidUpdateReturnCleanup = null;
+  async _stageBackgroundUpdate(result, options = {}) {
+    const silent = Boolean(options?.silent);
+    const platform =
+      options?.platform ||
+      (typeof this.updaterService?.detectPlatform === 'function'
+        ? this.updaterService.detectPlatform()
+        : 'web');
+    const manifest = options?.manifest || this.updaterService?.lastManifest || result || null;
+    const nextVersion = result?.latestVersion || manifest?.version || this.state.updateState.latestVersion;
+    const us = this.state.updateState;
+
+    if (platform === 'windows-tauri') {
+      if (us.downloading || (us.readyToRestart && us.latestVersion === nextVersion)) {
+        return;
+      }
+      this.state.updateState = {
+        ...this.state.updateState,
+        downloading: true,
+        statusText: 'Downloading update in background...'
+      };
+      if (!silent) {
+        this.render();
+      }
+
+      try {
+        const res = await this.updaterService.stageWindowsUpdate?.(manifest);
+        if (this._destroyed) return;
+        if (res?.ok && res?.staged) {
+          this.state.updateState = {
+            ...this.state.updateState,
+            downloading: false,
+            readyToRestart: true,
+            dismissed: false,
+            statusText: 'Update downloaded — restart to install'
+          };
+          this.render();
+          return;
+        }
+        this.state.updateState = {
+          ...this.state.updateState,
+          downloading: false,
+          statusText: ''
+        };
+        if (!silent) {
+          this.showStatusToast(res?.error || 'Unable to download update right now.');
+          this.render();
+        }
+      } catch (err) {
+        if (this._destroyed) return;
+        this.state.updateState = {
+          ...this.state.updateState,
+          downloading: false,
+          statusText: ''
+        };
+        if (!silent) {
+          this.showStatusToast(err?.message || 'Unable to download update right now.');
+          this.render();
+        }
+      }
+      return;
+    }
+
+    if (platform === 'web') {
+      if (us.readyToRestart && us.latestVersion === nextVersion) {
+        return;
+      }
+      try {
+        const res = await this.updaterService.stageWebUpdate?.();
+        if (this._destroyed) return;
+        if (res?.ok !== false) {
+          this.state.updateState = {
+            ...this.state.updateState,
+            downloading: false,
+            readyToRestart: true,
+            dismissed: false,
+            statusText: 'Update ready — reload to apply'
+          };
+          this.render();
+          return;
+        }
+        this.state.updateState = {
+          ...this.state.updateState,
+          downloading: false,
+          statusText: ''
+        };
+        if (!silent) {
+          this.showStatusToast(res?.error || 'Unable to prepare web update right now.');
+          this.render();
+        }
+      } catch (err) {
+        if (this._destroyed) return;
+        this.state.updateState = {
+          ...this.state.updateState,
+          downloading: false,
+          statusText: ''
+        };
+        if (!silent) {
+          this.showStatusToast(err?.message || 'Unable to prepare web update right now.');
+          this.render();
+        }
+      }
     }
   }
 
@@ -4902,193 +5068,105 @@ class AudiobookApp {
     const us = this.state.updateState;
     if (us.installing) return;
 
-    this._clearAndroidUpdateReturnListener();
-
     const platform =
-      typeof this.updaterService.detectPlatform === 'function'
+      typeof this.updaterService?.detectPlatform === 'function'
         ? this.updaterService.detectPlatform()
         : 'web';
-    const manifest = us.manifest || this.updaterService.lastManifest || null;
+    const manifest = us.manifest || this.updaterService?.lastManifest || null;
 
-    const attachAndroidInstallerReturnListener = () => {
-      this._clearAndroidUpdateReturnListener();
-      let handled = false;
-      const onReturn = (evt) => {
-        if (handled) return;
-        if (
-          evt?.type === 'visibilitychange' &&
-          typeof document !== 'undefined' &&
-          (document.hidden || document.visibilityState === 'hidden')
-        ) {
+    if (platform === 'android-apk') {
+      this.updaterService?.openAndroidReleasePage?.(manifest);
+      return;
+    }
+
+    if (platform === 'windows-tauri') {
+      this.state.updateState = {
+        ...us,
+        installing: true,
+        statusText: us.readyToRestart ? 'Restarting to install update...' : 'Downloading update...'
+      };
+      this.render();
+
+      try {
+        if (!us.readyToRestart) {
+          const stageRes = await this.updaterService.stageWindowsUpdate?.(manifest);
+          if (!stageRes?.ok || !stageRes?.staged) {
+            this.state.updateState = {
+              ...this.state.updateState,
+              installing: false,
+              statusText: stageRes?.error || 'Unable to stage Windows update.'
+            };
+            this.showError('Update Failed', stageRes?.error || 'Unable to stage Windows update.');
+            this.render();
+            return;
+          }
+        }
+
+        const res = await this.updaterService.applyStagedWindowsUpdate?.();
+        if (res?.ok && res?.restarting) {
+          this.state.updateState = {
+            ...this.state.updateState,
+            installing: true,
+            readyToRestart: true,
+            statusText: 'Restarting to install update...'
+          };
+          this.render();
           return;
         }
-        handled = true;
-        this._clearAndroidUpdateReturnListener();
-        if (this._destroyed || !this.state.updateState.installing) return;
+
         this.state.updateState = {
           ...this.state.updateState,
           installing: false,
-          progress: 0,
-          statusText: ''
+          statusText: res?.error || 'Unable to apply Windows update.'
         };
+        this.showError('Update Failed', res?.error || 'Unable to apply Windows update.');
         this.render();
-      };
-
-      if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-        window.addEventListener('focus', onReturn);
-        window.addEventListener('visibilitychange', onReturn);
+      } catch (err) {
+        this.state.updateState = {
+          ...this.state.updateState,
+          installing: false,
+          statusText: err?.message || 'Unable to install update.'
+        };
+        this.showError('Update Failed', err?.message || 'Unable to install update.');
+        this.render();
       }
-      if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
-        document.addEventListener('visibilitychange', onReturn);
-      }
-
-      this._androidUpdateReturnCleanup = () => {
-        if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
-          window.removeEventListener('focus', onReturn);
-          window.removeEventListener('visibilitychange', onReturn);
-        }
-        if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
-          document.removeEventListener('visibilitychange', onReturn);
-        }
-      };
-    };
-
-    if (this.audioEngine?.playing) {
-      this.audioEngine.pause();
+      return;
     }
-    const gate =
-      typeof this.updaterService.mountMandatoryUpdateGate === 'function'
-        ? this.updaterService.mountMandatoryUpdateGate({
-            latestVersion: us.latestVersion || manifest?.version || LOCAL_VERSION,
-            latestBuild: manifest?.build || us.latestBuild || 1
-          })
-        : null;
 
     this.state.updateState = {
       ...us,
       installing: true,
-      dismissed: false,
-      progress: platform === 'web' ? 40 : 0,
-      statusText:
-        platform === 'web'
-          ? 'Applying web update...'
-          : platform === 'windows-tauri'
-            ? 'Downloading Windows update...'
-            : 'Downloading Android APK...'
+      statusText: 'Applying web update...'
     };
     this.render();
 
     try {
-      const res = await this.updaterService.installNativeUpdate?.(platform, manifest, {
-        onProgress: (evt = {}) => {
-          const status = evt.status || '';
-          const pct = Number.isFinite(Number(evt.progress))
-            ? Math.max(0, Math.min(100, Math.round(Number(evt.progress))))
-            : this.state.updateState.progress;
-          let statusText = evt.message || this.state.updateState.statusText;
-          let installing = true;
-
-          if (status === 'downloading') {
-            statusText = evt.message || `Downloading update... ${pct}%`;
-          } else if (status === 'installing' || status === 'restarting') {
-            statusText =
-              evt.message ||
-              (platform === 'windows-tauri' ? 'Installing & restarting...' : 'Opening installer...');
-          } else if (status === 'permission_required') {
-            this._clearAndroidUpdateReturnListener();
-            installing = false;
-            statusText =
-              evt.message ||
-              'Allow Install unknown apps for MultiPlayer, then tap Update Now again.';
-          } else if (status === 'error') {
-            this._clearAndroidUpdateReturnListener();
-            installing = false;
-            statusText = evt.message || 'Update failed.';
-          }
-
-          gate?.updateStatus?.(statusText, pct, status === 'error');
-          this.state.updateState = {
-            ...this.state.updateState,
-            installing,
-            progress: pct,
-            statusText
-          };
-          this.render();
-
-          if (platform === 'android-apk' && status === 'installing') {
-            attachAndroidInstallerReturnListener();
-          }
-        }
-      });
-
-      if (res && res.ok === false && res.reason === 'permission_required') {
-        this._clearAndroidUpdateReturnListener();
+      const res = await this.updaterService?.applyOtaUpdate?.();
+      if (res?.applied) {
         this.state.updateState = {
           ...this.state.updateState,
           installing: false,
-          statusText:
-            res.message ||
-            'Allow Install unknown apps for MultiPlayer, then tap Update Now again.'
+          statusText: 'Update applied! Reloading...'
         };
         this.render();
         return;
       }
-
-      if (platform === 'web') {
-        if (res?.applied) {
-          this.state.updateState = {
-            ...this.state.updateState,
-            installing: false,
-            progress: 100,
-            statusText: 'Update applied! Reloading...'
-          };
-          this.render();
-          return;
-        }
-        if (res && res.applied === false) {
-          this.state.updateState = {
-            ...this.state.updateState,
-            installing: false,
-            progress: 0,
-            statusText: 'Refresh the page to load the latest version.'
-          };
-          this.showStatusToast('Refresh to load the latest version');
-          return;
-        }
-      }
-
-      if (res?.restarting || res?.result?.restarting) {
-        this.state.updateState = {
-          ...this.state.updateState,
-          installing: true,
-          progress: 100,
-          statusText: 'Restarting to apply update...'
-        };
-        this.render();
-        return;
-      }
-
-      if (res?.ok === false && res?.error) {
-        this._clearAndroidUpdateReturnListener();
-        this.state.updateState = {
-          ...this.state.updateState,
-          installing: false,
-          statusText: res.error
-        };
-        this.showError('Update Failed', res.error);
-        return;
-      }
+      this.state.updateState = {
+        ...this.state.updateState,
+        installing: false,
+        statusText: 'Refresh the page to load the latest version.'
+      };
+      this.showStatusToast('Refresh to load the latest version');
+      this.render();
     } catch (err) {
-      this._clearAndroidUpdateReturnListener();
       this.state.updateState = {
         ...this.state.updateState,
         installing: false,
         statusText: err?.message || 'Unable to install update.'
       };
       this.showError('Update Failed', err?.message || 'Unable to install update.');
-      return;
+      this.render();
     }
-    this.render();
   }
 
   async openCoverSearchModal(bookKey = null) {
@@ -5220,6 +5298,40 @@ class AudiobookApp {
       activeOutputDeviceId,
       audioOutputs
     } = this.state;
+    const updatePlatform =
+      typeof this.updaterService?.detectPlatform === 'function'
+        ? this.updaterService.detectPlatform()
+        : 'web';
+    const us = this.state.updateState || {};
+    const canInstallUpdate =
+      Boolean(us.readyToRestart) || (updatePlatform === 'android-apk' && Boolean(us.updateAvailable));
+    const updateAction = canInstallUpdate ? 'install-update' : 'check-update';
+    const updateLabel = us.installing
+      ? updatePlatform === 'windows-tauri'
+        ? 'Restarting...'
+        : 'Reloading...'
+      : us.readyToRestart
+        ? updatePlatform === 'windows-tauri'
+          ? `Restart to Update v${escapeHtml(us.latestVersion)}`
+          : `Reload to Update v${escapeHtml(us.latestVersion)}`
+        : us.downloading
+          ? `Downloading v${escapeHtml(us.latestVersion)}...`
+          : updatePlatform === 'android-apk' && us.updateAvailable
+            ? 'Update via Obtainium'
+            : `Check for Updates (v${escapeHtml(LOCAL_VERSION)})`;
+    const updateBadge = us.checking
+      ? '...'
+      : us.installing
+        ? 'Wait'
+        : us.readyToRestart
+          ? 'Ready'
+          : us.downloading
+            ? 'DL'
+            : updatePlatform === 'android-apk' && us.updateAvailable
+              ? 'New'
+              : us.checked && !us.updateAvailable
+                ? 'Latest'
+                : '';
 
     return `
       <div id="profilePopover" class="popover-menu fixed right-3 sm:right-5 top-[calc(3.75rem+max(env(safe-area-inset-top,0px),var(--android-safe-top,0px)))] md:top-14 z-50 w-72 max-w-[calc(100vw-24px)] rounded-2xl p-3.5 text-sm">
@@ -5279,26 +5391,10 @@ class AudiobookApp {
             <span>Theme</span>
             <span class="text-[11px] font-semibold text-[#1ed760] shrink-0">True Black</span>
           </div>
-          <button data-action="${this.state.updateState.updateAvailable ? 'install-update' : 'check-update'}" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
-            <span class="truncate">${
-              this.state.updateState.installing
-                ? 'Updating...'
-                : this.state.updateState.updateAvailable
-                  ? `Update to v${escapeHtml(this.state.updateState.latestVersion)}`
-                  : `Check for Updates (v${escapeHtml(LOCAL_VERSION)})`
-            }</span>
-            <span class="text-[11px] shrink-0 ${this.state.updateState.updateAvailable ? 'text-[#1ed760] font-semibold' : 'text-[var(--text-muted)]'}">
-              ${
-                this.state.updateState.checking
-                  ? '...'
-                  : this.state.updateState.installing
-                    ? `${this.state.updateState.progress || 0}%`
-                    : this.state.updateState.updateAvailable
-                      ? 'New'
-                      : this.state.updateState.checked
-                        ? 'Latest'
-                        : ''
-              }
+          <button data-action="${updateAction}" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+            <span class="truncate">${updateLabel}</span>
+            <span class="text-[11px] shrink-0 ${canInstallUpdate ? 'text-[#1ed760] font-semibold' : 'text-[var(--text-muted)]'}">
+              ${updateBadge}
             </span>
           </button>
         </div>
@@ -5517,7 +5613,14 @@ class AudiobookApp {
 
   _renderWorkspaceBanners() {
     const us = this.state.updateState || {};
-    const showUpdate = Boolean(us.updateAvailable && !us.dismissed);
+    const platform =
+      typeof this.updaterService?.detectPlatform === 'function'
+        ? this.updaterService.detectPlatform()
+        : 'web';
+    const showUpdate =
+      platform === 'android-apk'
+        ? Boolean(us.updateAvailable && !us.dismissed)
+        : Boolean(us.readyToRestart && !us.dismissed);
     const isSupabaseAuthenticated = Boolean(this.syncService?.isAuthenticated?.());
     const showReauth = Boolean(
       !isSupabaseAuthenticated &&
@@ -5528,26 +5631,32 @@ class AudiobookApp {
     const releaseSummary = String(us.releaseNotes || '')
       .replace(/\s+/g, ' ')
       .trim();
+    const actionLabel = us.installing
+      ? platform === 'windows-tauri'
+        ? 'Restarting...'
+        : 'Reloading...'
+      : platform === 'android-apk'
+        ? 'Open Release'
+        : platform === 'windows-tauri'
+          ? 'Restart to Update'
+          : 'Reload to Update';
+    const badgeLabel =
+      platform === 'android-apk'
+        ? `v${escapeHtml(us.latestVersion)} available`
+        : `v${escapeHtml(us.latestVersion)} ready`;
 
     const updateBanner = showUpdate
       ? `
       <div class="update-banner px-4 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 min-w-0">
         <div class="min-w-0 flex-1 space-y-1">
           <div class="flex items-center gap-2 min-w-0">
-            <span class="px-2 py-0.5 rounded-full bg-[#1ed760]/20 text-[#1ed760] text-[10px] font-bold shrink-0">v${escapeHtml(us.latestVersion)} available</span>
+            <span class="px-2 py-0.5 rounded-full bg-[#1ed760]/20 text-[#1ed760] text-[10px] font-bold shrink-0">${badgeLabel}</span>
             <span class="text-xs font-semibold text-white truncate">${escapeHtml(us.statusText || releaseSummary || 'A new update is ready to install.')}</span>
           </div>
-          ${
-            us.installing
-              ? `<div class="w-full max-w-sm h-1 rounded-full bg-white/10 overflow-hidden">
-                  <div class="h-full bg-[#1ed760] transition-all duration-200 rounded-full" style="width:${Math.max(4, Number(us.progress || 0))}%"></div>
-                </div>`
-              : ''
-          }
         </div>
         <div class="flex items-center gap-2 shrink-0">
           <button type="button" data-action="install-update" ${us.installing ? 'disabled' : ''} class="btn-press px-3.5 py-1.5 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold disabled:opacity-60">
-            ${us.installing ? `Updating ${us.progress || 0}%` : 'Update Now'}
+            ${actionLabel}
           </button>
           <button type="button" data-action="dismiss-update" aria-label="Dismiss update" class="btn-press p-1 rounded-full hover:bg-white/10 text-[var(--text-secondary)] hover:text-white">
             ${ICON_CLOSE(14)}

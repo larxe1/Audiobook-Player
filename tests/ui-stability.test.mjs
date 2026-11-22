@@ -738,76 +738,113 @@ test('loading cached split Expanse books normalizes keys/series, deduplicates co
   }
 });
 
-test('auto-updater banner, dismiss, profile action, and installNativeUpdate progress/permission UX', async () => {
+test('Windows Tauri background updater stages silently without pausing audio, shows Restart to Update, and handles partial releases and dismiss', async () => {
   const env = createDomEnv({ innerWidth: 1280 });
   let app = null;
   try {
+    const tauriCalls = [];
+    env.mockWindow.__TAURI_INTERNALS__ = {
+      invoke: async (cmd, args) => {
+        tauriCalls.push({ cmd, args });
+        if (cmd === 'desktop_stage_update') {
+          return { ok: true, staged: true, version: args.version, path: 'C:\\Temp\\Audiobook-Player-update.exe' };
+        }
+        return { ok: true, restarting: true };
+      }
+    };
+
     app = new AudiobookApp(env.rootEl);
     app._enrichSingleBookInBackground = async () => {};
     app._runBackgroundMetadataEnrichment = async () => {};
     app.guestLocalMode = true;
     app.books = [makeBook(1)];
     app.state.activeBookKey = app.books[0].bookKey;
+    app.updaterService.detectPlatform = () => 'windows-tauri';
 
+    let pauseCalls = 0;
+    const origPause = app.audioEngine.pause.bind(app.audioEngine);
+    app.audioEngine.playing = true;
+    app.audioEngine.pause = (...args) => {
+      pauseCalls += 1;
+      return origPause(...args);
+    };
+
+    // 1. Partial release without .exe does not stage or show update banner
     app.updaterService.checkForUpdate = async () => ({
       updateAvailable: true,
-      currentVersion: '1.0.11',
-      latestVersion: '1.2.0',
-      releaseNotes: 'Adds faster sync and seamless handoff.',
-      exeDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe',
-      apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk'
+      currentVersion: '1.0.23',
+      latestVersion: '1.0.24',
+      releaseNotes: 'Android APK built first',
+      exeDownloadUrl: '',
+      apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.24/Audiobook-Player.apk',
+      releasePageUrl: 'https://github.com/larxe1/Audiobook-Player/releases/tag/v1.0.24'
     });
-    app.updaterService.lastManifest = {
-      version: '1.2.0',
-      exeDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe'
+    await app.handleCheckForUpdate({ silent: true });
+    assert.equal(tauriCalls.length, 0);
+    assert.equal(pauseCalls, 0);
+    assert.equal(app.state.updateState.updateAvailable, false);
+    assert.equal(env.rootEl.querySelector('.update-banner'), null);
+
+    // 2. Full release with .exe stages in background without pausing playing audioEngine
+    const manifest = {
+      version: '1.0.24',
+      exeDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.24/Audiobook-Player.exe',
+      releasePageUrl: 'https://github.com/larxe1/Audiobook-Player/releases/tag/v1.0.24'
     };
+    app.updaterService.lastManifest = manifest;
+    app.updaterService.checkForUpdate = async () => ({
+      updateAvailable: true,
+      currentVersion: '1.0.23',
+      latestVersion: '1.0.24',
+      releaseNotes: 'Background update ready.',
+      exeDownloadUrl: manifest.exeDownloadUrl,
+      apkDownloadUrl: '',
+      releasePageUrl: manifest.releasePageUrl
+    });
 
     await app.handleCheckForUpdate({ silent: true });
-    assert.equal(app.state.updateState.updateAvailable, true);
-    assert.equal(app.state.updateState.latestVersion, '1.2.0');
+    assert.equal(pauseCalls, 0, 'background update stage must never pause audioEngine');
+    assert.equal(app.state.updateState.readyToRestart, true);
     assert.equal(app.state.updateState.dismissed, false);
+    assert.deepEqual(tauriCalls, [
+      {
+        cmd: 'desktop_stage_update',
+        args: { url: manifest.exeDownloadUrl, version: '1.0.24' }
+      }
+    ]);
 
     const banner = env.rootEl.querySelector('.update-banner');
-    assert.ok(banner, 'Update Available banner should render on Desktop');
-    assert.match(banner.textContent, /v1\.2\.0 available/);
-    assert.match(banner.textContent, /Adds faster sync/);
-
-    let calledInstall = null;
-    app.updaterService.detectPlatform = () => 'android-apk';
-    app.updaterService.installNativeUpdate = async (platform, manifest, { onProgress }) => {
-      calledInstall = { platform, manifest };
-      onProgress({ status: 'downloading', progress: 45 });
-      assert.match(env.rootEl.querySelector('.update-banner')?.textContent || '', /45%/);
-      onProgress({
-        status: 'permission_required',
-        message: 'Allow Install unknown apps for Audiobook Player, then tap Update Now again.'
-      });
-      return { ok: false, reason: 'permission_required' };
-    };
-
-    const installBtn = env.rootEl.querySelector('[data-action="install-update"]');
+    assert.ok(banner, 'Restart to Update banner should render on Desktop once staged');
+    assert.match(banner.textContent, /v1\.0\.24 ready/);
+    const installBtn = banner.querySelector('[data-action="install-update"]');
     assert.ok(installBtn);
-    installBtn.click();
-    await new Promise((r) => setTimeout(r, 10));
+    assert.match(installBtn.textContent, /Restart to Update/);
+    const dismissBtn = banner.querySelector('[data-action="dismiss-update"]');
+    assert.ok(dismissBtn);
 
-    assert.equal(calledInstall?.platform, 'android-apk');
-    assert.equal(app.state.updateState.installing, false);
-    assert.match(app.state.updateState.statusText, /Allow Install unknown apps/);
-
-    // Profile menu also exposes Update to v1.2.0
+    // Profile menu also exposes Restart to Update v1.0.24
     app.state.profileOpen = true;
     app.render();
     const profileInstallBtn = env.rootEl
       .querySelector('#appOverlayProfile')
       ?.querySelector('[data-action="install-update"]');
     assert.ok(profileInstallBtn);
-    assert.match(profileInstallBtn.textContent, /Update to v1\.2\.0/);
+    assert.match(profileInstallBtn.textContent, /Restart to Update v1\.0\.24/);
 
     // Dismissing hides banner
-    const dismissBtn = env.rootEl.querySelector('[data-action="dismiss-update"]');
     dismissBtn.click();
     assert.equal(app.state.updateState.dismissed, true);
     assert.equal(env.rootEl.querySelector('.update-banner'), null);
+
+    // Re-show and click Restart to Update -> invokes desktop_apply_staged_update
+    app.state.updateState.dismissed = false;
+    app.render();
+    const restartBtn = env.rootEl.querySelector('.update-banner')?.querySelector('[data-action="install-update"]');
+    assert.ok(restartBtn);
+    restartBtn.click();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(pauseCalls, 0);
+    assert.deepEqual(tauriCalls.at(-1), { cmd: 'desktop_apply_staged_update', args: {} });
   } finally {
     app?.destroy?.();
     env.restore();
@@ -962,82 +999,167 @@ test('cross-device library merge, Drive folder auto-link, remote-local badge/not
   }
 });
 
-test('returning via focus or visibilitychange after Android installing resets installing=false so Update Now is clickable again', async () => {
-  const env = createDomEnv({ innerWidth: 390 });
-  let app = null;
+test('Android APK skips silent startup checks, shows non-blocking Open Release or Obtainium toast on manual check, and Web PWA stages Reload to Update', async () => {
+  // 1. Android APK mobile viewport
+  const androidEnv = createDomEnv({ innerWidth: 390 });
+  let androidApp = null;
   try {
-    app = new AudiobookApp(env.rootEl);
-    app._enrichSingleBookInBackground = async () => {};
-    app._runBackgroundMetadataEnrichment = async () => {};
-    app.guestLocalMode = true;
-    app.books = [makeBook(1)];
-    app.state.activeBookKey = app.books[0].bookKey;
+    const openedUrls = [];
+    androidEnv.mockWindow.open = (url) => {
+      openedUrls.push(url);
+      return {};
+    };
 
-    app.state.updateState = {
-      ...app.state.updateState,
-      checked: true,
-      updateAvailable: true,
-      latestVersion: '1.0.12',
-      manifest: {
-        version: '1.0.12',
-        apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk'
+    androidApp = new AudiobookApp(androidEnv.rootEl);
+    androidApp._enrichSingleBookInBackground = async () => {};
+    androidApp._runBackgroundMetadataEnrichment = async () => {};
+    androidApp.guestLocalMode = true;
+    androidApp.books = [makeBook(1)];
+    androidApp.state.activeBookKey = androidApp.books[0].bookKey;
+    androidApp.updaterService.detectPlatform = () => 'android-apk';
+
+    let androidPauseCalls = 0;
+    const origAndroidPause = androidApp.audioEngine.pause.bind(androidApp.audioEngine);
+    androidApp.audioEngine.playing = true;
+    androidApp.audioEngine.pause = (...args) => {
+      androidPauseCalls += 1;
+      return origAndroidPause(...args);
+    };
+
+    let checkCalls = 0;
+    let remoteAvailable = false;
+    androidApp.updaterService.checkForUpdate = async () => {
+      checkCalls += 1;
+      if (!remoteAvailable) {
+        return {
+          updateAvailable: false,
+          currentVersion: '1.0.23',
+          latestVersion: '1.0.23',
+          apkDownloadUrl: '',
+          exeDownloadUrl: '',
+          releasePageUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest',
+          releaseNotes: ''
+        };
+      }
+      const manifest = {
+        version: '1.0.24',
+        apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.24/Audiobook-Player.apk',
+        releasePageUrl: 'https://github.com/larxe1/Audiobook-Player/releases/tag/v1.0.24'
+      };
+      androidApp.updaterService.lastManifest = manifest;
+      return {
+        updateAvailable: true,
+        currentVersion: '1.0.23',
+        latestVersion: '1.0.24',
+        apkDownloadUrl: manifest.apkDownloadUrl,
+        exeDownloadUrl: '',
+        releasePageUrl: manifest.releasePageUrl,
+        releaseNotes: 'New Android release'
+      };
+    };
+
+    // Silent startup check must be a no-op on Android APK
+    await androidApp.handleCheckForUpdate({ silent: true });
+    assert.equal(checkCalls, 0);
+    assert.equal(androidPauseCalls, 0);
+    assert.equal(androidEnv.rootEl.querySelector('.update-banner'), null);
+    assert.equal(androidEnv.rootEl.querySelector('#mandatory-update-gate'), null);
+
+    // Manual check when up to date shows Obtainium toast and no banner
+    await androidApp.handleCheckForUpdate({ silent: false });
+    assert.equal(checkCalls, 1);
+    assert.equal(androidPauseCalls, 0);
+    assert.match(androidEnv.rootEl.querySelector('#appOverlayToast')?.innerHTML || '', /managed by Obtainium/i);
+    assert.equal(androidEnv.rootEl.querySelector('.update-banner'), null);
+
+    // Manual check when newer shows non-blocking Open Release banner
+    remoteAvailable = true;
+    await androidApp.handleCheckForUpdate({ silent: false });
+    assert.equal(checkCalls, 2);
+    assert.equal(androidPauseCalls, 0);
+    const androidBanner = androidEnv.rootEl.querySelector('.update-banner');
+    assert.ok(androidBanner, 'Android manual check should show non-blocking Open Release banner');
+    assert.match(androidBanner.textContent, /v1\.0\.24 available/);
+    const openReleaseBtn = androidBanner.querySelector('[data-action="install-update"]');
+    assert.ok(openReleaseBtn);
+    assert.match(openReleaseBtn.textContent, /Open Release/);
+
+    openReleaseBtn.click();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(androidPauseCalls, 0);
+    assert.deepEqual(openedUrls, ['https://github.com/larxe1/Audiobook-Player/releases/tag/v1.0.24']);
+  } finally {
+    androidApp?.destroy?.();
+    androidEnv.restore();
+  }
+
+  // 2. Web PWA: stages via SW update and shows Reload to Update; clicking calls applyOtaUpdate
+  const webEnv = createDomEnv({ innerWidth: 390 });
+  let webApp = null;
+  try {
+    webApp = new AudiobookApp(webEnv.rootEl);
+    webApp._enrichSingleBookInBackground = async () => {};
+    webApp._runBackgroundMetadataEnrichment = async () => {};
+    webApp.guestLocalMode = true;
+    webApp.books = [makeBook(1)];
+    webApp.state.activeBookKey = webApp.books[0].bookKey;
+    webApp.updaterService.detectPlatform = () => 'web';
+
+    let swUpdateCalls = 0;
+    const posted = [];
+    let reloaded = false;
+    webApp.updaterService._navigatorObj = {
+      serviceWorker: {
+        async getRegistration() {
+          return {
+            async update() {
+              swUpdateCalls += 1;
+            },
+            waiting: {
+              postMessage(msg) {
+                posted.push(msg);
+              }
+            }
+          };
+        }
       }
     };
-    app.render();
 
-    let progressHandler = null;
-    let installCalls = 0;
-    app.updaterService.detectPlatform = () => 'android-apk';
-    app.updaterService.installNativeUpdate = async (platform, manifest, { onProgress }) => {
-      installCalls += 1;
-      progressHandler = onProgress;
-      return { ok: true, started: true, platform, url: manifest.apkDownloadUrl };
+    let applyCalls = 0;
+    const origApplyOta = webApp.updaterService.applyOtaUpdate.bind(webApp.updaterService);
+    webApp.updaterService.applyOtaUpdate = async () => {
+      applyCalls += 1;
+      return origApplyOta({ reload: () => { reloaded = true; } });
     };
 
-    // 1. Trigger install and advance to Android PackageInstaller launch (`installing` at 100%)
-    env.rootEl.querySelector('[data-action="install-update"]').click();
+    webApp.updaterService.checkForUpdate = async () => ({
+      updateAvailable: true,
+      currentVersion: '1.0.23',
+      latestVersion: '1.0.24',
+      releaseNotes: 'Web update ready',
+      releasePageUrl: 'https://github.com/larxe1/Audiobook-Player/releases/tag/v1.0.24'
+    });
+
+    await webApp.handleCheckForUpdate({ silent: true });
+    assert.equal(swUpdateCalls, 1);
+    assert.equal(applyCalls, 0);
+    assert.deepEqual(posted, []);
+    assert.equal(webApp.state.updateState.readyToRestart, true);
+
+    const webBanner = webEnv.rootEl.querySelector('.update-banner');
+    assert.ok(webBanner, 'Web PWA should show Reload to Update banner once staged');
+    const reloadBtn = webBanner.querySelector('[data-action="install-update"]');
+    assert.ok(reloadBtn);
+    assert.match(reloadBtn.textContent, /Reload to Update/);
+
+    reloadBtn.click();
     await new Promise((r) => setTimeout(r, 10));
-    progressHandler({ status: 'downloading', progress: 60 });
-    progressHandler({ status: 'installing', progress: 100, message: 'Opening Android installer...' });
-
-    const disabledBtn = env.rootEl.querySelector('[data-action="install-update"]');
-    assert.equal(app.state.updateState.installing, true);
-    assert.equal(disabledBtn?.disabled, true);
-    assert.match(disabledBtn?.textContent || '', /Updating 100%/);
-
-    // Hidden visibilitychange when PackageInstaller opens must NOT reset prematurely
-    env.mockDocument.hidden = true;
-    env.mockDocument.visibilityState = 'hidden';
-    env.mockDocument.dispatchEvent('visibilitychange');
-    assert.equal(app.state.updateState.installing, true);
-
-    // Returning via focus resets installing=false and makes Update Now clickable again
-    env.mockDocument.hidden = false;
-    env.mockDocument.visibilityState = 'visible';
-    env.mockWindow.dispatchEvent('focus');
-
-    assert.equal(app.state.updateState.installing, false);
-    assert.equal(app.state.updateState.statusText, '');
-    const reenabledBtn = env.rootEl.querySelector('[data-action="install-update"]');
-    assert.equal(reenabledBtn?.disabled, false);
-    assert.match(reenabledBtn?.textContent || '', /Update Now/);
-
-    // 2. Retry install and verify visibilitychange -> visible also resets cleanly
-    reenabledBtn.click();
-    await new Promise((r) => setTimeout(r, 10));
-    assert.equal(installCalls, 2);
-    progressHandler({ status: 'installing', progress: 100, message: 'Opening Android installer...' });
-    assert.equal(app.state.updateState.installing, true);
-
-    env.mockDocument.hidden = false;
-    env.mockDocument.visibilityState = 'visible';
-    env.mockDocument.dispatchEvent('visibilitychange');
-
-    assert.equal(app.state.updateState.installing, false);
-    assert.equal(env.rootEl.querySelector('[data-action="install-update"]')?.disabled, false);
+    assert.equal(applyCalls, 1);
+    assert.deepEqual(posted, [{ type: 'SKIP_WAITING' }]);
+    assert.equal(reloaded, true);
   } finally {
-    app?.destroy?.();
-    env.restore();
+    webApp?.destroy?.();
+    webEnv.restore();
   }
 });
 

@@ -512,10 +512,22 @@ async fn desktop_clear_auth_session(state: tauri::State<'_, AppState>) -> Result
     Ok(true)
 }
 
+static STAGING_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+struct StagingGuard;
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        STAGING_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
+
 fn is_allowed_update_url(url: &str) -> bool {
     let allowed_prefixes = [
         "https://github.com/larxe1/Audiobook-Player/",
         "https://objects.githubusercontent.com/",
+        "https://release-assets.githubusercontent.com/",
     ];
     if !allowed_prefixes.iter().any(|p| url.starts_with(p)) {
         return false;
@@ -523,91 +535,167 @@ fn is_allowed_update_url(url: &str) -> bool {
     !url.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
-#[tauri::command]
-async fn desktop_install_update(
-    app: tauri::AppHandle,
-    url: String,
-) -> Result<serde_json::Value, String> {
+fn validate_staged_exe(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+
+    let meta = fs::metadata(path)
+        .map_err(|e| format!("Downloaded update binary missing: {e}"))?;
+    if meta.len() <= 1_000_000 {
+        return Err(format!(
+            "Downloaded update binary is unexpectedly small ({} bytes).",
+            meta.len()
+        ));
+    }
+
+    let mut header = [0u8; 2];
+    let mut file = fs::File::open(path)
+        .map_err(|e| format!("Failed to inspect downloaded update: {e}"))?;
+    file.read_exact(&mut header)
+        .map_err(|e| format!("Failed to read update header: {e}"))?;
+    if &header != b"MZ" {
+        return Err("Downloaded file is not a valid Windows executable (missing MZ header).".into());
+    }
+    Ok(())
+}
+
+fn clean_windows_path(path: &Path) -> Result<String, String> {
+    let raw = path.to_string_lossy();
+    let cleaned = raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
+    if cleaned.contains('"') || cleaned.contains('\r') || cleaned.contains('\n') {
+        return Err("Executable path contains unsupported characters.".into());
+    }
+    Ok(cleaned)
+}
+
+fn stage_update_blocking(url: &str, version: Option<&str>) -> Result<serde_json::Value, String> {
     let trimmed_url = url.trim().to_string();
     if !is_allowed_update_url(&trimmed_url) {
         return Err("Update URL is not from an allowed GitHub release origin.".into());
     }
 
+    let normalized_version = version
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    let temp_dir = std::env::temp_dir();
+    let staged_exe = temp_dir.join("Audiobook-Player-update.exe");
+    let part_exe = temp_dir.join("Audiobook-Player-update.exe.part");
+    let meta_path = temp_dir.join("Audiobook-Player-update.json");
+
+    if staged_exe.is_file() && meta_path.is_file() {
+        if let Ok(meta_raw) = fs::read_to_string(&meta_path) {
+            if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&meta_raw) {
+                let meta_url = meta_json.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                let meta_ver = meta_json
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                if normalized_version.is_some()
+                    && meta_url == trimmed_url
+                    && meta_ver == normalized_version
+                    && validate_staged_exe(&staged_exe).is_ok()
+                {
+                    let path_str = clean_windows_path(&staged_exe)?;
+                    return Ok(serde_json::json!({
+                        "ok": true,
+                        "staged": true,
+                        "alreadyStaged": true,
+                        "version": normalized_version,
+                        "path": path_str
+                    }));
+                }
+            }
+        }
+    }
+
+    if STAGING_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("Update download already in progress.".into());
+    }
+    let _staging_guard = StagingGuard;
+
+    let _ = fs::remove_file(&part_exe);
+
+    let mut curl_cmd = std::process::Command::new("curl.exe");
+    curl_cmd
+        .arg("-fSL")
+        .arg("--retry")
+        .arg("2")
+        .arg("--connect-timeout")
+        .arg("15")
+        .arg("-o")
+        .arg(&part_exe)
+        .arg(&trimmed_url);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        curl_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = curl_cmd
+        .output()
+        .map_err(|e| format!("Failed to invoke curl.exe: {e}"))?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&part_exe);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Update download failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        ));
+    }
+
+    if let Err(err) = validate_staged_exe(&part_exe) {
+        let _ = fs::remove_file(&part_exe);
+        return Err(err);
+    }
+
+    let _ = fs::remove_file(&meta_path);
+    let _ = fs::remove_file(&staged_exe);
+    if fs::rename(&part_exe, &staged_exe).is_err() {
+        fs::copy(&part_exe, &staged_exe)
+            .map_err(|e| format!("Failed to finalize staged update binary: {e}"))?;
+        let _ = fs::remove_file(&part_exe);
+    }
+
+    let meta_payload = serde_json::json!({
+        "version": normalized_version,
+        "url": trimmed_url
+    });
+    fs::write(
+        &meta_path,
+        serde_json::to_string(&meta_payload)
+            .map_err(|e| format!("Failed to serialize update metadata: {e}"))?,
+    )
+    .map_err(|e| format!("Failed to write update metadata: {e}"))?;
+
+    let path_str = clean_windows_path(&staged_exe)?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "staged": true,
+        "alreadyStaged": false,
+        "version": normalized_version,
+        "path": path_str
+    }))
+}
+
+async fn apply_staged_update_internal(app: &tauri::AppHandle) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        use std::io::Read;
-
         let temp_dir = std::env::temp_dir();
-        let temp_exe = temp_dir.join("Audiobook-Player-update.exe");
-        let _ = fs::remove_file(&temp_exe);
+        let staged_exe = temp_dir.join("Audiobook-Player-update.exe");
+        let meta_path = temp_dir.join("Audiobook-Player-update.json");
 
-        let mut curl_cmd = std::process::Command::new("curl.exe");
-        curl_cmd
-            .arg("-fSL")
-            .arg("--retry")
-            .arg("2")
-            .arg("--connect-timeout")
-            .arg("15")
-            .arg("-o")
-            .arg(&temp_exe)
-            .arg(&trimmed_url);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            curl_cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let output = curl_cmd
-            .output()
-            .map_err(|e| format!("Failed to invoke curl.exe: {e}"))?;
-        if !output.status.success() {
-            let _ = fs::remove_file(&temp_exe);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "Update download failed (exit {}): {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            ));
-        }
-
-        let meta = fs::metadata(&temp_exe)
-            .map_err(|e| format!("Downloaded update binary missing: {e}"))?;
-        if meta.len() <= 1_000_000 {
-            let _ = fs::remove_file(&temp_exe);
-            return Err(format!(
-                "Downloaded update binary is unexpectedly small ({} bytes).",
-                meta.len()
-            ));
-        }
-
-        let mut header = [0u8; 2];
-        {
-            let mut file = fs::File::open(&temp_exe)
-                .map_err(|e| format!("Failed to inspect downloaded update: {e}"))?;
-            file.read_exact(&mut header)
-                .map_err(|e| format!("Failed to read update header: {e}"))?;
-        }
-        if &header != b"MZ" {
-            let _ = fs::remove_file(&temp_exe);
-            return Err("Downloaded file is not a valid Windows executable (missing MZ header).".into());
-        }
+        validate_staged_exe(&staged_exe)?;
 
         let current_exe = std::env::current_exe()
             .map_err(|e| format!("Failed to resolve current executable path: {e}"))?;
-        let current_exe_raw = current_exe.to_string_lossy();
-        let current_exe_str = current_exe_raw
-            .strip_prefix(r"\\?\")
-            .unwrap_or(&current_exe_raw);
-        let temp_exe_raw = temp_exe.to_string_lossy();
-        let temp_exe_str = temp_exe_raw
-            .strip_prefix(r"\\?\")
-            .unwrap_or(&temp_exe_raw);
-
-        for p in [current_exe_str, temp_exe_str] {
-            if p.contains('"') || p.contains('\r') || p.contains('\n') {
-                return Err("Executable path contains unsupported characters.".into());
-            }
-        }
+        let current_exe_str = clean_windows_path(&current_exe)?;
+        let staged_exe_str = clean_windows_path(&staged_exe)?;
+        let meta_path_str = clean_windows_path(&meta_path)?;
 
         let pid = std::process::id();
         let cmd_path = temp_dir.join("audiobook-self-update.cmd");
@@ -615,8 +703,9 @@ async fn desktop_install_update(
             "@echo off\r\n\
             setlocal\r\n\
             set \"PID={pid}\"\r\n\
-            set \"SRC={temp_exe_str}\"\r\n\
+            set \"SRC={staged_exe_str}\"\r\n\
             set \"DST={current_exe_str}\"\r\n\
+            set \"META={meta_path_str}\"\r\n\
             set /a TRIES=0\r\n\
             :wait_loop\r\n\
             tasklist /NH /FI \"PID eq %PID%\" 2>NUL | find \"%PID%\" >NUL\r\n\
@@ -640,6 +729,7 @@ async fn desktop_install_update(
             ping -n 2 127.0.0.1 >NUL\r\n\
             goto try_move\r\n\
             :launch\r\n\
+            del /F /Q \"%META%\" >NUL 2>&1\r\n\
             start \"\" \"%DST%\"\r\n\
             (goto) 2>nul & del \"%~f0\"\r\n"
         );
@@ -677,6 +767,34 @@ async fn desktop_install_update(
         "ok": true,
         "restarting": true
     }))
+}
+
+#[tauri::command]
+async fn desktop_stage_update(
+    url: String,
+    version: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || stage_update_blocking(&url, version.as_deref()))
+        .await
+        .map_err(|e| format!("Update staging worker panicked: {e}"))?
+}
+
+#[tauri::command]
+async fn desktop_apply_staged_update(
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    apply_staged_update_internal(&app).await
+}
+
+#[tauri::command]
+async fn desktop_install_update(
+    app: tauri::AppHandle,
+    url: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || stage_update_blocking(&url, None))
+        .await
+        .map_err(|e| format!("Update staging worker panicked: {e}"))??;
+    apply_staged_update_internal(&app).await
 }
 
 #[tauri::command]
@@ -825,6 +943,8 @@ fn main() {
             desktop_save_auth_session,
             desktop_load_auth_session,
             desktop_clear_auth_session,
+            desktop_stage_update,
+            desktop_apply_staged_update,
             desktop_install_update,
             fetch_podcast_rss
         ])
