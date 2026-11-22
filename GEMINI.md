@@ -11,8 +11,8 @@ Never ship a Windows-only or Android-only fix without auditing auth redirects, O
 
 ## Mandatory Design, UX & Fluid Motion Craft Rule (`.agents/skills/ui-motion-craft/SKILL.md`)
 
-1. **Pitch Black Default & Zero-Blink Fluid Transitions:**
-   - `theme-pitch` (`#000000`) is the default theme across HTML, CSS, Tauri, and Android system bars (legacy `'midnight'` is removed and auto-migrated to `'pitch'`).
+1. **True Black Default & Zero-Blink Fluid Transitions:**
+   - **True Black (`theme-amoled`, `#000000`)** is the sole default theme across HTML, CSS, Tauri, and Android system bars (legacy `'pitch'` and `'midnight'` preferences are removed and auto-migrated to `'amoled'`).
    - Primary view changes (`Home <-> Detail`, `Audiobooks <-> Podcasts`), modal/sheet/popover/context-menu open **and close** (`[data-closing]` exit transition + `@starting-style` entry), and staggered reveals (`.ui-stagger-item`) use exponential ease-out (`cubic-bezier(0.16, 1, 0.3, 1)` / `var(--ease-spring)`).
    - **Zero-blink same-view updates**: Never re-run `.ui-view-enter` / `.ui-stagger-grid` or `startViewTransition` on same-view book selection, play/pause, or series folder toggles, and update search results in-place without recreating focused `<input>` elements.
    - Handle `@media (prefers-reduced-motion: reduce)` case-by-case (`translate: none`) without global `0.01ms !important` overrides.
@@ -24,13 +24,13 @@ Never ship a Windows-only or Android-only fix without auditing auth redirects, O
 ## Mandatory Dual-Platform Subagent Parity Gate
 
 Unless a task is explicitly requested for one platform only, every implementation round **MUST** be audited in parallel by two separate platform verifiers before building or pushing a release:
-- **`android-parity-verifier`** (`.agents/agents/android-parity-verifier.md`, or `auditor-android` in `/swarm`): checks every fix/feature is imported, wired into `android-auto/` & `.github/workflows/release.yml`, and working across Android APK, Mobile `< 768px`, Chrome PWA, Notification Shade, Wear OS, and Android Auto.
-- **`windows-parity-verifier`** (`.agents/agents/windows-parity-verifier.md`, or `auditor-windows` in `/swarm`): checks every fix/feature is imported, wired into `src-tauri/` & `scripts/prepare-tauri-ui.mjs`, and working across Windows `.exe` (`tauri.localhost`), Desktop `>= 768px`, and Windows CI.
+- **`android-parity-verifier`** (`.agents/agents/android-parity-verifier.md`, or `auditor-android` in `/swarm`): read-only audit scoped strictly to Android-specific surfaces (`android-auto/`, `.github/workflows/release.yml`, `< 768px` mobile layout, Capacitor/WebView/OTA constraints, Chrome PWA, Notification Shade, Wear OS, Android Auto) without re-running full test suites or duplicating shared business-logic review.
+- **`windows-parity-verifier`** (`.agents/agents/windows-parity-verifier.md`, or `auditor-windows` in `/swarm`): read-only audit scoped strictly to Windows-specific surfaces (`src-tauri/`, `scripts/prepare-tauri-ui.mjs`, `>= 768px` desktop layout, Windows `.exe` CI) without re-running full test suites or duplicating shared business-logic review.
 
 ## 5-Step Release Parity Checklist
 
-1. **Dual-Platform Subagent Audit**: Run `android-parity-verifier` and `windows-parity-verifier` in parallel to verify both Windows (`tauri.localhost` / desktop viewport) and Android (`capacitor://` / `https://localhost` / mobile viewport / Android WebView / Chrome PWA / `android-auto/`) behavior and CI wiring.
-2. **Version Bump**: Bump `version.json` (`version` and `build`), `LOCAL_VERSION` in `src/services/self-updater.js`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`.
+1. **Dual-Platform Subagent Audit**: Run `android-parity-verifier` and `windows-parity-verifier` in parallel (strictly read-only platform-surface checks, handing off to `neon-reviewer` for shared logic diff review before `verifier` runs the single authoritative test suite).
+2. **Version Bump**: Bump `version.json` (`version` and `build`, keeping `minNativeBuild` unchanged unless a breaking native bridge change requires a new APK), `LOCAL_VERSION` / `LOCAL_BUILD` in `src/services/self-updater.js`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`.
 3. **Prepare & Build Windows `.exe`**: Run `node scripts/prepare-tauri-ui.mjs` and `cargo build --release --manifest-path src-tauri/Cargo.toml`.
 4. **Update Local & Desktop `.exe`**: Stop any running `Audiobook Player` / `MultiPlayer` process, copy the release `.exe` to both `d:\Code\Audiobook\` and `C:\Users\ecmat\OneDrive\Desktop\`, and verify identical SHA256 hashes (`Get-FileHash`).
-5. **Verify, Shield & Push**: Run all unit tests (`node --test`), run `git-secret-shield`, commit, and `git push origin main` so Android OTA / GitHub Actions `.apk` receives the exact fix too.
+5. **Verify, Shield, Push & Confirm CI**: Run all unit tests (`node --test`), run `git-secret-shield`, commit, and `git push origin main` so Android OTA / GitHub Actions `.apk` receives the exact fix too. Whenever `.github/workflows/*` or `android-auto/*` changes, check/report the triggered GitHub Actions run status/URL after pushing so broken APK builds never go unnoticed.

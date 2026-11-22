@@ -1,6 +1,6 @@
 ---
 name: ui-motion-craft
-description: Unified Design, UX, Progressive Disclosure, Pitch Black Palette, Context Menus, Zero-Blink DOM Updates, and Fluid Motion Craft across Windows Desktop and Android Mobile in MultiPlayer.
+description: Unified Design, UX, Progressive Disclosure, True Black Palette, Context Menus, Zero-Blink DOM Updates, and Fluid Motion Craft across Windows Desktop and Android Mobile in MultiPlayer.
 ---
 
 # MultiPlayer — Unified Design, UX & Motion Craft
@@ -10,9 +10,9 @@ description: Unified Design, UX, Progressive Disclosure, Pitch Black Palette, Co
 
 ---
 
-## 1. Visual System & Pitch Black Default Canvas
-- **Pitch Black (`theme-pitch`) is the default theme** across `index.html` (`<body class="theme-pitch ...">`), `src/styles/theme.css` (`:root`), Capacitor/Android system bars (`#000000`), Tauri main window background (`#000000`), and `_loadTheme()` (auto-migrating any legacy `'midnight'` preference in `localStorage` to `'pitch'`).
-- Do **not** offer or fall back to the legacy `'midnight'` theme.
+## 1. Visual System & True Black Default Canvas
+- **True Black (`theme-amoled`, `#000000`) is the sole default theme** across `index.html` (`<body class="theme-amoled ...">`), `src/styles/theme.css` (`:root`), Capacitor/Android system bars (`#000000`), Tauri main window background (`#000000`), and `_loadTheme()` (auto-migrating any legacy `'pitch'` or `'midnight'` preference in `localStorage` to `'amoled'`).
+- Do **not** offer or fall back to legacy `'pitch'` or `'midnight'` theme options in Settings or Profile.
 - **Zero default row/card icon clutter**: Never render cloud (`☁️`) or folder badges on library rows/cards. Render **only** a crisp green checkmark (`ICON_OFFLINE_CHECK`) when an item is genuinely saved offline.
 
 ---
