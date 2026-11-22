@@ -1,13 +1,13 @@
 {
-  "version": "1.0.21",
-  "build": 22,
-  "minNativeBuild": 22,
+  "version": "1.0.22",
+  "build": 23,
+  "minNativeBuild": 21,
   "channel": "stable",
-  "publishedAt": "2026-11-22T01:30:00Z",
+  "publishedAt": "2026-11-22T02:05:00Z",
   "manifestUrl": "https://raw.githubusercontent.com/larxe1/Audiobook-Player/main/version.json",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "webBundleUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Updated Inland Empire desktop and Android app icons, fixed Android Web OTA cache invalidation and release tag checks, and removed the 50-episode podcast and library scan limits"
+  "releaseNotes": "Added True Black default theme, volume and mute controls, podcast New Episodes and progress reset with listening hours tracking, sidebar search isolation, Android device deduplication, and Web OTA fallback on APK 404"
 }

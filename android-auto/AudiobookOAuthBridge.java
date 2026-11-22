@@ -2,11 +2,14 @@ package com.audiobook.player;
 
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.CookieManager;
@@ -23,6 +26,7 @@ import java.net.URLDecoder;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -47,6 +51,7 @@ public class AudiobookOAuthBridge {
     private static final String DEFAULT_PROMPT = "select_account";
     private static final String PREFS_NAME = "audiobook_auth_prefs";
     private static final String KEY_AUTH_SESSION = "auth_session_v1";
+    private static final String KEY_DEVICE_ID = "device_id_v1";
 
     private final BridgeActivity activity;
     private String pendingResultJson;
@@ -369,6 +374,83 @@ public class AudiobookOAuthBridge {
         } catch (Exception ignored) {
             return false;
         }
+    }
+
+    @JavascriptInterface
+    public String getDeviceId() {
+        try {
+            SharedPreferences prefs =
+                activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String androidId = null;
+            try {
+                androidId = Settings.Secure.getString(
+                    activity.getContentResolver(),
+                    Settings.Secure.ANDROID_ID
+                );
+            } catch (Exception ignored) {
+            }
+            if (androidId != null) {
+                String cleaned = androidId.trim().toLowerCase(Locale.US).replaceAll("[^a-z0-9_-]", "");
+                if (!cleaned.isEmpty() && !"9774d56d682e549c".equals(cleaned)) {
+                    String cached = prefs.getString(KEY_DEVICE_ID, null);
+                    if (!cleaned.equals(cached)) {
+                        prefs.edit().putString(KEY_DEVICE_ID, cleaned).commit();
+                    }
+                    return cleaned;
+                }
+            }
+            String saved = prefs.getString(KEY_DEVICE_ID, null);
+            if (saved != null && !saved.trim().isEmpty()) {
+                return saved.trim();
+            }
+            String generated = UUID.randomUUID().toString();
+            prefs.edit().putString(KEY_DEVICE_ID, generated).commit();
+            return generated;
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    @JavascriptInterface
+    public String getDeviceName() {
+        try {
+            String manufacturer = Build.MANUFACTURER != null ? Build.MANUFACTURER.trim() : "";
+            String model = Build.MODEL != null ? Build.MODEL.trim() : "";
+            if (model.isEmpty() && manufacturer.isEmpty()) {
+                return "Android Phone";
+            }
+            if (manufacturer.isEmpty()) {
+                return model;
+            }
+            if (model.isEmpty()) {
+                return formatManufacturer(manufacturer);
+            }
+            if (model.toLowerCase(Locale.US).startsWith(manufacturer.toLowerCase(Locale.US))) {
+                return model;
+            }
+            return formatManufacturer(manufacturer) + " " + model;
+        } catch (Exception ignored) {
+            return "Android Phone";
+        }
+    }
+
+    private static String formatManufacturer(String raw) {
+        String trimmed = raw != null ? raw.trim() : "";
+        if (trimmed.isEmpty()) {
+            return "";
+        }
+        boolean hasUpper = false;
+        boolean hasLower = false;
+        for (int i = 0; i < trimmed.length(); i++) {
+            char c = trimmed.charAt(i);
+            if (Character.isUpperCase(c)) hasUpper = true;
+            if (Character.isLowerCase(c)) hasLower = true;
+        }
+        if (hasUpper && (hasLower || trimmed.length() <= 4)) {
+            return trimmed;
+        }
+        return trimmed.substring(0, 1).toUpperCase(Locale.US)
+            + trimmed.substring(1).toLowerCase(Locale.US);
     }
 
     public boolean handleRedirectIntent(Intent intent) {

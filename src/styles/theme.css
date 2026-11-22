@@ -2,42 +2,10 @@
 
 :root,
 body,
+body.theme-amoled,
+.theme-amoled,
 body.theme-pitch,
 .theme-pitch {
-  --bg-canvas: #050506;
-  --bg-shell: #08080a;
-  --bg-panel: #101012;
-  --bg-card: #161619;
-  --bg-card-hover: #202025;
-  --border-subtle: rgba(255, 255, 255, 0.08);
-  --text-primary: #fafafa;
-  --text-secondary: #a1a1aa;
-  --text-muted: #71717a;
-  --accent: #1ed760;
-  --accent-hover: #1fdf64;
-  --ambient-color: rgba(30, 215, 96, 0.16);
-  --range-track: rgba(255, 255, 255, 0.18);
-  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
-  --dur-fast: 160ms;
-  --dur-normal: 260ms;
-  --dur-slow: 360ms;
-  --android-safe-top: 0px;
-  --android-safe-bottom: 0px;
-  color-scheme: dark;
-}
-
-@media (max-width: 767px) {
-  :root.is-android-native:not(.has-native-insets),
-  html.is-android-native:not(.has-native-insets),
-  body.is-android-native:not(.has-native-insets) {
-    --android-safe-top: 32px;
-    --android-safe-bottom: 16px;
-  }
-}
-
-body.theme-amoled,
-.theme-amoled {
   --bg-canvas: #000000;
   --bg-shell: #040405;
   --bg-panel: #0a0a0c;
@@ -56,7 +24,18 @@ body.theme-amoled,
   --dur-fast: 160ms;
   --dur-normal: 260ms;
   --dur-slow: 360ms;
+  --android-safe-top: 0px;
+  --android-safe-bottom: 0px;
   color-scheme: dark;
+}
+
+@media (max-width: 767px) {
+  :root.is-android-native:not(.has-native-insets),
+  html.is-android-native:not(.has-native-insets),
+  body.is-android-native:not(.has-native-insets) {
+    --android-safe-top: 32px;
+    --android-safe-bottom: 16px;
+  }
 }
 
 /* Same-Document View Transitions */

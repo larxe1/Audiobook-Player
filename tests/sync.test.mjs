@@ -10,8 +10,15 @@ import {
   DEFAULT_GOOGLE_SCOPES,
   SUPABASE_CONFIG,
   SupabaseSyncService,
-  handleRemoteEvent
+  deduplicateDevicesList,
+  detectDeviceName,
+  handleRemoteEvent,
+  mergeCloudBook,
+  mergeEpisodeProgressMaps,
+  normalizeCloudBook
 } from '../src/services/supabase-sync.js';
+import { createPodcastBookItem } from '../src/services/podcast-service.js';
+import { deduplicateLibraryItems } from '../src/services/library-scanner.js';
 import { AudioEngine } from '../src/player/audio-engine.js';
 
 function createMemoryStorage() {
@@ -2171,4 +2178,332 @@ test('AudioEngine retries Google Drive stream fetch once on 401 via onDriveToken
 
   engine.destroy();
   engineFail.destroy();
+});
+
+test('Android persistent hardware deviceId, native/UA model name detection, and 6-row Android device deduplication + cloud pruning', async () => {
+  // 1. Native bridge getDeviceId() & getDeviceName()
+  const nativeWin = createFakeWindow();
+  nativeWin.AudiobookOAuthNative = {
+    getDeviceId: () => 'a1b2c3d4e5f6',
+    getDeviceName: () => 'Samsung SM-S918B'
+  };
+  const nativeStorage = createMemoryStorage();
+  const androidNativeSync = new SupabaseSyncService({
+    storage: nativeStorage,
+    windowObj: nativeWin,
+    navigatorObj: { onLine: true, userAgent: 'Mozilla/5.0 (Linux; Android 14; SM-S918B Build/UP1A.231005.007; wv)' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null
+  });
+  assert.equal(androidNativeSync.deviceId, 'dev_android_a1b2c3d4e5f6');
+  assert.equal(androidNativeSync.deviceName, 'Samsung SM-S918B');
+  assert.equal(nativeStorage.getItem('audiobook_player_device_id_v1'), 'dev_android_a1b2c3d4e5f6');
+  androidNativeSync.destroy();
+
+  // 2. UA model name parsing when native bridge is unavailable
+  assert.equal(
+    detectDeviceName({ userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro Build/UQ1A.240205.004) AppleWebKit/537.36' }),
+    'Android (Pixel 8 Pro)'
+  );
+  assert.equal(
+    detectDeviceName({ userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36' }),
+    'Android Phone'
+  );
+
+  // 3. deduplicateDevicesList collapses 6 generic Android Device rows into 1 while keeping distinct Android models
+  const sixGenericAndPc = [
+    { deviceId: 'win-1', deviceName: 'Windows PC', platform: 'windows', lastSeenAt: '2026-11-22T01:00:00Z' },
+    { deviceId: 'dev_old_1', deviceName: 'Android Device', platform: 'android', lastSeenAt: '2026-11-10T01:00:00Z' },
+    { deviceId: 'dev_old_2', deviceName: 'Android Device', platform: 'android', lastSeenAt: '2026-11-11T01:00:00Z' },
+    { deviceId: 'dev_old_3', deviceName: 'Android Device', platform: 'android', lastSeenAt: '2026-11-12T01:00:00Z' },
+    { deviceId: 'dev_old_4', deviceName: 'Android Device', platform: 'android', lastSeenAt: '2026-11-13T01:00:00Z' },
+    { deviceId: 'dev_old_5', deviceName: 'Android Device', platform: 'android', lastSeenAt: '2026-11-14T01:00:00Z' },
+    { deviceId: 'dev_old_6', deviceName: 'Android Device', platform: 'android', lastSeenAt: '2026-11-15T01:00:00Z' }
+  ];
+  const collapsedFromPc = deduplicateDevicesList(sixGenericAndPc, 'win-1');
+  assert.equal(collapsedFromPc.length, 2);
+  assert.equal(collapsedFromPc.find((d) => d.platform === 'android')?.deviceId, 'dev_old_6');
+
+  // When upgraded phone registers with real model name, all 6 legacy generic rows collapse into it
+  const withNamedPhone = [
+    ...sixGenericAndPc,
+    { deviceId: 'dev_android_a1b2c3d4e5f6', deviceName: 'Samsung SM-S918B', platform: 'android', lastSeenAt: '2026-11-22T00:30:00Z' }
+  ];
+  const collapsedNamed = deduplicateDevicesList(withNamedPhone, 'dev_android_a1b2c3d4e5f6');
+  assert.equal(collapsedNamed.length, 2);
+  assert.equal(collapsedNamed.find((d) => d.platform === 'android')?.deviceId, 'dev_android_a1b2c3d4e5f6');
+  assert.equal(collapsedNamed.find((d) => d.platform === 'android')?.deviceName, 'Samsung SM-S918B');
+
+  // Two genuinely distinct Android phones must both be preserved
+  const twoDistinctPhones = deduplicateDevicesList(
+    [
+      { deviceId: 'dev_android_1', deviceName: 'Google Pixel 8', platform: 'android', lastSeenAt: '2026-11-22T01:00:00Z' },
+      { deviceId: 'dev_android_2', deviceName: 'Samsung SM-S918B', platform: 'android', lastSeenAt: '2026-11-22T00:50:00Z' },
+      { deviceId: 'dev_legacy_1', deviceName: 'Android Device', platform: 'android', lastSeenAt: '2026-11-10T00:00:00Z' }
+    ],
+    'win-1'
+  );
+  assert.equal(twoDistinctPhones.length, 2);
+  assert.deepEqual(
+    twoDistinctPhones.map((d) => d.deviceName).sort(),
+    ['Google Pixel 8', 'Samsung SM-S918B']
+  );
+
+  // 4. fetchDevices() actively prunes stale duplicate Android rows from Supabase audiobook_devices
+  const supaRows = [
+    { device_id: 'win-1', device_name: 'Windows PC', platform: 'windows', last_seen_at: '2026-11-22T01:00:00Z' },
+    { device_id: 'dev_android_real', device_name: 'Samsung SM-S918B', platform: 'android', last_seen_at: '2026-11-22T00:40:00Z' },
+    { device_id: 'dev_old_1', device_name: 'Android Device', platform: 'android', last_seen_at: '2026-11-10T01:00:00Z' },
+    { device_id: 'dev_old_2', device_name: 'Android Device', platform: 'android', last_seen_at: '2026-11-11T01:00:00Z' }
+  ];
+  const deleteUrls = [];
+  const pruneSync = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: null,
+    navigatorObj: { onLine: true, userAgent: 'Windows NT 10.0' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    deviceId: 'win-1',
+    deviceName: 'Windows PC',
+    fetchImpl: async (url, init = {}) => {
+      if (init.method === 'DELETE') {
+        deleteUrls.push(url);
+        return { ok: true, status: 204, async text() { return ''; } };
+      }
+      if (url.includes('audiobook_devices?select=*')) {
+        return { ok: true, status: 200, async text() { return JSON.stringify(supaRows); } };
+      }
+      return { ok: true, status: 200, async text() { return '[]'; } };
+    }
+  });
+  pruneSync.setSession({
+    access_token: 'supa-jwt-prune',
+    user: { id: 'user-prune-1', email: 'prune@gmail.com' }
+  });
+
+  const mergedDevices = await pruneSync.fetchDevices();
+  assert.equal(mergedDevices.length, 2);
+  assert.equal(deleteUrls.length, 1);
+  assert.match(deleteUrls[0], /audiobook_devices\?user_id=eq\.user-prune-1/);
+  assert.match(deleteUrls[0], /dev_old_1/);
+  assert.match(deleteUrls[0], /dev_old_2/);
+  pruneSync.destroy();
+});
+
+test('Podcast totalListeningSec and progressResetAt survive sync, feed refresh, and deduplication without resurrecting reset progress', async () => {
+  const tBeforeReset = '2026-11-20T10:00:00.000Z';
+  const resetMs = Date.parse('2026-11-21T12:00:00.000Z');
+  const tAfterReset = '2026-11-22T08:00:00.000Z';
+
+  // 1. mergeEpisodeProgressMaps filters out pre-reset entries and keeps post-reset entries
+  const mergedEpMap = mergeEpisodeProgressMaps(
+    {
+      'ep-1': { positionSec: 900, durationSec: 1800, completed: false, updatedAt: tBeforeReset },
+      'ep-2': { positionSec: 1800, durationSec: 1800, completed: true, updatedAt: new Date(resetMs).toISOString() }
+    },
+    {
+      'ep-3': { positionSec: 120, durationSec: 1800, completed: false, updatedAt: tAfterReset }
+    },
+    resetMs
+  );
+  assert.equal(mergedEpMap['ep-1'], undefined, 'pre-reset episodeProgress must be filtered out');
+  assert.equal(mergedEpMap['ep-2'], undefined, 'episodeProgress at exact reset timestamp must be filtered out');
+  assert.equal(mergedEpMap['ep-3']?.positionSec, 120, 'post-reset episodeProgress must be preserved');
+
+  // 2. mergeCloudBook preserves totalListeningSec via Math.max and never resurrects pre-reset progress
+  const oldCloud = normalizeCloudBook({
+    bookKey: 'podcast:abc123',
+    title: 'Tech Show',
+    isPodcast: true,
+    mediaType: 'podcast',
+    feedUrl: 'https://example.com/feed.xml',
+    chapterIndex: 12,
+    positionSec: 1450,
+    completed: false,
+    lastPlayedAt: tBeforeReset,
+    totalListeningSec: 7200,
+    episodeProgress: {
+      'ep-12': { positionSec: 1450, durationSec: 2000, completed: false, updatedAt: tBeforeReset }
+    },
+    updatedAt: tBeforeReset
+  });
+  const resetLocal = normalizeCloudBook({
+    bookKey: 'podcast:abc123',
+    title: 'Tech Show',
+    isPodcast: true,
+    mediaType: 'podcast',
+    feedUrl: 'https://example.com/feed.xml',
+    chapterIndex: 0,
+    positionSec: 0,
+    completed: false,
+    progressResetAt: resetMs,
+    totalListeningSec: 9400,
+    episodeProgress: {},
+    updatedAt: new Date(resetMs).toISOString()
+  });
+
+  const mergedReset = mergeCloudBook(oldCloud, resetLocal);
+  assert.equal(mergedReset.totalListeningSec, 9400);
+  assert.equal(mergedReset.progressResetAt, resetMs);
+  assert.equal(mergedReset.chapterIndex, 0);
+  assert.equal(mergedReset.positionSec, 0);
+  assert.equal(mergedReset.completed, false);
+  assert.deepEqual(mergedReset.episodeProgress, {});
+
+  // Even if stale cloud payload arrives AFTER reset with a later metadata updatedAt, progressResetAt still wins
+  const staleMetaLater = normalizeCloudBook({
+    ...oldCloud,
+    totalListeningSec: 10800,
+    updatedAt: tAfterReset
+  });
+  const mergedWithStaleLater = mergeCloudBook(resetLocal, staleMetaLater);
+  assert.equal(mergedWithStaleLater.totalListeningSec, 10800, 'totalListeningSec must take Math.max');
+  assert.equal(mergedWithStaleLater.progressResetAt, resetMs);
+  assert.equal(mergedWithStaleLater.chapterIndex, 0);
+  assert.equal(mergedWithStaleLater.positionSec, 0);
+  assert.equal(mergedWithStaleLater.completed, false);
+  assert.deepEqual(mergedWithStaleLater.episodeProgress, {});
+
+  // 3. createPodcastBookItem preserves totalListeningSec & progressResetAt on RSS refresh
+  const refreshed = createPodcastBookItem(
+    {
+      feedUrl: 'https://example.com/feed.xml',
+      title: 'Tech Show',
+      episodes: [
+        { episodeId: 'ep-new', title: 'Episode New', audioUrl: 'https://example.com/new.mp3', durationSec: 1800 },
+        { episodeId: 'ep-12', title: 'Episode 12', audioUrl: 'https://example.com/12.mp3', durationSec: 2000 }
+      ]
+    },
+    {
+      bookKey: 'podcast:abc123',
+      title: 'Tech Show',
+      chapterIndex: 1,
+      positionSec: 500,
+      lastPlayedAt: tBeforeReset,
+      progressResetAt: resetMs,
+      totalListeningSec: 9400,
+      episodeProgress: {
+        'ep-12': { positionSec: 500, durationSec: 2000, completed: false, updatedAt: tBeforeReset }
+      },
+      chapters: [{ index: 0, episodeId: 'ep-12', title: 'Episode 12', audioUrl: 'https://example.com/12.mp3', durationSec: 2000 }]
+    }
+  );
+  assert.equal(refreshed.totalListeningSec, 9400);
+  assert.equal(refreshed.progressResetAt, resetMs);
+  assert.equal(refreshed.chapterIndex, 0);
+  assert.equal(refreshed.positionSec, 0);
+  assert.deepEqual(refreshed.episodeProgress, {});
+
+  // 4. deduplicateLibraryItems preserves totalListeningSec & progressResetAt via Math.max
+  const dedupedLib = deduplicateLibraryItems([oldCloud, resetLocal]);
+  assert.equal(dedupedLib.length, 1);
+  assert.equal(dedupedLib[0].totalListeningSec, 9400);
+  assert.equal(dedupedLib[0].progressResetAt, resetMs);
+  assert.equal(dedupedLib[0].chapterIndex, 0);
+  assert.equal(dedupedLib[0].positionSec, 0);
+  assert.equal(dedupedLib[0].completed, false);
+  assert.deepEqual(dedupedLib[0].episodeProgress, {});
+
+  // 5. syncLibraryItems persists totalListeningSec and progressResetAt into Supabase metadata_json
+  const sentBodies = [];
+  const syncSvc = new SupabaseSyncService({
+    storage: createMemoryStorage(),
+    windowObj: null,
+    navigatorObj: { onLine: true, userAgent: 'Windows NT 10.0' },
+    BroadcastChannelImpl: null,
+    WebSocketImpl: null,
+    fetchImpl: async (_url, init = {}) => {
+      sentBodies.push(init.body ? JSON.parse(init.body) : null);
+      return { ok: true, status: 200, async text() { return '[]'; } };
+    }
+  });
+  syncSvc.setSession({
+    access_token: 'supa-jwt-pod',
+    user: { id: 'user-pod-1', email: 'pod@gmail.com' }
+  });
+  await syncSvc.syncLibraryItems([resetLocal]);
+  assert.equal(sentBodies[0][0].metadata_json.totalListeningSec, 9400);
+  assert.equal(sentBodies[0][0].metadata_json.progressResetAt, resetMs);
+  assert.deepEqual(sentBodies[0][0].metadata_json.episodeProgress, {});
+  syncSvc.destroy();
+
+  // 6. Post-reset playback (both with lastPlayedAt > progressResetAt AND with missing lastPlayedAt + post-reset episodeProgress.updatedAt)
+  // must NEVER be wiped back to chapter 0 / 0s across normalizeCloudBook, mergeCloudBook, createPodcastBookItem, and deduplicateLibraryItems
+  const postResetNoLastPlayed = {
+    bookKey: 'podcast:abc123',
+    title: 'Tech Show',
+    isPodcast: true,
+    mediaType: 'podcast',
+    feedUrl: 'https://example.com/feed.xml',
+    chapterIndex: 4,
+    positionSec: 300,
+    completed: false,
+    progressResetAt: resetMs,
+    totalListeningSec: 9700,
+    episodeProgress: {
+      'ep-4': { positionSec: 300, durationSec: 1800, completed: false, updatedAt: tAfterReset }
+    },
+    chapters: [
+      { index: 0, episodeId: 'ep-0', title: 'Ep 0', audioUrl: 'https://example.com/0.mp3', durationSec: 1800 },
+      { index: 1, episodeId: 'ep-1', title: 'Ep 1', audioUrl: 'https://example.com/1.mp3', durationSec: 1800 },
+      { index: 2, episodeId: 'ep-2', title: 'Ep 2', audioUrl: 'https://example.com/2.mp3', durationSec: 1800 },
+      { index: 3, episodeId: 'ep-3', title: 'Ep 3', audioUrl: 'https://example.com/3.mp3', durationSec: 1800 },
+      { index: 4, episodeId: 'ep-4', title: 'Ep 4', audioUrl: 'https://example.com/4.mp3', durationSec: 1800 }
+    ],
+    updatedAt: tAfterReset
+  };
+
+  const normPostNoLast = normalizeCloudBook(postResetNoLastPlayed);
+  assert.equal(normPostNoLast.chapterIndex, 4);
+  assert.equal(normPostNoLast.positionSec, 300);
+  assert.equal(normPostNoLast.episodeProgress['ep-4']?.positionSec, 300);
+
+  const mergedPostNoLast = mergeCloudBook(oldCloud, normPostNoLast);
+  assert.equal(mergedPostNoLast.chapterIndex, 4);
+  assert.equal(mergedPostNoLast.positionSec, 300);
+  assert.equal(mergedPostNoLast.episodeProgress['ep-12'], undefined);
+  assert.equal(mergedPostNoLast.episodeProgress['ep-4']?.positionSec, 300);
+  assert.equal(mergedPostNoLast.totalListeningSec, 9700);
+
+  const refreshedPostNoLast = createPodcastBookItem(
+    {
+      feedUrl: 'https://example.com/feed.xml',
+      title: 'Tech Show',
+      episodes: [
+        { episodeId: 'ep-new', title: 'Ep New', audioUrl: 'https://example.com/new.mp3', durationSec: 1800 },
+        ...postResetNoLastPlayed.chapters
+      ]
+    },
+    postResetNoLastPlayed
+  );
+  assert.equal(refreshedPostNoLast.chapterIndex, 5, 'active ep-4 shifts from index 4 to 5 when 1 new episode prepends');
+  assert.equal(refreshedPostNoLast.positionSec, 300);
+  assert.equal(refreshedPostNoLast.totalListeningSec, 9700);
+
+  const dedupedPostNoLast = deduplicateLibraryItems([oldCloud, postResetNoLastPlayed]);
+  assert.equal(dedupedPostNoLast.length, 1);
+  assert.equal(dedupedPostNoLast[0].chapterIndex, 4);
+  assert.equal(dedupedPostNoLast[0].positionSec, 300);
+  assert.equal(dedupedPostNoLast[0].episodeProgress['ep-4']?.positionSec, 300);
+  assert.equal(dedupedPostNoLast[0].episodeProgress['ep-12'], undefined);
+
+  // Also verify with explicit lastPlayedAt > progressResetAt
+  const postResetWithLastPlayed = {
+    ...postResetNoLastPlayed,
+    lastPlayedAt: tAfterReset,
+    chapterIndex: 2,
+    positionSec: 450,
+    episodeProgress: {}
+  };
+  const normPostWithLast = normalizeCloudBook(postResetWithLastPlayed);
+  assert.equal(normPostWithLast.chapterIndex, 2);
+  assert.equal(normPostWithLast.positionSec, 450);
+
+  const mergedPostWithLast = mergeCloudBook(oldCloud, normPostWithLast);
+  assert.equal(mergedPostWithLast.chapterIndex, 2);
+  assert.equal(mergedPostWithLast.positionSec, 450);
+
+  const dedupedPostWithLast = deduplicateLibraryItems([oldCloud, postResetWithLastPlayed]);
+  assert.equal(dedupedPostWithLast[0].chapterIndex, 2);
+  assert.equal(dedupedPostWithLast[0].positionSec, 450);
 });

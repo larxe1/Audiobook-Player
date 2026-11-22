@@ -215,6 +215,7 @@ import {
   ICON_DOWNLOAD_CIRCLE,
   ICON_SLEEP,
   ICON_SPEAKER,
+  ICON_SPEAKER_MUTED,
   ICON_SPARKLES,
   ICON_PANEL_RIGHT,
   ICON_UPLOAD,
@@ -476,6 +477,8 @@ class AudiobookApp {
         positionSec: 0,
         durationSec: 0,
         playbackRate: 1.0,
+        volume: this.audioEngine.volume ?? 1,
+        muted: Boolean(this.audioEngine.muted),
         chapterIndex: 0,
         sleepTimerMode: 0,
         sleepRemainingSec: 0
@@ -483,6 +486,8 @@ class AudiobookApp {
     };
 
     this._lastCheckpointAt = 0;
+    this._lastListeningTickAt = 0;
+    this._lastListeningBookKey = null;
     this._syncAbortController = null;
     this._isAutoEnriching = false;
     this._pendingReEnrich = false;
@@ -680,18 +685,17 @@ class AudiobookApp {
   _loadTheme() {
     try {
       const saved = localStorage.getItem(STORAGE_THEME_KEY);
-      if (saved === 'pitch' || saved === 'amoled') return saved;
-      if (saved === 'midnight' || saved) {
-        localStorage.setItem(STORAGE_THEME_KEY, 'pitch');
+      if (saved && saved !== 'amoled') {
+        localStorage.setItem(STORAGE_THEME_KEY, 'amoled');
       }
     } catch {
       // ignore
     }
-    return 'pitch';
+    return 'amoled';
   }
 
-  _saveTheme(theme) {
-    const cleanTheme = theme === 'amoled' ? 'amoled' : 'pitch';
+  _saveTheme() {
+    const cleanTheme = 'amoled';
     this.state.theme = cleanTheme;
     this._applyThemeBodyClass(cleanTheme);
     try {
@@ -701,10 +705,10 @@ class AudiobookApp {
     }
   }
 
-  _applyThemeBodyClass(theme) {
+  _applyThemeBodyClass() {
     if (typeof document === 'undefined') return;
     document.body.classList.remove('theme-midnight', 'theme-pitch', 'theme-amoled');
-    document.body.classList.add(theme === 'amoled' ? 'theme-amoled' : 'theme-pitch');
+    document.body.classList.add('theme-amoled');
   }
 
   _loadDismissedContinueSigs() {
@@ -844,7 +848,10 @@ class AudiobookApp {
             ? book.episodeProgress
             : {},
         positionSec: book.positionSec ?? book.elapsedSec ?? 0,
-        chapterIndex: Number(book.chapterIndex || 0) || 0
+        chapterIndex: Number(book.chapterIndex || 0) || 0,
+        totalListeningSec: Math.max(0, Number(book.totalListeningSec || 0) || 0),
+        progressResetAt: Math.max(0, Number(book.progressResetAt || 0) || 0),
+        ...(book.lastPlayedAt ? { lastPlayedAt: book.lastPlayedAt } : {})
       };
     }
 
@@ -873,7 +880,12 @@ class AudiobookApp {
       ...normalized,
       id: nextKey || normalized.id,
       bookKey: nextKey || normalized.bookKey,
-      positionSec: normalized.positionSec ?? normalized.elapsedSec ?? 0
+      positionSec: normalized.positionSec ?? normalized.elapsedSec ?? 0,
+      totalListeningSec: Math.max(0, Number(normalized.totalListeningSec ?? book.totalListeningSec ?? 0) || 0),
+      progressResetAt: Math.max(0, Number(normalized.progressResetAt ?? book.progressResetAt ?? 0) || 0),
+      ...((normalized.lastPlayedAt || book.lastPlayedAt)
+        ? { lastPlayedAt: normalized.lastPlayedAt || book.lastPlayedAt }
+        : {})
     };
   }
 
@@ -1159,6 +1171,46 @@ class AudiobookApp {
         this.syncService?.deviceId &&
         originDeviceId !== this.syncService.deviceId;
       const isPodcast = Boolean(norm.isPodcast || l?.isPodcast || r?.isPodcast);
+      const totalListeningSec = Math.max(
+        0,
+        Number(l?.totalListeningSec || 0) || 0,
+        Number(r?.totalListeningSec || 0) || 0,
+        Number(norm.totalListeningSec || 0) || 0
+      );
+      const progressResetAt = Math.max(
+        0,
+        Number(l?.progressResetAt || 0) || 0,
+        Number(r?.progressResetAt || 0) || 0,
+        Number(norm.progressResetAt || 0) || 0
+      );
+      const lastPlayedCandidates = [l?.lastPlayedAt, r?.lastPlayedAt, norm.lastPlayedAt]
+        .filter(Boolean)
+        .map((iso) => ({ iso, ms: Date.parse(iso) || 0 }))
+        .sort((a, b) => b.ms - a.ms);
+      const bestLastPlayed = lastPlayedCandidates[0] || null;
+      let mergedEpisodeProgress;
+      if (isPodcast) {
+        const rawEpProgress = {
+          ...(r?.episodeProgress || {}),
+          ...(l?.episodeProgress || {}),
+          ...(norm.episodeProgress || {})
+        };
+        if (progressResetAt > 0) {
+          mergedEpisodeProgress = {};
+          for (const [epId, epVal] of Object.entries(rawEpProgress)) {
+            const epMs = epVal?.updatedAt ? Date.parse(epVal.updatedAt) || 0 : 0;
+            if (epMs > progressResetAt) {
+              mergedEpisodeProgress[epId] = epVal;
+            }
+          }
+        } else {
+          mergedEpisodeProgress = rawEpProgress;
+        }
+      }
+      const postResetActive =
+        progressResetAt === 0 ||
+        (bestLastPlayed && bestLastPlayed.ms > progressResetAt) ||
+        (isPodcast && Object.keys(mergedEpisodeProgress || {}).length > 0);
 
       return this._normalizeBookRecord({
         ...norm,
@@ -1172,6 +1224,12 @@ class AudiobookApp {
         offlineCached,
         isOffline: remoteOnlyLocal ? false : Boolean(offlineCached || hasLocalHere || norm.isOffline),
         offline: remoteOnlyLocal ? false : Boolean(offlineCached || hasLocalHere || norm.offline),
+        totalListeningSec,
+        progressResetAt,
+        ...(bestLastPlayed && (!progressResetAt || bestLastPlayed.ms > progressResetAt)
+          ? { lastPlayedAt: bestLastPlayed.iso }
+          : { lastPlayedAt: '' }),
+        ...(!postResetActive ? { chapterIndex: 0, positionSec: 0, completed: false } : {}),
         ...(isPodcast
           ? {
               isPodcast: true,
@@ -1179,11 +1237,7 @@ class AudiobookApp {
               feedUrl: l?.feedUrl || r?.feedUrl || norm.feedUrl || '',
               lastFeedRefreshAt:
                 l?.lastFeedRefreshAt || r?.lastFeedRefreshAt || norm.lastFeedRefreshAt || '',
-              episodeProgress: {
-                ...(r?.episodeProgress || {}),
-                ...(l?.episodeProgress || {}),
-                ...(norm.episodeProgress || {})
-              }
+              episodeProgress: mergedEpisodeProgress || {}
             }
           : {}),
         ...(mergedTracks ? { tracks: mergedTracks } : {}),
@@ -2548,29 +2602,32 @@ class AudiobookApp {
     return null;
   }
 
-  getFilteredBooks() {
-    const q = (this.state.searchQuery || '').trim().toLowerCase();
+  getSidebarBooks() {
     const filter = this.state.filterSource || 'audiobooks';
     return this.state.books.filter((book) => {
       const isPodcast = Boolean(book?.isPodcast || book?.sources?.includes('podcast'));
       if (filter === 'podcasts') {
-        if (!isPodcast) return false;
-      } else if (filter === 'downloaded') {
-        if (!this._isBookSavedOffline(book)) {
-          return false;
-        }
-      } else {
-        // 'audiobooks' (default), and back-compat 'all' / 'local' / 'drive': show all audiobooks (local + Drive combined)
-        if (isPodcast) return false;
+        return isPodcast;
       }
-      if (q) {
-        const epTitles = isPodcast
-          ? (book.chapters || []).map((c) => c?.title || '').join(' ')
-          : '';
-        const hay = `${book.title} ${book.author} ${book.narrator || ''} ${book.series || ''} ${epTitles}`.toLowerCase();
-        if (!hay.includes(q)) return false;
+      if (filter === 'downloaded') {
+        return this._isBookSavedOffline(book);
       }
-      return true;
+      // 'audiobooks' (default), and back-compat 'all' / 'local' / 'drive': show all audiobooks (local + Drive combined)
+      return !isPodcast;
+    });
+  }
+
+  getFilteredBooks() {
+    const q = (this.state.searchQuery || '').trim().toLowerCase();
+    const base = this.getSidebarBooks();
+    if (!q) return base;
+    return base.filter((book) => {
+      const isPodcast = Boolean(book?.isPodcast || book?.sources?.includes('podcast'));
+      const epTitles = isPodcast
+        ? (book.chapters || []).map((c) => c?.title || '').join(' ')
+        : '';
+      const hay = `${book.title} ${book.author} ${book.narrator || ''} ${book.series || ''} ${epTitles}`.toLowerCase();
+      return hay.includes(q);
     });
   }
 
@@ -2625,6 +2682,7 @@ class AudiobookApp {
       await this.audioEngine.jumpToChapter(targetChapter);
     }
     await this.audioEngine.play();
+    book.lastPlayedAt = new Date().toISOString();
     this.state.snapshot = this.audioEngine.getSnapshot();
     this._syncCurrentDevicePlaybackState({ isPlaying: true, isActivePlayer: true });
     this.syncService.broadcastPlaybackState({
@@ -2646,6 +2704,8 @@ class AudiobookApp {
     const seq = (this._selectBookSeq = (this._selectBookSeq || 0) + 1);
     const prevActiveKey = this.state.activeBookKey;
     this.state.activeBookKey = book.bookKey;
+    this._lastListeningTickAt = 0;
+    this._lastListeningBookKey = null;
     if (!options?.skipDeviceSync) {
       this._lastLocalPlayAt = Date.now();
     }
@@ -2672,6 +2732,7 @@ class AudiobookApp {
       }
       await this.audioEngine.play();
       if (seq !== this._selectBookSeq) return;
+      book.lastPlayedAt = new Date().toISOString();
       this.state.snapshot = this.audioEngine.getSnapshot();
       this.syncService.broadcastPlaybackState({
         isPlaying: true,
@@ -2705,10 +2766,73 @@ class AudiobookApp {
     this.mediaBridge.updatePlaybackState(this.state.snapshot);
   }
 
+  _formatPodcastListeningHours(totalSec = 0) {
+    const sec = Math.max(0, Number(totalSec) || 0);
+    const hours = sec / 3600;
+    return `${hours.toFixed(1)} hrs listened`;
+  }
+
+  _getPodcastTargetChapterIndex(book, isCurrent = false) {
+    const chapters = Array.isArray(book?.chapters) ? book.chapters : [];
+    const clamp = (idx) => {
+      const n = Number(idx) || 0;
+      if (chapters.length === 0) return Math.max(0, n);
+      return Math.max(0, Math.min(chapters.length - 1, n));
+    };
+    const engineLoadedForBook = Boolean(
+      isCurrent && this.state.snapshot?.bookKey && this.state.snapshot.bookKey === book?.bookKey
+    );
+    if (engineLoadedForBook) {
+      return clamp(this.state.snapshot?.chapterIndex ?? book?.chapterIndex ?? 0);
+    }
+    const explicitIdx = Number(book?.chapterIndex);
+    if (Number.isFinite(explicitIdx) && explicitIdx > 0) {
+      return clamp(explicitIdx);
+    }
+    const progMap =
+      book?.episodeProgress && typeof book.episodeProgress === 'object' ? book.episodeProgress : null;
+    const resetAt = Number(book?.progressResetAt || 0);
+    if (progMap && chapters.length > 0) {
+      let bestMs = resetAt;
+      let bestIdx = 0;
+      for (let i = 0; i < chapters.length; i += 1) {
+        const ch = chapters[i];
+        const epId = ch?.episodeId;
+        if (!epId) continue;
+        const ep = progMap[epId];
+        if (!ep || typeof ep !== 'object') continue;
+        const ms = ep.updatedAt ? Date.parse(ep.updatedAt) || 0 : 0;
+        if (ms > bestMs) {
+          bestMs = ms;
+          bestIdx = typeof ch?.index === 'number' ? ch.index : i;
+        }
+      }
+      if (bestMs > resetAt) {
+        return clamp(bestIdx);
+      }
+    }
+    return clamp(explicitIdx || 0);
+  }
+
   _handleTimeUpdate(snap) {
     this.state.snapshot = snap;
     const book = this.getActiveBook();
+    const now = Date.now();
     if (book && snap.bookKey === book.bookKey) {
+      if (snap.playing) {
+        if (this._lastListeningBookKey === book.bookKey && this._lastListeningTickAt > 0) {
+          const dtSec = (now - this._lastListeningTickAt) / 1000;
+          if (dtSec > 0 && dtSec <= 5) {
+            book.totalListeningSec = Math.max(0, Number(book.totalListeningSec || 0)) + dtSec;
+          }
+        }
+        this._lastListeningTickAt = now;
+        this._lastListeningBookKey = book.bookKey;
+        book.lastPlayedAt = new Date(now).toISOString();
+      } else {
+        this._lastListeningTickAt = 0;
+        this._lastListeningBookKey = null;
+      }
       book.positionSec = snap.positionSec;
       book.chapterIndex = snap.chapterIndex;
       if (book.isPodcast || book.sources?.includes('podcast')) {
@@ -2734,12 +2858,14 @@ class AudiobookApp {
       } else if (snap.durationSec > 0) {
         book.totalDurationSec = snap.durationSec;
       }
+    } else {
+      this._lastListeningTickAt = 0;
+      this._lastListeningBookKey = null;
     }
 
     this.mediaBridge.updatePlaybackState(snap);
     this._updateLiveProgressDom(snap, book);
 
-    const now = Date.now();
     if (now - this._lastCheckpointAt >= 5000) {
       this._lastCheckpointAt = now;
       this._persistProgressCheckpoint(false);
@@ -2756,6 +2882,8 @@ class AudiobookApp {
     this.mediaBridge.updatePlaybackState(snap);
 
     if (prevPlaying !== snap.playing) {
+      this._lastListeningTickAt = snap.playing ? Date.now() : 0;
+      this._lastListeningBookKey = snap.playing ? (snap.bookKey || null) : null;
       if (snap.playing) {
         this._lastLocalPlayAt = Date.now();
         this.state.remotePlaybackPrompt = null;
@@ -2789,6 +2917,7 @@ class AudiobookApp {
     }
 
     this._updateLiveProgressDom(snap, this.getActiveBook());
+    this._updateLiveVolumeDom(snap);
   }
 
   _handleBookEnded() {
@@ -2891,6 +3020,41 @@ class AudiobookApp {
 
     document.querySelectorAll('[data-ab-progress-fill]').forEach((el) => {
       el.style.width = `${pct.toFixed(2)}%`;
+    });
+
+    document.querySelectorAll('[data-ab-podcast-listening]').forEach((el) => {
+      if (el.dataset.abPodcastListening === book.bookKey) {
+        el.textContent = this._formatPodcastListeningHours(book.totalListeningSec);
+      }
+    });
+  }
+
+  _updateLiveVolumeDom(snap = this.state.snapshot) {
+    if (typeof document === 'undefined' || !snap) return;
+    const isMuted = Boolean(snap.muted) || Number(snap.volume ?? 1) <= 0;
+    const pct = isMuted ? 0 : Math.round(Math.max(0, Math.min(1, Number(snap.volume ?? 1))) * 100);
+    document.querySelectorAll('[data-ab-volume-range]').forEach((el) => {
+      if (document.activeElement !== el) {
+        el.value = String(pct);
+      }
+      el.style.setProperty('--range-progress', `${pct}%`);
+    });
+    document.querySelectorAll('[data-action="toggle-mute"]').forEach((btn) => {
+      btn.setAttribute('aria-label', isMuted ? 'Unmute' : 'Mute');
+      btn.setAttribute('title', isMuted ? 'Unmute' : 'Mute');
+      if (btn.classList) {
+        if (isMuted) {
+          btn.classList.remove('text-[#1ed760]');
+          btn.classList.add('text-[var(--text-muted)]');
+        } else {
+          btn.classList.add('text-[#1ed760]');
+          btn.classList.remove('text-[var(--text-muted)]');
+        }
+      }
+      const nextIcon = isMuted ? ICON_SPEAKER_MUTED(15) : ICON_SPEAKER(15);
+      if (btn.innerHTML !== nextIcon) {
+        btn.innerHTML = nextIcon;
+      }
     });
   }
 
@@ -3150,7 +3314,7 @@ class AudiobookApp {
     if (!target) return;
     if (target.attr === 'data-series') {
       const seriesKey = target.value;
-      const grouped = this._groupBooksByFranchise(this.getFilteredBooks());
+      const grouped = this._groupBooksByFranchise(this.getSidebarBooks());
       const entry = grouped.find((e) => e.type === 'franchise' && e.seriesKey === seriesKey);
       const firstBook = entry?.books?.[0] || null;
       this.state.contextMenu = {
@@ -3249,11 +3413,26 @@ class AudiobookApp {
   async resetBookProgress(bookKey) {
     const book = this.books.find((b) => b.bookKey === bookKey);
     if (!book) return;
+    let finalResetAt = Date.now();
     book.completed = false;
     book.positionSec = 0;
     book.chapterIndex = 0;
+    book.progressResetAt = finalResetAt;
+    book.episodeProgress = {};
+    delete book.lastPlayedAt;
     if (this.state.activeBookKey === bookKey && this.audioEngine) {
-      this.audioEngine.seekToSeconds?.(0);
+      if (Array.isArray(book.chapters) && book.chapters.length > 0 && typeof this.audioEngine.setChapter === 'function') {
+        await this.audioEngine.setChapter(0, 0);
+      } else {
+        this.audioEngine.seekToSeconds?.(0);
+      }
+      finalResetAt = Date.now();
+      book.completed = false;
+      book.positionSec = 0;
+      book.chapterIndex = 0;
+      book.progressResetAt = finalResetAt;
+      book.episodeProgress = {};
+      delete book.lastPlayedAt;
       this.state.snapshot = this.audioEngine.getSnapshot();
     }
     const checkpoint = {
@@ -3262,13 +3441,15 @@ class AudiobookApp {
       positionSec: 0,
       durationSec: Math.round(Number(book.totalDurationSec || 0)),
       completed: false,
-      clientUpdatedAt: new Date().toISOString()
+      clientUpdatedAt: new Date(finalResetAt).toISOString()
     };
     this._persistBooks();
     this.offlineQueue.saveLocalProgress(book.bookKey, checkpoint);
     if (this._hasCloudSyncAuth()) {
       void this.syncService.pushProgress(checkpoint).catch(() => null);
+      void this._syncLibraryToCloud([book]);
     }
+    this.render();
     this.showStatusToast(`Reset progress for ${book.title}`);
   }
 
@@ -3513,28 +3694,39 @@ class AudiobookApp {
     const episodes = [];
     for (const podcast of podcasts) {
       const chapters = Array.isArray(podcast.chapters) ? podcast.chapters : [];
-      chapters.slice(0, 50).forEach((ch, idx) => {
+      let best = null;
+      for (let idx = 0; idx < chapters.length; idx += 1) {
+        const ch = chapters[idx];
         const chapterIndex = typeof ch?.index === 'number' ? ch.index : idx;
         const pubMs = ch?.publishedAt ? Date.parse(ch.publishedAt) || 0 : 0;
-        const epProg = ch?.episodeId ? podcast.episodeProgress?.[ch.episodeId] : null;
-        episodes.push({
-          book: podcast,
-          bookKey: podcast.bookKey,
-          podcastTitle: podcast.title,
-          podcastAuthor: podcast.author,
-          coverUrl: ch?.coverUrl || podcast.coverUrl || '',
-          chapter: ch,
-          chapterIndex,
-          episodeId: ch?.episodeId || `${podcast.bookKey}::${chapterIndex}`,
-          title: ch?.title || `Episode ${chapterIndex + 1}`,
-          description: ch?.description || '',
-          durationSec: Math.max(1, Number(ch?.durationSec) || 1800),
-          publishedAt: ch?.publishedAt || '',
-          publishedAtMs: pubMs,
-          offlineCached: Boolean(ch?.offlineCached),
-          completed: Boolean(epProg?.completed),
-          positionSec: Number(epProg?.positionSec || 0)
-        });
+        if (
+          !best ||
+          pubMs > best.publishedAtMs ||
+          (pubMs === best.publishedAtMs && chapterIndex < best.chapterIndex)
+        ) {
+          best = { ch, chapterIndex, publishedAtMs: pubMs };
+        }
+      }
+      if (!best) continue;
+      const { ch, chapterIndex, publishedAtMs } = best;
+      const epProg = ch?.episodeId ? podcast.episodeProgress?.[ch.episodeId] : null;
+      episodes.push({
+        book: podcast,
+        bookKey: podcast.bookKey,
+        podcastTitle: podcast.title,
+        podcastAuthor: podcast.author,
+        coverUrl: ch?.coverUrl || podcast.coverUrl || '',
+        chapter: ch,
+        chapterIndex,
+        episodeId: ch?.episodeId || `${podcast.bookKey}::${chapterIndex}`,
+        title: ch?.title || `Episode ${chapterIndex + 1}`,
+        description: ch?.description || '',
+        durationSec: Math.max(1, Number(ch?.durationSec) || 1800),
+        publishedAt: ch?.publishedAt || '',
+        publishedAtMs,
+        offlineCached: Boolean(ch?.offlineCached),
+        completed: Boolean(epProg?.completed),
+        positionSec: Number(epProg?.positionSec || 0)
       });
     }
     episodes.sort((a, b) => {
@@ -3570,6 +3762,7 @@ class AudiobookApp {
       await this.audioEngine.jumpToChapter(idx);
     }
     await this.audioEngine.play();
+    book.lastPlayedAt = new Date().toISOString();
     this.state.snapshot = this.audioEngine.getSnapshot();
     this._syncMediaSessionMetadata();
     this._syncCurrentDevicePlaybackState({ isPlaying: true, isActivePlayer: true });
@@ -5082,10 +5275,10 @@ class AudiobookApp {
             </span>
             <span class="text-[11px] shrink-0 text-[var(--text-muted)]">${ICON_CHEVRON('right', 13)}</span>
           </button>
-          <button data-action="toggle-theme" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
+          <div class="w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl text-left text-xs font-medium text-[var(--text-primary)]">
             <span>Theme</span>
-            <span class="text-[11px] font-semibold text-[#1ed760] shrink-0">${theme === 'amoled' ? 'True Black' : 'Pitch'}</span>
-          </button>
+            <span class="text-[11px] font-semibold text-[#1ed760] shrink-0">True Black</span>
+          </div>
           <button data-action="${this.state.updateState.updateAvailable ? 'install-update' : 'check-update'}" class="btn-press w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">
             <span class="truncate">${
               this.state.updateState.installing
@@ -5142,20 +5335,9 @@ class AudiobookApp {
           </div>
 
           <div class="flex-1 overflow-y-auto p-4 space-y-4">
-            <div class="surface-card rounded-2xl p-3.5 space-y-2.5">
+            <div class="surface-card rounded-2xl p-3.5 flex items-center justify-between gap-3">
               <div class="text-xs font-bold text-white">Theme</div>
-              <div class="grid grid-cols-2 gap-2">
-                <button type="button" data-action="set-theme" data-theme="pitch" class="btn-press filter-pill px-3 py-2 rounded-xl text-xs font-semibold ${
-                  theme !== 'amoled'
-                    ? 'bg-[#1ed760] text-[#050506]'
-                    : 'surface-panel text-[var(--text-secondary)] hover:text-white'
-                }">Pitch</button>
-                <button type="button" data-action="set-theme" data-theme="amoled" class="btn-press filter-pill px-3 py-2 rounded-xl text-xs font-semibold ${
-                  theme === 'amoled'
-                    ? 'bg-[#1ed760] text-[#050506]'
-                    : 'surface-panel text-[var(--text-secondary)] hover:text-white'
-                }">True Black</button>
-              </div>
+              <button type="button" data-action="set-theme" data-theme="amoled" class="btn-press filter-pill px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-[#1ed760] text-[#050506]">True Black</button>
             </div>
 
             <div class="surface-card rounded-2xl p-3.5 flex items-center justify-between gap-3">
@@ -5223,6 +5405,7 @@ class AudiobookApp {
         <button type="button" data-action="play-book" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-semibold text-white">Play / Resume</button>
         <button type="button" data-action="refresh-podcast-feed" data-book-key="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Refresh Episodes</button>
         <button type="button" data-action="mark-podcast-played" data-book-key="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Mark All as Played</button>
+        <button type="button" data-action="reset-book-progress" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">Reset Progress</button>
         <button type="button" data-action="toggle-download" data-book="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-white/5 text-left text-xs font-medium text-[var(--text-primary)]">${isOffline ? 'Remove Offline' : 'Save Latest Offline'}</button>
         <div class="my-1 border-t border-[var(--border-subtle)]"></div>
         <button type="button" data-action="unsubscribe-podcast" data-book-key="${escapeHtml(cm.bookKey)}" class="btn-press w-full px-3.5 py-2.5 rounded-xl hover:bg-red-500/15 text-left text-xs font-bold text-red-400">Unfollow Podcast</button>
@@ -6260,16 +6443,32 @@ class AudiobookApp {
     return `<div class="space-y-1">${mainBtn}${subHtml}</div>`;
   }
 
+  _renderVolumeControl({ compact = false, fullWidth = false } = {}) {
+    const snap = this.state.snapshot || {};
+    const isMuted = Boolean(snap.muted) || Number(snap.volume ?? 1) <= 0;
+    const volVal = isMuted ? 0 : Math.round(Math.max(0, Math.min(1, Number(snap.volume ?? 1))) * 100);
+    return `
+      <div class="flex items-center gap-2 ${fullWidth ? 'w-full' : 'shrink-0'}" data-ab-volume-control>
+        <button type="button" data-action="toggle-mute" aria-label="${isMuted ? 'Unmute' : 'Mute'}" title="${isMuted ? 'Unmute' : 'Mute'}" class="btn-press p-1.5 rounded-full hover:bg-white/10 ${isMuted ? 'text-[var(--text-muted)]' : 'text-[#1ed760]'} shrink-0">
+          ${isMuted ? ICON_SPEAKER_MUTED(compact ? 15 : 16) : ICON_SPEAKER(compact ? 15 : 16)}
+        </button>
+        <input data-ab-volume-range data-action="volume-range" type="range" min="0" max="100" step="1" value="${volVal}" aria-label="Volume" style="--range-progress:${volVal}%" class="${fullWidth ? 'flex-1 min-w-0' : 'w-20 lg:w-24'} shrink-0" />
+      </div>
+    `;
+  }
+
   _renderPodcastEpisodesList(book, isCurrent, compact = false) {
     const chapters = Array.isArray(book?.chapters) ? book.chapters : [];
     if (chapters.length === 0) {
       return `<div class="text-xs text-[var(--text-muted)] py-2">No episodes available</div>`;
     }
+    const targetChapterIdx = this._getPodcastTargetChapterIndex(book, isCurrent);
 
     const itemsHtml = chapters
       .map((ch, idx) => {
         const chIdx = typeof ch?.index === 'number' ? ch.index : idx;
         const isActiveEp = isCurrent && Number(this.state.snapshot?.chapterIndex || 0) === chIdx;
+        const isHighlightedEp = chIdx === targetChapterIdx || isActiveEp;
         const isPlayingEp = isActiveEp && Boolean(this.state.snapshot?.playing);
         const epProg = ch?.episodeId ? book.episodeProgress?.[ch.episodeId] : null;
         const isCompleted = Boolean(epProg?.completed);
@@ -6281,8 +6480,8 @@ class AudiobookApp {
         const descText = String(ch?.description || '').trim();
 
         return `
-          <div class="surface-card rounded-2xl ${compact ? 'p-2.5' : 'p-3.5'} flex items-start gap-3 min-w-0 ${
-            isActiveEp ? 'border border-[#1ed760]/50 bg-[#1ed760]/10' : ''
+          <div data-podcast-episode-row="${chIdx}" class="surface-card rounded-2xl ${compact ? 'p-2.5' : 'p-3.5'} flex items-start gap-3 min-w-0 ${
+            isHighlightedEp ? 'border border-[#1ed760]/50 bg-[#1ed760]/10' : ''
           }">
             <button type="button" data-action="play-podcast-episode" data-book-key="${escapeHtml(book.bookKey)}" data-chapter-index="${chIdx}" aria-label="${isPlayingEp ? 'Pause episode' : 'Play episode'}" class="play-fab ${compact ? 'w-8 h-8' : 'w-9 h-9'} shrink-0 mt-0.5">
               ${isPlayingEp ? ICON_PAUSE(14) : ICON_PLAY(14)}
@@ -6290,7 +6489,7 @@ class AudiobookApp {
             <button type="button" data-action="play-podcast-episode" data-book-key="${escapeHtml(book.bookKey)}" data-chapter-index="${chIdx}" class="min-w-0 flex-1 text-left space-y-1">
               <div class="flex items-center gap-2 min-w-0">
                 <span class="text-xs sm:text-sm font-semibold truncate ${
-                  isActiveEp ? 'text-[#1ed760]' : 'text-white'
+                  isHighlightedEp ? 'text-[#1ed760]' : 'text-white'
                 }">${escapeHtml(ch?.title || `Episode ${chIdx + 1}`)}</span>
                 ${
                   isCompleted
@@ -6394,43 +6593,6 @@ class AudiobookApp {
         <h2 class="text-xl font-bold tracking-tight text-white">New Episodes</h2>
         <div class="ui-stagger-grid grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
           ${cardsHtml}
-        </div>
-      </section>
-    `;
-  }
-
-  _renderPodcastDiscoveryHub(variant = 'desktop') {
-    if (this.state.filterSource !== 'podcasts') return '';
-    const categories = Array.isArray(PODCAST_CATEGORIES) ? PODCAST_CATEGORIES : [];
-    const q = String(this.state.searchQuery || '').trim();
-    const isMobile = variant === 'mobile';
-
-    return `
-      <section class="ui-view-enter surface-card rounded-2xl ${isMobile ? 'p-3.5 space-y-3' : 'p-4 space-y-3.5'} border border-[#1ed760]/25">
-        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-          <div class="flex items-center gap-2.5 min-w-0">
-            <div class="w-9 h-9 rounded-xl bg-[#1ed760]/15 border border-[#1ed760]/35 flex items-center justify-center shrink-0">
-              ${FLUENT_3D_PODCAST(18)}
-            </div>
-            <div class="min-w-0">
-              <h2 class="text-sm font-bold text-white truncate">Discover Live Podcasts</h2>
-              <p class="text-[11px] text-[var(--text-secondary)] truncate">Search shows, hosts, topics, or browse categories</p>
-            </div>
-          </div>
-          <button type="button" data-action="open-search-modal" data-search-filter="podcasts" data-query="${escapeHtml(q)}" class="btn-press filter-pill inline-flex items-center justify-center gap-2 px-4 py-2 rounded-full bg-[#1ed760] text-[#050506] text-xs font-bold shrink-0">
-            ${ICON_SEARCH(13)}
-            <span>${q ? `Search '${escapeHtml(q)}' in Podcasts` : 'Search Podcasts'}</span>
-          </button>
-        </div>
-        <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
-          ${categories
-            .map(
-              (cat) => `
-            <button type="button" data-action="open-podcast-category" data-category-id="${escapeHtml(cat.id)}" class="btn-press filter-pill px-3 py-1.5 rounded-full surface-panel border border-[var(--border-subtle)] hover:border-[#1ed760]/40 text-xs font-medium text-[var(--text-primary)] hover:text-white whitespace-nowrap">
-              ${escapeHtml(cat.label)}
-            </button>`
-            )
-            .join('')}
         </div>
       </section>
     `;
@@ -6574,7 +6736,6 @@ class AudiobookApp {
         <!-- Mobile Scrollable Content -->
         <div id="mobileMainScroll" class="ui-view-enter flex-1 overflow-y-auto px-4 pb-24 mobile-safe-scroll-bottom space-y-6 min-w-0 flex flex-col">
           ${this._renderContinueFromDeviceCard()}
-          ${this._renderPodcastDiscoveryHub('mobile')}
           ${
             isPodcastTab && filtered.length === 0
               ? this._renderPodcastEmptyStateCard()
@@ -6771,16 +6932,26 @@ class AudiobookApp {
           <button data-action="bookmark" aria-label="Bookmark" class="btn-press p-2 rounded-full surface-card text-[#1ed760]">${ICON_BOOKMARK(18)}</button>
         </div>
 
+        <div class="mt-3 px-1">
+          ${this._renderVolumeControl({ fullWidth: true })}
+        </div>
+
         ${
           book.isPodcast || book.sources?.includes('podcast')
-            ? `<div class="mt-4 flex items-center justify-end gap-2">
-                <button type="button" data-action="refresh-podcast-feed" data-book-key="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full surface-card text-xs font-semibold text-white">
-                  ${ICON_REFRESH(13)}
-                  <span>${this.state.refreshingPodcastKeys.has(book.bookKey) ? 'Refreshing...' : 'Refresh'}</span>
-                </button>
-                <button type="button" data-action="unsubscribe-podcast" data-book-key="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full surface-card text-xs font-semibold text-red-300">
-                  <span>Unfollow</span>
-                </button>
+            ? `<div class="mt-4 flex flex-wrap items-center justify-between gap-2">
+                <span data-ab-podcast-listening="${escapeHtml(book.bookKey)}" class="text-[11px] font-medium text-[var(--text-secondary)] tabular-nums">${this._formatPodcastListeningHours(book.totalListeningSec)}</span>
+                <div class="flex items-center gap-2 flex-wrap justify-end">
+                  <button type="button" data-action="refresh-podcast-feed" data-book-key="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full surface-card text-xs font-semibold text-white">
+                    ${ICON_REFRESH(13)}
+                    <span>${this.state.refreshingPodcastKeys.has(book.bookKey) ? 'Refreshing...' : 'Refresh'}</span>
+                  </button>
+                  <button type="button" data-action="reset-book-progress" data-book="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full surface-card text-xs font-semibold text-white">
+                    <span>Reset Progress</span>
+                  </button>
+                  <button type="button" data-action="unsubscribe-podcast" data-book-key="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full surface-card text-xs font-semibold text-red-300">
+                    <span>Unfollow</span>
+                  </button>
+                </div>
               </div>`
             : ''
         }
@@ -6823,6 +6994,7 @@ class AudiobookApp {
 
   _renderDesktopView(activeBook, snap) {
     const filtered = this.getFilteredBooks();
+    const sidebarBooks = this.getSidebarBooks();
     const detailBook = this.getDetailBook();
     const { sidebarCollapsed, rightPanelOpen, desktopView, filterSource, searchQuery } = this.state;
     const isPodcastTab = filterSource === 'podcasts';
@@ -6896,7 +7068,7 @@ class AudiobookApp {
                         </button>
                       </div>`
                   : sidebarCollapsed
-                    ? filtered
+                    ? sidebarBooks
                         .map(
                           (book) => `
                   <button data-action="open-detail" data-book="${escapeHtml(book.bookKey)}" data-book-key="${escapeHtml(book.bookKey)}" class="library-context-target btn-press w-full flex items-center justify-center p-2 rounded-xl overflow-hidden ${
@@ -6908,7 +7080,7 @@ class AudiobookApp {
                   </button>`
                         )
                         .join('')
-                    : this._renderGroupedLibraryEntries(filtered, activeBook, 'desktop')
+                    : this._renderGroupedLibraryEntries(sidebarBooks, activeBook, 'desktop')
               }
             </div>
           </aside>
@@ -6917,6 +7089,11 @@ class AudiobookApp {
           <section class="flex-1 min-w-0 surface-panel ambient-surface rounded-2xl flex flex-col overflow-hidden">
             <div class="px-5 py-3 flex items-center justify-between gap-3 border-b border-[var(--border-subtle)]">
               <div class="flex items-center gap-2 flex-1 max-w-xl min-w-0">
+                ${
+                  desktopView === 'detail'
+                    ? `<button data-action="desktop-home" class="btn-press px-3 py-1.5 rounded-full surface-card text-xs font-medium text-white flex items-center gap-1 shrink-0">${ICON_CHEVRON('left', 14)} Back</button>`
+                    : ''
+                }
                 <div class="relative flex-1 max-w-md min-w-0">
                   <span class="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)] pointer-events-none">${ICON_SEARCH(15)}</span>
                   <input id="desktopSearchInput" data-action="search-input" type="search" value="${escapeHtml(searchQuery)}" placeholder="Search audiobooks, podcasts, authors..." class="w-full pl-9 pr-3 py-1.5 rounded-full bg-white/5 border border-[var(--border-subtle)] text-xs text-white placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[#1ed760]/60" />
@@ -6933,8 +7110,7 @@ class AudiobookApp {
               <div class="flex items-center gap-2 shrink-0">
                 ${
                   desktopView === 'detail'
-                    ? `<button data-action="desktop-home" class="btn-press px-3 py-1.5 rounded-full surface-card text-xs font-medium text-white flex items-center gap-1">${ICON_CHEVRON('left', 14)} Back</button>
-                       <button data-action="desktop-home" aria-label="Close Detail" class="btn-press p-2 rounded-full surface-card text-[var(--text-secondary)] hover:text-white">${ICON_CLOSE(15)}</button>`
+                    ? `<button data-action="desktop-home" aria-label="Close Detail" class="btn-press p-2 rounded-full surface-card text-[var(--text-secondary)] hover:text-white">${ICON_CLOSE(15)}</button>`
                     : ''
                 }
                 <button data-action="toggle-right-panel" aria-label="Toggle Now Playing Panel" class="btn-press p-2 rounded-full surface-card ${rightPanelOpen ? 'text-[#1ed760]' : 'text-[var(--text-secondary)]'}">
@@ -6989,6 +7165,10 @@ class AudiobookApp {
               <div class="surface-card rounded-xl p-3 space-y-1.5 min-w-0">
                 <div class="text-[11px] font-semibold text-[var(--text-secondary)]">${activeBook.isPodcast || activeBook.sources?.includes('podcast') ? 'Episode' : 'Chapter'}</div>
                 <div class="text-xs font-medium text-white truncate">${escapeHtml(activeChapter?.title || (activeBook.isPodcast ? 'Episode 1' : 'Chapter 1'))}</div>
+              </div>
+
+              <div class="surface-card rounded-xl px-3 py-2">
+                ${this._renderVolumeControl({ fullWidth: true })}
               </div>
 
               <div class="space-y-2 min-w-0">
@@ -7066,13 +7246,14 @@ class AudiobookApp {
             </div>
           </div>
 
-          <div class="hidden md:flex items-center justify-end gap-2 w-72 shrink-0">
+          <div class="hidden md:flex items-center justify-end gap-2 w-80 lg:w-[26rem] shrink-0">
+            ${this._renderVolumeControl({ compact: true })}
             <button data-action="cycle-speed" class="btn-press px-2.5 py-1 rounded-full surface-card text-xs font-semibold text-white tabular-nums">${formatPlaybackRate(snap.playbackRate)}</button>
             <button data-action="cycle-sleep" class="btn-press inline-flex items-center gap-1 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white">
               ${ICON_SLEEP(13)}
               <span>${snap.sleepTimerMode ? (snap.sleepTimerMode === 'chapter' ? 'Ch' : `${snap.sleepTimerMode}m`) : 'Sleep'}</span>
             </button>
-            <button data-action="cycle-device" class="btn-press inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white max-w-[120px]">
+            <button data-action="cycle-device" class="btn-press inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white max-w-[115px]">
               ${ICON_SPEAKER(13, 'text-[#1ed760] shrink-0')}
               <span class="truncate">${escapeHtml(this.state.activeOutputDevice)}</span>
             </button>
@@ -7105,7 +7286,8 @@ class AudiobookApp {
             </div>
           </div>
 
-          <div class="hidden md:flex items-center justify-end gap-2 w-72 shrink-0">
+          <div class="hidden md:flex items-center justify-end gap-2 w-80 lg:w-[26rem] shrink-0">
+            ${this._renderVolumeControl({ compact: true })}
             <button data-action="cycle-speed" class="btn-press px-2.5 py-1 rounded-full surface-card text-xs font-semibold text-white tabular-nums">${formatPlaybackRate(snap.playbackRate)}</button>
             <button data-action="cycle-device" class="btn-press inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white max-w-[120px]">
               ${ICON_SPEAKER(13, 'text-[#1ed760] shrink-0')}
@@ -7120,9 +7302,8 @@ class AudiobookApp {
 
   _renderDesktopHome(filtered, activeBook) {
     const continueCard = this._renderContinueFromDeviceCard();
-    const podcastHub = this._renderPodcastDiscoveryHub('desktop');
     if (this.state.filterSource === 'podcasts' && filtered.length === 0) {
-      return `${continueCard}${podcastHub}${this._renderPodcastEmptyStateCard()}`;
+      return `${continueCard}${this._renderPodcastEmptyStateCard()}`;
     }
     if (this.books.length === 0) {
       return `${continueCard}${this._renderEmptyLibraryCard()}`;
@@ -7131,7 +7312,6 @@ class AudiobookApp {
       const q = String(this.state.searchQuery || '').trim();
       return `
         ${continueCard}
-        ${podcastHub}
         <div class="ui-view-enter flex-1 min-h-[280px] flex flex-col items-center justify-center text-center space-y-3">
           <div class="text-sm font-semibold text-white">No matching audiobooks</div>
           ${
@@ -7148,7 +7328,6 @@ class AudiobookApp {
     }
     return `
       ${continueCard}
-      ${podcastHub}
       <!-- Quick-Resume Grid -->
       <div class="ui-view-enter ui-stagger-grid grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
         ${filtered
@@ -7239,6 +7418,12 @@ class AudiobookApp {
 
     return `
       <div class="ui-view-enter space-y-6 min-w-0">
+        <div class="flex items-center justify-start">
+          <button type="button" data-action="desktop-home" class="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full surface-card text-xs font-medium text-white">
+            ${ICON_CHEVRON('left', 14)}
+            <span>Back</span>
+          </button>
+        </div>
         <div class="flex flex-col sm:flex-row gap-5 items-start min-w-0">
           <button data-action="open-cover-search" data-book="${escapeHtml(book.bookKey)}" class="w-44 h-44 rounded-2xl overflow-hidden shadow-2xl shrink-0 relative group">
             ${this._renderCoverImg(book)}
@@ -7253,6 +7438,11 @@ class AudiobookApp {
               ${
                 !isPodcast && book.series
                   ? `<span class="series-order-pill">${escapeHtml(book.series)}${book.seriesOrder != null ? ` #${book.seriesOrder}` : ''}</span>`
+                  : ''
+              }
+              ${
+                isPodcast
+                  ? `<span data-ab-podcast-listening="${escapeHtml(book.bookKey)}" class="text-[11px] font-medium text-[var(--text-secondary)] tabular-nums">${this._formatPodcastListeningHours(book.totalListeningSec)}</span>`
                   : ''
               }
             </div>
@@ -7275,6 +7465,9 @@ class AudiobookApp {
                   ? `<button type="button" data-action="refresh-podcast-feed" data-book-key="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">
                       ${ICON_REFRESH(14)}
                       <span>${isRefreshing ? 'Refreshing...' : 'Refresh'}</span>
+                    </button>
+                    <button type="button" data-action="reset-book-progress" data-book="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-white">
+                      <span>Reset Progress</span>
                     </button>
                     <button type="button" data-action="unsubscribe-podcast" data-book-key="${escapeHtml(book.bookKey)}" class="btn-press inline-flex items-center gap-1.5 px-4 py-2 rounded-full surface-card text-xs font-semibold text-red-300 hover:bg-red-500/15">
                       <span>Unfollow</span>
@@ -7791,10 +7984,8 @@ class AudiobookApp {
       !prevMeta ||
       prevMeta.isLoggedIn !== nextMeta.isLoggedIn ||
       prevMeta.layoutMode !== nextMeta.layoutMode;
-    const filterOrSearchChanged =
-      authOrLayoutChanged ||
-      prevMeta.filterSource !== nextMeta.filterSource ||
-      prevMeta.searchQuery !== nextMeta.searchQuery;
+    const filterChanged = authOrLayoutChanged || prevMeta.filterSource !== nextMeta.filterSource;
+    const filterOrSearchChanged = filterChanged || prevMeta.searchQuery !== nextMeta.searchQuery;
     const detailChanged =
       authOrLayoutChanged ||
       prevMeta.desktopView !== nextMeta.desktopView ||
@@ -7811,7 +8002,7 @@ class AudiobookApp {
       if (el) el.scrollLeft = val;
     };
 
-    setTop('book-list', filterOrSearchChanged ? 0 : scrollSnap.bookListTop);
+    setTop('book-list', filterChanged ? 0 : scrollSnap.bookListTop);
     setTop('mobileMainScroll', filterOrSearchChanged ? 0 : scrollSnap.mobileMainTop);
     setTop('desktopMainScroll', detailChanged ? 0 : scrollSnap.desktopMainTop);
     setTop('desktopRightScroll', activeBookChanged ? 0 : scrollSnap.desktopRightTop);
@@ -7821,6 +8012,84 @@ class AudiobookApp {
         'mobileSheetScroll',
         mobileSheetNewlyOpened || activeBookChanged ? 0 : scrollSnap.mobileSheetTop
       );
+    }
+  }
+
+  _scrollPodcastRowInstant(mainLayer, containerId, targetChapterIdx) {
+    if (!mainLayer || !(targetChapterIdx > 0)) return;
+    const container = mainLayer.querySelector?.(`#${containerId}`);
+    const row = container?.querySelector?.(`[data-podcast-episode-row="${targetChapterIdx}"]`);
+    if (!container || !row) return;
+    if (
+      typeof row.getBoundingClientRect === 'function' &&
+      typeof container.getBoundingClientRect === 'function'
+    ) {
+      const cRect = container.getBoundingClientRect();
+      const rRect = row.getBoundingClientRect();
+      if (
+        cRect.height > 0 &&
+        rRect.height > 0 &&
+        !(rRect.top === cRect.top && cRect.height === 32 && rRect.height === 32 && Number(row.offsetTop || 0) > 0)
+      ) {
+        const currentTop = Number(container.scrollTop || 0);
+        const offsetWithin = rRect.top - cRect.top;
+        const centeredTop = currentTop + offsetWithin - Math.max(0, (cRect.height - rRect.height) / 2);
+        container.scrollTop = Math.max(0, Math.round(centeredTop));
+      } else if (typeof row.offsetTop === 'number') {
+        container.scrollTop = Math.max(0, row.offsetTop);
+      }
+    } else if (typeof row.offsetTop === 'number') {
+      container.scrollTop = Math.max(0, row.offsetTop);
+    }
+    if (typeof row.scrollIntoView === 'function') {
+      try {
+        row.scrollIntoView({ block: 'center', behavior: 'instant' });
+      } catch {
+        // ignore in environments without scrollIntoView options support
+      }
+    }
+  }
+
+  _teleportPodcastEpisodeIfNeeded(mainLayer, prevMeta, nextMeta) {
+    if (!mainLayer || !nextMeta?.isLoggedIn) return;
+    const authOrLayoutChanged =
+      !prevMeta ||
+      prevMeta.isLoggedIn !== nextMeta.isLoggedIn ||
+      prevMeta.layoutMode !== nextMeta.layoutMode;
+
+    if (nextMeta.layoutMode === 'desktop' && nextMeta.desktopView === 'detail') {
+      const detailChanged =
+        authOrLayoutChanged ||
+        prevMeta.desktopView !== nextMeta.desktopView ||
+        prevMeta.detailBookKey !== nextMeta.detailBookKey;
+      if (detailChanged) {
+        const detailBook = this.getDetailBook();
+        if (detailBook && (detailBook.isPodcast || detailBook.sources?.includes('podcast'))) {
+          const activeBook = this.getActiveBook();
+          const targetIdx = this._getPodcastTargetChapterIndex(
+            detailBook,
+            activeBook?.bookKey === detailBook.bookKey
+          );
+          if (targetIdx > 0) {
+            this._scrollPodcastRowInstant(mainLayer, 'desktopMainScroll', targetIdx);
+          }
+        }
+      }
+    } else if (nextMeta.layoutMode === 'android' && nextMeta.mobileSheetOpen && nextMeta.mobileChaptersExpanded) {
+      const mobileSheetNewlyOpened = Boolean(!prevMeta?.mobileSheetOpen && nextMeta.mobileSheetOpen);
+      const activeBookChanged = authOrLayoutChanged || prevMeta.activeBookKey !== nextMeta.activeBookKey;
+      const chaptersNewlyExpanded = Boolean(
+        !prevMeta?.mobileChaptersExpanded && nextMeta.mobileChaptersExpanded
+      );
+      if (mobileSheetNewlyOpened || activeBookChanged || chaptersNewlyExpanded) {
+        const activeBook = this.getActiveBook();
+        if (activeBook && (activeBook.isPodcast || activeBook.sources?.includes('podcast'))) {
+          const targetIdx = this._getPodcastTargetChapterIndex(activeBook, true);
+          if (targetIdx > 0) {
+            this._scrollPodcastRowInstant(mainLayer, 'mobileSheetScroll', targetIdx);
+          }
+        }
+      }
     }
   }
 
@@ -7915,6 +8184,7 @@ class AudiobookApp {
         filterSource: this.state.filterSource,
         searchQuery: this.state.searchQuery,
         mobileSheetOpen: false,
+        mobileChaptersExpanded: Boolean(this.state.mobileChaptersExpanded),
         shadeOpen: false
       };
     } else {
@@ -7942,6 +8212,7 @@ class AudiobookApp {
         filterSource: this.state.filterSource,
         searchQuery: this.state.searchQuery,
         mobileSheetOpen: Boolean(this.state.mobileSheetOpen),
+        mobileChaptersExpanded: Boolean(this.state.mobileChaptersExpanded),
         shadeOpen: Boolean(this.state.shadeOpen)
       };
     }
@@ -7961,6 +8232,7 @@ class AudiobookApp {
       this._lastMainViewSignature = nextViewSignature;
       this._bindContainerEvents(shell.main);
       this._restoreMainScroll(shell.main, prevMeta, nextViewMeta, scrollSnap);
+      this._teleportPodcastEpisodeIfNeeded(shell.main, prevMeta, nextViewMeta);
     } else {
       this._lastMainViewSignature = nextViewSignature;
     }
@@ -8199,10 +8471,22 @@ class AudiobookApp {
       });
     });
 
+    containerEl.querySelectorAll('[data-action="volume-range"]').forEach((rangeEl) => {
+      const handleVolumeInput = (e) => {
+        const pct = Math.max(0, Math.min(100, Number(e.target?.value ?? 100)));
+        this.audioEngine.setVolume(pct / 100);
+        this.state.snapshot = this.audioEngine.getSnapshot();
+        this._updateLiveVolumeDom(this.state.snapshot);
+      };
+      rangeEl.addEventListener('input', handleVolumeInput);
+      rangeEl.addEventListener('change', handleVolumeInput);
+    });
+
     containerEl.querySelectorAll('[data-action]').forEach((el) => {
       const action = el.dataset.action;
       if (
         action === 'seek-range' ||
+        action === 'volume-range' ||
         action === 'search-input' ||
         action === 'podcast-search-input' ||
         action === 'toggle-wipe-clear-folder'
@@ -8223,15 +8507,19 @@ class AudiobookApp {
         }
         switch (action) {
           case 'toggle-theme': {
-            const nextTheme = this.state.theme === 'amoled' ? 'pitch' : 'amoled';
-            this._saveTheme(nextTheme);
+            this._saveTheme('amoled');
             this.render();
             break;
           }
           case 'set-theme': {
-            const nextTheme = el.dataset.theme === 'amoled' ? 'amoled' : 'pitch';
-            this._saveTheme(nextTheme);
+            this._saveTheme('amoled');
             this.render();
+            break;
+          }
+          case 'toggle-mute': {
+            this.audioEngine.toggleMute();
+            this.state.snapshot = this.audioEngine.getSnapshot();
+            this._updateLiveVolumeDom(this.state.snapshot);
             break;
           }
           case 'toggle-profile': {

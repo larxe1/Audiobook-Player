@@ -10,6 +10,8 @@
 
 const OFFLINE_DB_NAME = 'audiobook_player_offline_v1';
 const OFFLINE_STORE = 'audio_blobs';
+const STORAGE_VOLUME_KEY = 'audiobook_player_volume_v1';
+const STORAGE_MUTED_KEY = 'audiobook_player_muted_v1';
 
 function openOfflineDb() {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null);
@@ -58,12 +60,15 @@ export class AudioEngine {
     this.currentBook = null;
     this.playing = false;
     this.playbackRate = 1.0;
+    this.volume = this._loadVolume();
+    this.muted = this._loadMuted();
     this.positionSec = 0;
     this.durationSec = 0;
     this.chapterIndex = 0;
     this.usingSynth = false;
     this.activeObjectUrl = null;
     this.driveAccessToken = null;
+    this._applyAudioVolume();
 
     // Sleep timer state: 0 (off) | minutes number | 'chapter'
     this.sleepPresetIndex = 0;
@@ -228,6 +233,7 @@ export class AudioEngine {
           this.activeObjectUrl = blobUrl;
           this.audio.src = blobUrl;
           this.audio.playbackRate = this.playbackRate;
+          this._applyAudioVolume();
           try {
             this.audio.currentTime = savedPos;
           } catch {
@@ -257,6 +263,99 @@ export class AudioEngine {
     return true;
   }
 
+  _loadVolume() {
+    try {
+      const raw = globalThis.localStorage?.getItem?.(STORAGE_VOLUME_KEY);
+      if (raw !== null && raw !== undefined && raw !== '') {
+        const parsed = Number(raw);
+        if (Number.isFinite(parsed)) {
+          return Math.max(0, Math.min(1, parsed));
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return 1;
+  }
+
+  _loadMuted() {
+    try {
+      const raw = globalThis.localStorage?.getItem?.(STORAGE_MUTED_KEY);
+      return raw === '1' || raw === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  _effectiveVolume() {
+    return this.muted ? 0 : Math.max(0, Math.min(1, Number(this.volume ?? 1)));
+  }
+
+  _applyAudioVolume() {
+    const effective = this._effectiveVolume();
+    if (this.audio) {
+      try {
+        this.audio.volume = effective;
+        this.audio.muted = Boolean(this.muted || effective <= 0);
+      } catch {
+        // Ignore on platforms where HTMLMediaElement.volume is read-only
+      }
+    }
+    if (this._synthNodes?.master && this._audioCtx) {
+      try {
+        const targetGain = Math.max(0.0001, 0.022 * effective);
+        this._synthNodes.master.gain.setTargetAtTime(targetGain, this._audioCtx.currentTime, 0.03);
+        if (this._synthNodes.lfoGain) {
+          this._synthNodes.lfoGain.gain.setTargetAtTime(
+            0.008 * effective,
+            this._audioCtx.currentTime,
+            0.03
+          );
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  setVolume(vol) {
+    const num = Number(vol);
+    const clamped = Number.isFinite(num) ? Math.max(0, Math.min(1, num)) : 1;
+    this.volume = clamped;
+    if (clamped > 0 && this.muted) {
+      this.muted = false;
+      try {
+        globalThis.localStorage?.setItem?.(STORAGE_MUTED_KEY, '0');
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      globalThis.localStorage?.setItem?.(STORAGE_VOLUME_KEY, String(clamped));
+    } catch {
+      // ignore
+    }
+    this._applyAudioVolume();
+    this._emitState();
+    return this.volume;
+  }
+
+  setMuted(muted) {
+    this.muted = Boolean(muted);
+    try {
+      globalThis.localStorage?.setItem?.(STORAGE_MUTED_KEY, this.muted ? '1' : '0');
+    } catch {
+      // ignore
+    }
+    this._applyAudioVolume();
+    this._emitState();
+    return this.muted;
+  }
+
+  toggleMute() {
+    return this.setMuted(!this.muted);
+  }
+
   setDriveAccessToken(token) {
     this.driveAccessToken = token || null;
   }
@@ -268,6 +367,8 @@ export class AudioEngine {
       positionSec: this.positionSec,
       durationSec: this.durationSec || this.currentBook?.totalDurationSec || 0,
       playbackRate: this.playbackRate,
+      volume: this.volume,
+      muted: this.muted,
       chapterIndex: this.chapterIndex,
       usingSynth: this.usingSynth,
       sleepTimerMode: this.sleepTimerMode,
@@ -514,6 +615,7 @@ export class AudioEngine {
       }
       this.audio.src = mediaUrl;
       this.audio.playbackRate = this.playbackRate;
+      this._applyAudioVolume();
       try {
         this.audio.currentTime = this.positionSec;
       } catch {
@@ -555,9 +657,13 @@ export class AudioEngine {
       this._stopSynthTone();
 
       const ctx = this._audioCtx;
+      const effective = this._effectiveVolume();
       const master = ctx.createGain();
       master.gain.setValueAtTime(0.0001, ctx.currentTime);
-      master.gain.exponentialRampToValueAtTime(0.022, ctx.currentTime + 0.35);
+      master.gain.exponentialRampToValueAtTime(
+        Math.max(0.0001, 0.022 * effective),
+        ctx.currentTime + 0.35
+      );
 
       const filter = ctx.createBiquadFilter();
       filter.type = 'lowpass';
@@ -577,7 +683,7 @@ export class AudioEngine {
       lfo.frequency.setValueAtTime(0.45 * this.playbackRate, ctx.currentTime);
 
       const lfoGain = ctx.createGain();
-      lfoGain.gain.setValueAtTime(0.008, ctx.currentTime);
+      lfoGain.gain.setValueAtTime(0.008 * effective, ctx.currentTime);
 
       lfo.connect(lfoGain);
       lfoGain.connect(master.gain);
@@ -685,6 +791,7 @@ export class AudioEngine {
 
     try {
       this.audio.playbackRate = this.playbackRate;
+      this._applyAudioVolume();
       await this.audio.play();
       this._emitState();
     } catch {
@@ -847,6 +954,7 @@ export class AudioEngine {
           }
           this.audio.src = mediaUrl;
           this.audio.playbackRate = this.playbackRate;
+          this._applyAudioVolume();
           try {
             this.audio.currentTime = this.positionSec;
           } catch {

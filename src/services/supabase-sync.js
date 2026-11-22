@@ -76,9 +76,41 @@ function generateId(prefix = 'dev') {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function detectDeviceName(navigatorObj) {
+function extractAndroidModelFromUserAgent(ua = '', navigatorObj = null) {
+  const uaDataModel = String(navigatorObj?.userAgentData?.model || '').trim();
+  if (uaDataModel && uaDataModel.length > 1 && !/^(k|android|linux|mobile|wv)$/i.test(uaDataModel)) {
+    return uaDataModel;
+  }
+  const match = String(ua || '').match(/Android[^;)]*;\s*([^;)]+)/i);
+  if (!match?.[1]) return '';
+  const cleaned = match[1]
+    .replace(/\s+Build\/.*$/i, '')
+    .replace(/\s+MIUI\/.*$/i, '')
+    .trim();
+  if (
+    !cleaned ||
+    cleaned.length <= 1 ||
+    /^(k|wv|mobile|android|linux|[a-z]{2}(?:-[a-z]{2})?)$/i.test(cleaned)
+  ) {
+    return '';
+  }
+  return cleaned;
+}
+
+export function detectDeviceName(navigatorObj, windowObj = null) {
+  try {
+    const nativeName = windowObj?.AudiobookOAuthNative?.getDeviceName?.();
+    if (typeof nativeName === 'string' && nativeName.trim()) {
+      return nativeName.trim();
+    }
+  } catch {
+    // Fall through to User-Agent detection
+  }
   const ua = navigatorObj?.userAgent || '';
-  if (/Android/i.test(ua)) return 'Android Device';
+  if (/Android/i.test(ua)) {
+    const model = extractAndroidModelFromUserAgent(ua, navigatorObj);
+    return model ? `Android (${model})` : 'Android Phone';
+  }
   if (/iPhone|iPad|iPod/i.test(ua)) return 'iOS Device';
   if (/Windows/i.test(ua)) return 'Windows PC';
   if (/Mac OS X|Macintosh/i.test(ua)) return 'Mac';
@@ -218,19 +250,39 @@ function sanitizeMediaEntry(entry, index = 0) {
   return clean;
 }
 
-function mergeEpisodeProgressMaps(existingMap = {}, incomingMap = {}) {
+function maxEpisodeProgressUpdatedAtMs(episodeProgress) {
+  if (!episodeProgress || typeof episodeProgress !== 'object' || Array.isArray(episodeProgress)) {
+    return 0;
+  }
+  let maxMs = 0;
+  for (const entry of Object.values(episodeProgress)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const ts = toEpochMs(entry.updatedAt);
+    if (ts > maxMs) maxMs = ts;
+  }
+  return maxMs;
+}
+
+export function mergeEpisodeProgressMaps(existingMap = {}, incomingMap = {}, progressResetAt = 0) {
   const a = existingMap && typeof existingMap === 'object' && !Array.isArray(existingMap) ? existingMap : {};
   const b = incomingMap && typeof incomingMap === 'object' && !Array.isArray(incomingMap) ? incomingMap : {};
+  const effectiveResetAt = toEpochMs(progressResetAt);
+  const isAfterReset = (entry) => {
+    if (!entry || typeof entry !== 'object') return false;
+    if (effectiveResetAt <= 0) return true;
+    return toEpochMs(entry.updatedAt) > effectiveResetAt;
+  };
   const merged = {};
   for (const epId of new Set([...Object.keys(a), ...Object.keys(b)])) {
-    const first = a[epId];
-    const second = b[epId];
+    const first = isAfterReset(a[epId]) ? a[epId] : null;
+    const second = isAfterReset(b[epId]) ? b[epId] : null;
+    if (!first && !second) continue;
     if (!first) {
-      if (second && typeof second === 'object') merged[epId] = { ...second };
+      merged[epId] = { ...second };
       continue;
     }
     if (!second) {
-      if (first && typeof first === 'object') merged[epId] = { ...first };
+      merged[epId] = { ...first };
       continue;
     }
     const firstTs = toEpochMs(first.updatedAt);
@@ -256,7 +308,7 @@ function sanitizeMediaList(list) {
   return list.map((entry, idx) => sanitizeMediaEntry(entry, idx)).filter(Boolean);
 }
 
-function normalizeCloudBook(rawBook, fallbackDevice = {}) {
+export function normalizeCloudBook(rawBook, fallbackDevice = {}) {
   if (!rawBook || typeof rawBook !== 'object') return null;
   const bookKey = String(rawBook.bookKey || rawBook.book_key || rawBook.id || '').trim();
   if (!bookKey) return null;
@@ -304,11 +356,27 @@ function normalizeCloudBook(rawBook, fallbackDevice = {}) {
   const mediaType = isPodcast ? 'podcast' : (rawBook.mediaType || meta.mediaType || 'audiobook');
   const feedUrl = String(rawBook.feedUrl || meta.feedUrl || '').trim();
   const lastFeedRefreshAt = String(rawBook.lastFeedRefreshAt || meta.lastFeedRefreshAt || '').trim();
+  const rawTotalListeningSec = Number(
+    rawBook.totalListeningSec ??
+      rawBook.total_listening_sec ??
+      meta.totalListeningSec ??
+      meta.total_listening_sec ??
+      0
+  );
+  const totalListeningSec =
+    Number.isFinite(rawTotalListeningSec) && rawTotalListeningSec > 0 ? rawTotalListeningSec : 0;
+  const progressResetAt = Math.max(
+    toEpochMs(rawBook.progressResetAt ?? rawBook.progress_reset_at ?? 0),
+    toEpochMs(meta.progressResetAt ?? meta.progress_reset_at ?? 0)
+  );
   const rawEpProgress = rawBook.episodeProgress || meta.episodeProgress;
-  const episodeProgress =
-    rawEpProgress && typeof rawEpProgress === 'object' && !Array.isArray(rawEpProgress)
-      ? rawEpProgress
-      : {};
+  const episodeProgress = mergeEpisodeProgressMaps(rawEpProgress, {}, progressResetAt);
+  const lastPlayedAt = rawBook.lastPlayedAt || meta.lastPlayedAt || rawBook.last_played_at || null;
+  const lastPlayedMs = Math.max(
+    toEpochMs(lastPlayedAt),
+    maxEpisodeProgressUpdatedAtMs(episodeProgress)
+  );
+  const isResetNewer = progressResetAt > 0 && lastPlayedMs <= progressResetAt;
   const hasDriveMedia =
     !isPodcast &&
     Boolean(
@@ -337,6 +405,20 @@ function normalizeCloudBook(rawBook, fallbackDevice = {}) {
   const originDeviceName = rawBook.originDeviceName || meta.originDeviceName || fallbackDevice.deviceName || null;
   const updatedAt = rawBook.updatedAt || meta.updatedAt || rawBook.updated_at || new Date().toISOString();
 
+  const progressFields = isResetNewer
+    ? { chapterIndex: 0, positionSec: 0, completed: false }
+    : {
+        ...(rawBook.chapterIndex !== undefined || meta.chapterIndex !== undefined
+          ? { chapterIndex: Number(rawBook.chapterIndex ?? meta.chapterIndex ?? 0) || 0 }
+          : {}),
+        ...(rawBook.positionSec !== undefined || meta.positionSec !== undefined
+          ? { positionSec: Number(rawBook.positionSec ?? meta.positionSec ?? 0) || 0 }
+          : {}),
+        ...(rawBook.completed !== undefined || meta.completed !== undefined
+          ? { completed: Boolean(rawBook.completed ?? meta.completed) }
+          : {})
+      };
+
   return {
     id: bookKey,
     bookKey,
@@ -350,6 +432,10 @@ function normalizeCloudBook(rawBook, fallbackDevice = {}) {
     coverDriveFileId,
     durationSec: safeDurationSec,
     totalDurationSec: safeDurationSec,
+    totalListeningSec,
+    progressResetAt,
+    ...(lastPlayedAt ? { lastPlayedAt } : {}),
+    ...progressFields,
     sources,
     ...(source ? { source } : {}),
     isPodcast,
@@ -369,7 +455,7 @@ function normalizeCloudBook(rawBook, fallbackDevice = {}) {
   };
 }
 
-function mergeCloudBook(existingBook, incomingBook) {
+export function mergeCloudBook(existingBook, incomingBook) {
   if (!existingBook) return incomingBook;
   if (!incomingBook) return existingBook;
 
@@ -412,6 +498,54 @@ function mergeCloudBook(existingBook, incomingBook) {
     ])
   );
 
+  const totalListeningSec = Math.max(
+    0,
+    Number(older.totalListeningSec ?? 0) || 0,
+    Number(newer.totalListeningSec ?? 0) || 0
+  );
+  const effectiveResetAt = Math.max(
+    toEpochMs(older.progressResetAt ?? 0),
+    toEpochMs(newer.progressResetAt ?? 0)
+  );
+  const episodeProgress = mergeEpisodeProgressMaps(
+    older.episodeProgress,
+    newer.episodeProgress,
+    effectiveResetAt
+  );
+  const olderPlayedMs = Math.max(
+    toEpochMs(older.lastPlayedAt),
+    maxEpisodeProgressUpdatedAtMs(older.episodeProgress)
+  );
+  const newerPlayedMs = Math.max(
+    toEpochMs(newer.lastPlayedAt),
+    maxEpisodeProgressUpdatedAtMs(newer.episodeProgress)
+  );
+  const latestPlayedMs = Math.max(olderPlayedMs, newerPlayedMs);
+  const latestLastPlayedAt =
+    newerPlayedMs >= olderPlayedMs
+      ? (newer.lastPlayedAt || older.lastPlayedAt || null)
+      : (older.lastPlayedAt || newer.lastPlayedAt || null);
+  const isResetNewer = effectiveResetAt > 0 && latestPlayedMs <= effectiveResetAt;
+
+  let progressPatch = {};
+  if (isResetNewer) {
+    progressPatch = {
+      chapterIndex: 0,
+      positionSec: 0,
+      completed: false
+    };
+  } else if (
+    effectiveResetAt > 0 &&
+    olderPlayedMs > effectiveResetAt &&
+    newerPlayedMs <= effectiveResetAt
+  ) {
+    progressPatch = {
+      ...(older.chapterIndex !== undefined ? { chapterIndex: Number(older.chapterIndex) || 0 } : {}),
+      ...(older.positionSec !== undefined ? { positionSec: Number(older.positionSec) || 0 } : {}),
+      ...(older.completed !== undefined ? { completed: Boolean(older.completed) } : {})
+    };
+  }
+
   return {
     ...older,
     ...newer,
@@ -427,8 +561,12 @@ function mergeCloudBook(existingBook, incomingBook) {
     mediaType: isPodcast ? 'podcast' : (newer.mediaType || older.mediaType || 'audiobook'),
     feedUrl: newer.feedUrl || older.feedUrl || '',
     lastFeedRefreshAt: newer.lastFeedRefreshAt || older.lastFeedRefreshAt || '',
-    episodeProgress: mergeEpisodeProgressMaps(older.episodeProgress, newer.episodeProgress),
+    episodeProgress,
     totalDurationSec: Number(newer.totalDurationSec || older.totalDurationSec || 0),
+    totalListeningSec,
+    progressResetAt: effectiveResetAt,
+    ...(latestLastPlayedAt ? { lastPlayedAt: latestLastPlayedAt } : {}),
+    ...progressPatch,
     originDeviceId: newer.originDeviceId || older.originDeviceId || null,
     originDeviceName: newer.originDeviceName || older.originDeviceName || null,
     updatedAt: newer.updatedAt || older.updatedAt
@@ -473,6 +611,226 @@ function normalizeDeviceRecord(row, currentDeviceId) {
     lastSeenAt,
     isCurrentDevice: deviceId === currentDeviceId
   };
+}
+
+function getDeviceLastSeenMs(dev) {
+  if (!dev || typeof dev !== 'object') return 0;
+  return toEpochMs(
+    dev.lastSeenAt ??
+      dev.last_seen_at ??
+      dev.updatedAt ??
+      dev.updated_at ??
+      dev.lastPlayedAt ??
+      dev.last_played_at ??
+      0
+  );
+}
+
+function isAndroidDeviceRecord(dev) {
+  if (!dev || typeof dev !== 'object') return false;
+  const platform = String(dev.platform || '').trim().toLowerCase();
+  const name = String(dev.deviceName ?? dev.device_name ?? '').trim();
+  const id = String(dev.deviceId ?? dev.device_id ?? '').trim();
+  return platform === 'android' || /^android\b/i.test(name) || /^dev_android_/i.test(id);
+}
+
+function isGenericAndroidDeviceName(name = '') {
+  const norm = String(name || '').trim().toLowerCase();
+  return (
+    !norm ||
+    norm === 'android device' ||
+    norm === 'android phone' ||
+    norm === 'android' ||
+    norm === 'device'
+  );
+}
+
+function normalizeAndroidModelKey(name = '') {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^android\s*\((.+)\)$/i, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function androidModelKeysMatch(keyA = '', keyB = '') {
+  if (!keyA || !keyB) return false;
+  if (keyA === keyB) return true;
+  if (keyA.length >= 4 && keyB.endsWith(` ${keyA}`)) return true;
+  if (keyB.length >= 4 && keyA.endsWith(` ${keyB}`)) return true;
+  return false;
+}
+
+function pickPreferredDevice(candidates = [], currentDeviceId = null) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+  let best = candidates[0];
+  for (let i = 1; i < candidates.length; i += 1) {
+    const candidate = candidates[i];
+    const bestId = String(best.deviceId ?? best.device_id ?? '');
+    const candId = String(candidate.deviceId ?? candidate.device_id ?? '');
+    if (currentDeviceId && candId === currentDeviceId && bestId !== currentDeviceId) {
+      best = candidate;
+      continue;
+    }
+    if (currentDeviceId && bestId === currentDeviceId && candId !== currentDeviceId) {
+      continue;
+    }
+    const candTs = getDeviceLastSeenMs(candidate);
+    const bestTs = getDeviceLastSeenMs(best);
+    if (candTs > bestTs) {
+      best = candidate;
+      continue;
+    }
+    if (candTs === bestTs) {
+      const candNative = /^dev_android_/i.test(candId);
+      const bestNative = /^dev_android_/i.test(bestId);
+      if (candNative && !bestNative) {
+        best = candidate;
+        continue;
+      }
+      const candNameLen = String(candidate.deviceName ?? candidate.device_name ?? '').trim().length;
+      const bestNameLen = String(best.deviceName ?? best.device_name ?? '').trim().length;
+      if (candNameLen > bestNameLen) {
+        best = candidate;
+      }
+    }
+  }
+  return best;
+}
+
+function deduplicateDevicesWithStaleIds(devices = [], currentDeviceId = null) {
+  if (!Array.isArray(devices) || devices.length === 0) {
+    return { devices: [], staleDeviceIds: [] };
+  }
+
+  // Step 1: Deduplicate identical deviceId entries first
+  const byId = new Map();
+  for (const raw of devices) {
+    if (!raw || typeof raw !== 'object') continue;
+    const id = String(raw.deviceId ?? raw.device_id ?? '').trim();
+    if (!id) continue;
+    const existing = byId.get(id);
+    if (!existing || getDeviceLastSeenMs(raw) >= getDeviceLastSeenMs(existing)) {
+      byId.set(id, {
+        ...(existing || {}),
+        ...raw,
+        deviceId: id,
+        ...(currentDeviceId !== null && currentDeviceId !== undefined
+          ? { isCurrentDevice: id === currentDeviceId }
+          : {})
+      });
+    }
+  }
+
+  const nonAndroid = [];
+  const specificAndroidGroups = [];
+  const genericAndroids = [];
+
+  for (const dev of byId.values()) {
+    if (!isAndroidDeviceRecord(dev)) {
+      nonAndroid.push(dev);
+      continue;
+    }
+    const rawName = String(dev.deviceName ?? dev.device_name ?? '').trim();
+    if (isGenericAndroidDeviceName(rawName)) {
+      genericAndroids.push(dev);
+      continue;
+    }
+    const modelKey = normalizeAndroidModelKey(rawName);
+    let matchedGroup = specificAndroidGroups.find((g) => androidModelKeysMatch(g.key, modelKey));
+    if (!matchedGroup) {
+      matchedGroup = { key: modelKey, members: [] };
+      specificAndroidGroups.push(matchedGroup);
+    } else if (modelKey.length > matchedGroup.key.length) {
+      matchedGroup.key = modelKey;
+    }
+    matchedGroup.members.push(dev);
+  }
+
+  const staleDeviceIds = new Set();
+  const keptAndroids = [];
+
+  for (const group of specificAndroidGroups) {
+    const winner = pickPreferredDevice(group.members, currentDeviceId);
+    if (!winner) continue;
+    // Prefer the most descriptive (non-generic) name in the group if winner had a shorter alias
+    let bestName = String(winner.deviceName ?? winner.device_name ?? '').trim();
+    for (const member of group.members) {
+      const mId = String(member.deviceId ?? member.device_id ?? '');
+      if (mId && mId !== winner.deviceId) {
+        staleDeviceIds.add(mId);
+      }
+      const mName = String(member.deviceName ?? member.device_name ?? '').trim();
+      if (mName && !isGenericAndroidDeviceName(mName) && !/^android\s*\(/i.test(mName) && /^android\s*\(/i.test(bestName)) {
+        bestName = mName;
+      }
+    }
+    keptAndroids.push(bestName && bestName !== winner.deviceName ? { ...winner, deviceName: bestName } : winner);
+  }
+
+  if (genericAndroids.length > 0) {
+    const currentGeneric = currentDeviceId
+      ? genericAndroids.find((d) => d.deviceId === currentDeviceId)
+      : null;
+
+    if (keptAndroids.length > 0 && !currentGeneric) {
+      // All legacy generic 'Android Device' / 'Android Phone' rows collapse into the specific Android device(s)
+      for (const gen of genericAndroids) {
+        staleDeviceIds.add(gen.deviceId);
+      }
+    } else if (currentGeneric && keptAndroids.length === 1) {
+      // Current session is on Android with a generic UA while 1 specific model exists: keep currentDeviceId with the richer model name
+      const specific = keptAndroids[0];
+      staleDeviceIds.add(specific.deviceId);
+      for (const gen of genericAndroids) {
+        if (gen.deviceId !== currentGeneric.deviceId) {
+          staleDeviceIds.add(gen.deviceId);
+        }
+      }
+      keptAndroids[0] = {
+        ...currentGeneric,
+        deviceName: specific.deviceName || currentGeneric.deviceName
+      };
+    } else {
+      // Only generic Android rows exist (or currentGeneric alongside multiple distinct phones): collapse generics to 1
+      const winner = pickPreferredDevice(genericAndroids, currentDeviceId);
+      if (winner) {
+        for (const gen of genericAndroids) {
+          if (gen.deviceId !== winner.deviceId) {
+            staleDeviceIds.add(gen.deviceId);
+          }
+        }
+        keptAndroids.push(winner);
+      }
+    }
+  }
+
+  if (currentDeviceId) {
+    staleDeviceIds.delete(currentDeviceId);
+  }
+
+  const deduped = [...nonAndroid, ...keptAndroids].sort(
+    (a, b) => getDeviceLastSeenMs(b) - getDeviceLastSeenMs(a)
+  );
+
+  return {
+    devices: deduped,
+    staleDeviceIds: Array.from(staleDeviceIds)
+  };
+}
+
+/**
+ * Collapses duplicate Android device rows (including legacy generic 'Android Device' rows
+ * and same-model rows) into a single entry per physical device, preferring `currentDeviceId`
+ * when on Android or otherwise the newest `last_seen_at` / `lastSeenAt` / `updatedAt`.
+ *
+ * @param {object[]} devices
+ * @param {string|null} [currentDeviceId=null]
+ * @returns {object[]}
+ */
+export function deduplicateDevicesList(devices = [], currentDeviceId = null) {
+  return deduplicateDevicesWithStaleIds(devices, currentDeviceId).devices;
 }
 
 function createEmptyDriveSyncPayload() {
@@ -591,6 +949,11 @@ function mergeDriveSyncPayloads(remoteRaw, delta = {}) {
     merged.bookmarks = Array.from(byKey.values());
   }
 
+  if (Array.isArray(delta.deleteDeviceIds)) {
+    for (const devId of delta.deleteDeviceIds) {
+      if (devId) delete merged.devices[devId];
+    }
+  }
   if (delta.devices && typeof delta.devices === 'object') {
     for (const [devId, dev] of Object.entries(delta.devices)) {
       if (!dev || typeof dev !== 'object') continue;
@@ -600,6 +963,18 @@ function mergeDriveSyncPayloads(remoteRaw, delta = {}) {
       }
     }
   }
+
+  const dedupedDevices = deduplicateDevicesList(
+    Object.values(merged.devices),
+    delta.currentDeviceId || null
+  );
+  const nextDevicesMap = {};
+  for (const dev of dedupedDevices) {
+    if (dev?.deviceId) {
+      nextDevicesMap[dev.deviceId] = dev;
+    }
+  }
+  merged.devices = nextDevicesMap;
 
   return merged;
 }
@@ -720,7 +1095,7 @@ export class SupabaseSyncService {
           : null;
 
     this.deviceId = options.deviceId || this._loadOrCreateDeviceId();
-    this.deviceName = options.deviceName || detectDeviceName(this.navigatorObj);
+    this.deviceName = options.deviceName || detectDeviceName(this.navigatorObj, this.windowObj);
     this.platform = options.platform || detectPlatform(this.navigatorObj);
 
     this.session = this._loadSession();
@@ -742,6 +1117,7 @@ export class SupabaseSyncService {
     this.needsDriveConsent = false;
     this._lastDrivePayload = null;
     this._lastLocalDeviceState = null;
+    this._androidDevicesPrunedForUserId = null;
     this._driveWriteQueue = Promise.resolve();
     this.googleAccessToken =
       this.session?.provider_token ||
@@ -767,6 +1143,27 @@ export class SupabaseSyncService {
   }
 
   _loadOrCreateDeviceId() {
+    try {
+      const nativeId = this.windowObj?.AudiobookOAuthNative?.getDeviceId?.();
+      const cleanNative =
+        typeof nativeId === 'string' ? nativeId.trim().replace(/[^a-zA-Z0-9_-]/g, '') : '';
+      if (cleanNative) {
+        const canonicalId = cleanNative.startsWith('dev_android_')
+          ? cleanNative
+          : `dev_android_${cleanNative}`;
+        if (this.storage) {
+          try {
+            this.storage.setItem(DEVICE_ID_STORAGE_KEY, canonicalId);
+          } catch {
+            // Ignore storage persistence errors
+          }
+        }
+        return canonicalId;
+      }
+    } catch {
+      // Fall back to stored or generated device ID
+    }
+
     if (this.storage) {
       try {
         const existing = this.storage.getItem(DEVICE_ID_STORAGE_KEY);
@@ -3800,6 +4197,50 @@ export class SupabaseSyncService {
   }
 
   /**
+   * Actively removes stale duplicate device_id rows from Supabase `audiobook_devices`
+   * and/or Google Drive `appDataFolder.devices`.
+   * @param {string[]} staleDeviceIds
+   * @param {{ pruneSupabase?: boolean, pruneDrive?: boolean }} [options]
+   * @returns {Promise<number>}
+   */
+  async _pruneStaleDevices(staleDeviceIds = [], { pruneSupabase = true, pruneDrive = true } = {}) {
+    const cleanIds = Array.from(
+      new Set(
+        (Array.isArray(staleDeviceIds) ? staleDeviceIds : [])
+          .map((id) => String(id || '').trim())
+          .filter((id) => id && id !== this.deviceId)
+      )
+    );
+    if (cleanIds.length === 0 || !this._isOnline() || !this.hasCloudSyncAuth()) {
+      return 0;
+    }
+
+    if (pruneSupabase && this.isAuthenticated() && this.session?.user?.id) {
+      const userId = encodeURIComponent(this.session.user.id);
+      const chunkSize = 50;
+      for (let i = 0; i < cleanIds.length; i += chunkSize) {
+        const chunk = cleanIds.slice(i, i + chunkSize);
+        const filter =
+          chunk.length === 1
+            ? `device_id=eq.${encodeURIComponent(chunk[0])}`
+            : `device_id=in.(${chunk.map((id) => `"${encodeURIComponent(id)}"`).join(',')})`;
+        await this._rest(`audiobook_devices?user_id=eq.${userId}&${filter}`, {
+          method: 'DELETE'
+        }).catch(() => null);
+      }
+    }
+
+    if (pruneDrive && this.hasDriveSyncToken()) {
+      await this._writeDriveSyncPayload({
+        deleteDeviceIds: cleanIds,
+        currentDeviceId: this.deviceId
+      }).catch(() => null);
+    }
+
+    return cleanIds.length;
+  }
+
+  /**
    * Registers or updates this device in Supabase /rest/v1/audiobook_devices and/or Drive appDataFolder.
    * @param {object} [deviceState]
    * @returns {Promise<object|null>}
@@ -3842,6 +4283,7 @@ export class SupabaseSyncService {
     }
 
     let supabaseResult = null;
+    let staleFromSupabase = [];
     if (this.isAuthenticated()) {
       const payload = {
         user_id: this.session.user.id,
@@ -3866,6 +4308,33 @@ export class SupabaseSyncService {
       } catch {
         // Still attempt Drive sync if available
       }
+
+      const shouldScanAndroidDupes =
+        normalizedLocal.platform === 'android' &&
+        (deviceState.pruneDuplicates === true ||
+          this._androidDevicesPrunedForUserId !== this.session.user.id);
+      if (shouldScanAndroidDupes) {
+        this._androidDevicesPrunedForUserId = this.session.user.id;
+        try {
+          const rows = await this._rest('audiobook_devices?select=*&order=last_seen_at.desc');
+          const normalizedRows = (Array.isArray(rows) ? rows : [])
+            .map((row) => normalizeDeviceRecord(row, this.deviceId))
+            .filter(Boolean);
+          const { staleDeviceIds } = deduplicateDevicesWithStaleIds(
+            [normalizedLocal, ...normalizedRows],
+            this.deviceId
+          );
+          staleFromSupabase = staleDeviceIds;
+          if (staleFromSupabase.length > 0) {
+            await this._pruneStaleDevices(staleFromSupabase, {
+              pruneSupabase: true,
+              pruneDrive: false
+            });
+          }
+        } catch {
+          // Best-effort duplicate cleanup
+        }
+      }
     }
 
     let driveResult = null;
@@ -3873,7 +4342,9 @@ export class SupabaseSyncService {
       driveResult = await this._writeDriveSyncPayload({
         devices: {
           [this.deviceId]: normalizedLocal
-        }
+        },
+        ...(staleFromSupabase.length > 0 ? { deleteDeviceIds: staleFromSupabase } : {}),
+        currentDeviceId: this.deviceId
       }).catch(() => null);
     }
 
@@ -3894,6 +4365,8 @@ export class SupabaseSyncService {
     }
 
     const byId = new Map();
+    const supaDeviceIds = new Set();
+    const driveDeviceIds = new Set();
 
     if (this.isAuthenticated()) {
       try {
@@ -3901,6 +4374,7 @@ export class SupabaseSyncService {
         for (const row of Array.isArray(rows) ? rows : []) {
           const normalized = normalizeDeviceRecord(row, this.deviceId);
           if (normalized) {
+            supaDeviceIds.add(normalized.deviceId);
             byId.set(normalized.deviceId, normalized);
           }
         }
@@ -3919,6 +4393,7 @@ export class SupabaseSyncService {
           for (const rawDev of Object.values(drivePayload.devices)) {
             const normalized = normalizeDeviceRecord(rawDev, this.deviceId);
             if (!normalized) continue;
+            driveDeviceIds.add(normalized.deviceId);
             const existing = byId.get(normalized.deviceId);
             if (!existing || toEpochMs(normalized.lastSeenAt) >= toEpochMs(existing.lastSeenAt)) {
               byId.set(normalized.deviceId, {
@@ -3935,9 +4410,21 @@ export class SupabaseSyncService {
       }
     }
 
-    return Array.from(byId.values()).sort(
-      (a, b) => toEpochMs(b.lastSeenAt) - toEpochMs(a.lastSeenAt)
+    const { devices: dedupedDevices, staleDeviceIds } = deduplicateDevicesWithStaleIds(
+      Array.from(byId.values()),
+      this.deviceId
     );
+
+    if (staleDeviceIds.length > 0) {
+      const supaStale = staleDeviceIds.filter((id) => supaDeviceIds.has(id));
+      const driveStale = staleDeviceIds.filter((id) => driveDeviceIds.has(id));
+      await this._pruneStaleDevices(staleDeviceIds, {
+        pruneSupabase: supaStale.length > 0,
+        pruneDrive: driveStale.length > 0
+      }).catch(() => null);
+    }
+
+    return dedupedDevices;
   }
 
   /**
@@ -4219,9 +4706,19 @@ export class SupabaseSyncService {
           mediaType: item.isPodcast ? 'podcast' : (item.mediaType || 'audiobook'),
           ...(item.feedUrl ? { feedUrl: item.feedUrl } : {}),
           ...(item.lastFeedRefreshAt ? { lastFeedRefreshAt: item.lastFeedRefreshAt } : {}),
-          ...(item.episodeProgress && Object.keys(item.episodeProgress).length > 0
-            ? { episodeProgress: item.episodeProgress }
+          ...(item.isPodcast || (item.episodeProgress && Object.keys(item.episodeProgress).length > 0)
+            ? { episodeProgress: item.episodeProgress || {} }
             : {}),
+          ...(Number(item.totalListeningSec) > 0
+            ? { totalListeningSec: Number(item.totalListeningSec) }
+            : {}),
+          ...(Number(item.progressResetAt) > 0
+            ? { progressResetAt: Number(item.progressResetAt) }
+            : {}),
+          ...(item.lastPlayedAt ? { lastPlayedAt: item.lastPlayedAt } : {}),
+          ...(item.chapterIndex !== undefined ? { chapterIndex: Number(item.chapterIndex) || 0 } : {}),
+          ...(item.positionSec !== undefined ? { positionSec: Number(item.positionSec) || 0 } : {}),
+          ...(item.completed !== undefined ? { completed: Boolean(item.completed) } : {}),
           seriesOrder:
             item.seriesOrder != null && Number.isFinite(Number(item.seriesOrder))
               ? Number(item.seriesOrder)

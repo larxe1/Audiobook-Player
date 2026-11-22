@@ -99,19 +99,26 @@ function normalizeFeedUrlKey(feedUrl = '') {
   return String(feedUrl || '').trim().replace(/\/+$/, '').toLowerCase();
 }
 
-function mergeEpisodeProgress(existingMap = {}, incomingMap = {}) {
+function mergeEpisodeProgress(existingMap = {}, incomingMap = {}, progressResetAt = 0) {
   const a = existingMap && typeof existingMap === 'object' && !Array.isArray(existingMap) ? existingMap : {};
   const b = incomingMap && typeof incomingMap === 'object' && !Array.isArray(incomingMap) ? incomingMap : {};
+  const effectiveResetAt = parseTimestampMs(progressResetAt);
+  const isValidAfterReset = (entry) => {
+    if (!entry || typeof entry !== 'object') return false;
+    if (effectiveResetAt <= 0) return true;
+    return parseTimestampMs(entry.updatedAt) > effectiveResetAt;
+  };
   const merged = {};
   for (const epId of new Set([...Object.keys(a), ...Object.keys(b)])) {
-    const first = a[epId];
-    const second = b[epId];
+    const first = isValidAfterReset(a[epId]) ? a[epId] : null;
+    const second = isValidAfterReset(b[epId]) ? b[epId] : null;
+    if (!first && !second) continue;
     if (!first) {
-      if (second && typeof second === 'object') merged[epId] = { ...second };
+      merged[epId] = { ...second };
       continue;
     }
     if (!second) {
-      if (first && typeof first === 'object') merged[epId] = { ...first };
+      merged[epId] = { ...first };
       continue;
     }
     const firstTs = parseTimestampMs(first.updatedAt);
@@ -342,6 +349,26 @@ function parseTimestampMs(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function maxEpisodeProgressUpdatedAtMs(episodeProgress) {
+  if (!episodeProgress || typeof episodeProgress !== 'object' || Array.isArray(episodeProgress)) {
+    return 0;
+  }
+  let maxMs = 0;
+  for (const entry of Object.values(episodeProgress)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const ts = parseTimestampMs(entry.updatedAt);
+    if (ts > maxMs) maxMs = ts;
+  }
+  return maxMs;
+}
+
+function getEffectiveLastPlayedMs(item) {
+  return Math.max(
+    parseTimestampMs(item?.lastPlayedAt),
+    maxEpisodeProgressUpdatedAtMs(item?.episodeProgress)
+  );
+}
+
 /**
  * Merge duplicate audiobooks across Local Folders and Google Drive sharing the same
  * driveFileId or normalized bookKey, preferring 'local' playback whenever a local copy exists.
@@ -389,10 +416,17 @@ export function deduplicateLibraryItems(items = []) {
     const rawProgress = Number(raw.progress ?? 0) || 0;
     const rawDuration = Number(raw.totalDurationSec ?? raw.durationSec ?? 0) || 0;
     const rawChapterIdx = Number(raw.chapterIndex ?? 0) || 0;
+    const rawTotalListeningSec = Math.max(0, Number(raw.totalListeningSec ?? 0) || 0);
+    const rawProgressResetAt = parseTimestampMs(raw.progressResetAt);
+    const rawPlayedMs = getEffectiveLastPlayedMs(raw);
+    const rawResetNewer = rawProgressResetAt > 0 && rawPlayedMs <= rawProgressResetAt;
     const rawOffline = Boolean(raw.isOffline || raw.offline || rawSources.has('local'));
 
     if (!byKey.has(mapKey)) {
       const sources = orderSources(rawSources);
+      const initPos = rawResetNewer ? 0 : rawPos;
+      const initProgress = rawResetNewer ? 0 : rawProgress;
+      const initChapterIdx = rawResetNewer ? 0 : rawChapterIdx;
       const created = {
         ...raw,
         id: raw.id || key,
@@ -406,16 +440,14 @@ export function deduplicateLibraryItems(items = []) {
         driveStreamUrl: raw.driveStreamUrl || (raw.driveFileId ? buildDriveStreamUrl(raw.driveFileId) : ''),
         isOffline: rawOffline,
         offline: rawOffline,
+        ...(rawResetNewer ? { completed: false } : {}),
         ...(isPodcast
           ? {
               isPodcast: true,
               mediaType: 'podcast',
               feedUrl: raw.feedUrl || '',
               lastFeedRefreshAt: raw.lastFeedRefreshAt || '',
-              episodeProgress:
-                raw.episodeProgress && typeof raw.episodeProgress === 'object'
-                  ? { ...raw.episodeProgress }
-                  : {}
+              episodeProgress: mergeEpisodeProgress(raw.episodeProgress, {}, rawProgressResetAt)
             }
           : {}),
         chapters: Array.isArray(raw.chapters) ? [...raw.chapters] : [],
@@ -424,11 +456,13 @@ export function deduplicateLibraryItems(items = []) {
           raw.seriesOrder != null && Number.isFinite(Number(raw.seriesOrder))
             ? Number(raw.seriesOrder)
             : null,
-        positionSec: rawPos,
-        progressSec: rawPos,
-        progress: rawProgress,
-        chapterIndex: rawChapterIdx,
+        positionSec: initPos,
+        progressSec: initPos,
+        progress: initProgress,
+        chapterIndex: initChapterIdx,
         totalDurationSec: rawDuration,
+        totalListeningSec: rawTotalListeningSec,
+        progressResetAt: rawProgressResetAt,
       };
       byKey.set(mapKey, created);
       if (!isPodcast) {
@@ -443,14 +477,56 @@ export function deduplicateLibraryItems(items = []) {
     const mergedSourceSet = new Set([...existing.sources, ...rawSources]);
     const sources = orderSources(mergedSourceSet);
 
+    const mergedTotalListeningSec = Math.max(
+      0,
+      Number(existing.totalListeningSec ?? 0) || 0,
+      rawTotalListeningSec
+    );
+    const mergedProgressResetAt = Math.max(
+      parseTimestampMs(existing.progressResetAt),
+      rawProgressResetAt
+    );
+
+    const existingPlayedMs = getEffectiveLastPlayedMs(existing);
+    const latestPlayedMs = Math.max(existingPlayedMs, rawPlayedMs);
+    const isResetNewer = mergedProgressResetAt > 0 && latestPlayedMs <= mergedProgressResetAt;
+    const existingPreReset = mergedProgressResetAt > 0 && existingPlayedMs <= mergedProgressResetAt;
+    const incomingPreReset = mergedProgressResetAt > 0 && rawPlayedMs <= mergedProgressResetAt;
+
     const existingPos = Number(existing.positionSec ?? existing.progressSec ?? 0) || 0;
-    const useIncomingProgress = rawPos > existingPos;
-    const bestPos = Math.max(existingPos, rawPos);
-    const bestProgress = Math.max(Number(existing.progress ?? 0) || 0, rawProgress);
     const bestDuration = Math.max(Number(existing.totalDurationSec ?? 0) || 0, rawDuration);
-    const bestChapterIndex = useIncomingProgress
-      ? rawChapterIdx
-      : (rawPos === existingPos ? Math.max(existing.chapterIndex || 0, rawChapterIdx) : (existing.chapterIndex || 0));
+    let bestPos;
+    let bestProgress;
+    let bestChapterIndex;
+    let mergedCompleted;
+
+    if (isResetNewer) {
+      bestPos = 0;
+      bestProgress = 0;
+      bestChapterIndex = 0;
+      mergedCompleted = false;
+    } else if (existingPreReset && !incomingPreReset) {
+      bestPos = rawPos;
+      bestProgress = rawProgress;
+      bestChapterIndex = rawChapterIdx;
+      mergedCompleted = raw.completed !== undefined ? Boolean(raw.completed) : false;
+    } else if (!existingPreReset && incomingPreReset) {
+      bestPos = existingPos;
+      bestProgress = Number(existing.progress ?? 0) || 0;
+      bestChapterIndex = existing.chapterIndex || 0;
+      mergedCompleted = existing.completed !== undefined ? Boolean(existing.completed) : false;
+    } else {
+      const useIncomingProgress = rawPos > existingPos;
+      bestPos = Math.max(existingPos, rawPos);
+      bestProgress = Math.max(Number(existing.progress ?? 0) || 0, rawProgress);
+      bestChapterIndex = useIncomingProgress
+        ? rawChapterIdx
+        : (rawPos === existingPos ? Math.max(existing.chapterIndex || 0, rawChapterIdx) : (existing.chapterIndex || 0));
+      mergedCompleted =
+        existing.completed !== undefined || raw.completed !== undefined
+          ? (existing.completed !== undefined ? Boolean(existing.completed) : Boolean(raw.completed))
+          : undefined;
+    }
 
     const existingTs = parseTimestampMs(existing.clientUpdatedAt || existing.lastPlayedAt);
     const incomingTs = parseTimestampMs(raw.clientUpdatedAt || raw.lastPlayedAt);
@@ -510,9 +586,7 @@ export function deduplicateLibraryItems(items = []) {
       ...(existing.offlineCached !== undefined || raw.offlineCached !== undefined
         ? { offlineCached: Boolean(existing.offlineCached ?? raw.offlineCached) }
         : {}),
-      ...(existing.completed !== undefined || raw.completed !== undefined
-        ? { completed: existing.completed !== undefined ? Boolean(existing.completed) : Boolean(raw.completed) }
-        : {}),
+      ...(mergedCompleted !== undefined ? { completed: mergedCompleted } : {}),
       ...(isPodcast
         ? {
             isPodcast: true,
@@ -522,7 +596,7 @@ export function deduplicateLibraryItems(items = []) {
               preferIncomingFeed
                 ? raw.lastFeedRefreshAt
                 : (existing.lastFeedRefreshAt || raw.lastFeedRefreshAt || ''),
-            episodeProgress: mergeEpisodeProgress(existing.episodeProgress, raw.episodeProgress),
+            episodeProgress: mergeEpisodeProgress(existing.episodeProgress, raw.episodeProgress, mergedProgressResetAt),
             hasOfflineEpisodes: Boolean(
               mergedChapters.some((c) => Boolean(c?.offlineCached)) ||
                 existing.hasOfflineEpisodes ||
@@ -537,6 +611,8 @@ export function deduplicateLibraryItems(items = []) {
       progress: bestProgress,
       chapterIndex: bestChapterIndex,
       totalDurationSec: bestDuration,
+      totalListeningSec: mergedTotalListeningSec,
+      progressResetAt: mergedProgressResetAt,
       ...(existing.enrichmentCheckedAt || raw.enrichmentCheckedAt
         ? { enrichmentCheckedAt: existing.enrichmentCheckedAt || raw.enrichmentCheckedAt }
         : {}),

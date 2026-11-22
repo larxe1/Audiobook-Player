@@ -814,19 +814,55 @@ export function createPodcastBookItem(parsedFeed = {}, existingBook = null) {
     String(parsedFeed.coverUrl || existingBook?.coverUrl || '').trim() ||
     buildDefaultPodcastCover(title, 0);
 
-  // Clone and update episodeProgress map
-  const episodeProgress = {
-    ...(existingBook?.episodeProgress && typeof existingBook.episodeProgress === 'object'
-      ? existingBook.episodeProgress
-      : {}),
+  const parseResetMs = (val) => {
+    if (typeof val === 'number') return Number.isFinite(val) ? val : 0;
+    if (typeof val === 'string' && val.trim()) {
+      const asNum = Number(val);
+      if (Number.isFinite(asNum)) return asNum;
+      const parsed = Date.parse(val);
+      return Number.isFinite(parsed) ? parsed : 0;
+    }
+    return 0;
   };
+
+  const totalListeningSec = Math.max(
+    0,
+    Number(existingBook?.totalListeningSec) || 0,
+    Number(parsedFeed?.totalListeningSec) || 0
+  );
+  const progressResetAt = Math.max(
+    parseResetMs(existingBook?.progressResetAt),
+    parseResetMs(parsedFeed?.progressResetAt)
+  );
+
+  // Clone and filter episodeProgress map against progressResetAt
+  const episodeProgress = {};
+  if (existingBook?.episodeProgress && typeof existingBook.episodeProgress === 'object') {
+    for (const [epId, entry] of Object.entries(existingBook.episodeProgress)) {
+      if (!entry || typeof entry !== 'object') continue;
+      if (progressResetAt > 0 && parseResetMs(entry.updatedAt) <= progressResetAt) {
+        continue;
+      }
+      episodeProgress[epId] = { ...entry };
+    }
+  }
 
   const prevChapters = Array.isArray(existingBook?.chapters) ? existingBook.chapters : [];
   const prevChapterIndex = Number(existingBook?.chapterIndex) || 0;
   const prevActiveChapter = prevChapters[prevChapterIndex] || null;
   const prevActiveEpisodeId = prevActiveChapter?.episodeId || existingBook?.activeEpisodeId || null;
+  let maxEpisodeProgressMs = 0;
+  for (const entry of Object.values(episodeProgress)) {
+    const ts = parseResetMs(entry?.updatedAt);
+    if (ts > maxEpisodeProgressMs) maxEpisodeProgressMs = ts;
+  }
+  const existingLastPlayedMs = Math.max(
+    parseResetMs(existingBook?.lastPlayedAt),
+    maxEpisodeProgressMs
+  );
+  const isResetNewer = progressResetAt > 0 && existingLastPlayedMs <= progressResetAt;
 
-  if (prevActiveEpisodeId && Number(existingBook?.positionSec) > 0) {
+  if (!isResetNewer && prevActiveEpisodeId && Number(existingBook?.positionSec) > 0) {
     const existingEntry = episodeProgress[prevActiveEpisodeId] || {};
     const pos = Math.max(Number(existingBook.positionSec) || 0, Number(existingEntry.positionSec) || 0);
     const dur = Number(prevActiveChapter?.durationSec) || Number(existingEntry.durationSec) || 1800;
@@ -879,19 +915,21 @@ export function createPodcastBookItem(parsedFeed = {}, existingBook = null) {
   let chapterIndex = 0;
   let positionSec = 0;
 
-  if (prevActiveEpisodeId && chapters.length > 0) {
-    const matchedIdx = chapters.findIndex((ch) => ch.episodeId === prevActiveEpisodeId);
-    if (matchedIdx >= 0) {
-      chapterIndex = matchedIdx;
-      const savedProg = episodeProgress[prevActiveEpisodeId];
-      positionSec =
-        Number(existingBook?.positionSec) > 0
-          ? Number(existingBook.positionSec)
-          : Number(savedProg?.positionSec || 0);
+  if (!isResetNewer) {
+    if (prevActiveEpisodeId && chapters.length > 0) {
+      const matchedIdx = chapters.findIndex((ch) => ch.episodeId === prevActiveEpisodeId);
+      if (matchedIdx >= 0) {
+        chapterIndex = matchedIdx;
+        const savedProg = episodeProgress[prevActiveEpisodeId];
+        positionSec =
+          Number(existingBook?.positionSec) > 0
+            ? Number(existingBook.positionSec)
+            : Number(savedProg?.positionSec || 0);
+      }
+    } else if (chapters.length > 0) {
+      const firstEpId = chapters[0].episodeId;
+      positionSec = Number(episodeProgress[firstEpId]?.positionSec || 0);
     }
-  } else if (chapters.length > 0) {
-    const firstEpId = chapters[0].episodeId;
-    positionSec = Number(episodeProgress[firstEpId]?.positionSec || 0);
   }
 
   const totalDurationSec =
@@ -915,7 +953,10 @@ export function createPodcastBookItem(parsedFeed = {}, existingBook = null) {
     source: 'podcast',
     chapterIndex,
     positionSec,
+    ...(isResetNewer ? { completed: false } : {}),
     totalDurationSec,
+    totalListeningSec,
+    progressResetAt,
     episodeProgress,
     hasOfflineEpisodes,
     offlineCached: hasOfflineEpisodes,

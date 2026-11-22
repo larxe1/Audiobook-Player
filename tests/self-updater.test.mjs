@@ -328,9 +328,17 @@ test('enforceMandatoryUpdate handles Android APK CI polling, native bridge insta
     /Server is finalizing the Android APK package/i
   );
 
+  const card = elementsById.get('mandatory-update-card');
+  assert.ok(card, '#mandatory-update-card must exist');
+  assert.equal(
+    card.children.some((ch) => /MANDATORY UPDATE/i.test(String(ch?.textContent || ''))),
+    false,
+    'MANDATORY UPDATE badge must be removed from mandatory update gate'
+  );
+
   const installBtn = elementsById.get('mandatory-update-action-btn');
-  assert.equal(installBtn.style.display, 'block');
-  assert.equal(installBtn.textContent, 'Install Update Now');
+  assert.equal(installBtn.style.display, 'none', 'action button must stay hidden during CI polling (!pkg.ready)');
+  assert.doesNotMatch(String(installBtn.textContent || ''), /Install Update Now/i);
 
   // Flip CI release to ready and let poll interval auto-download
   releaseReady = true;
@@ -341,6 +349,11 @@ test('enforceMandatoryUpdate handles Android APK CI polling, native bridge insta
     apkCalls[0],
     'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.13/Audiobook-Player.apk?v=1.0.13-14'
   );
+  assert.equal(installBtn.style.display, 'none', 'action button must remain hidden while downloading');
+
+  // Simulate downloading progress
+  windowObj.__onAndroidUpdateProgress({ status: 'downloading', progress: 45 });
+  assert.equal(installBtn.style.display, 'none');
 
   // Simulate permission_required followed by returning to app (focus)
   windowObj.__onAndroidUpdateProgress({
@@ -348,6 +361,8 @@ test('enforceMandatoryUpdate handles Android APK CI polling, native bridge insta
     message: 'Allow Install unknown apps for MultiPlayer.'
   });
   assert.match(elementsById.get('mandatory-update-status').textContent, /Allow Install unknown apps/i);
+  assert.equal(installBtn.style.display, 'block');
+  assert.equal(installBtn.textContent, 'Grant Install Permission');
   windowObj.dispatchEvent('focus');
   assert.equal(apkCalls.length, 2);
 
@@ -357,7 +372,7 @@ test('enforceMandatoryUpdate handles Android APK CI polling, native bridge insta
     elementsById.get('mandatory-update-status').textContent,
     /Android installer ready — tap 'Update' when prompted by Android/i
   );
-  assert.equal(installBtn.disabled, false);
+  assert.equal(installBtn.style.display, 'none', 'action button must stay hidden during installing');
 
   service.destroy();
 });
@@ -810,4 +825,109 @@ test('Android Web OTA clears WebView caches & SW registrations and never falls b
   assert.deepEqual(webOtaCalls, [
     'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.21/web-bundle.zip'
   ]);
+});
+
+test('enforceMandatoryUpdate falls back to Web OTA when APK is 404 and waits cleanly without 404 button when neither asset is ready', async () => {
+  // Case 1: APK asset missing on release tag, but web-bundle.zip IS published -> auto fallback to startWebOtaUpdate
+  const dom1 = createMockDom();
+  const webOtaCalls1 = [];
+  const apkCalls1 = [];
+  dom1.windowObj.location.origin = 'https://localhost';
+  dom1.windowObj.location.protocol = 'https:';
+  dom1.windowObj.Capacitor = { isNativePlatform: () => true };
+  dom1.windowObj.AudiobookUpdaterNative = {
+    getNativeBuild: () => 21,
+    startWebOtaUpdate: (url) => webOtaCalls1.push(url),
+    startApkUpdate: (url) => apkCalls1.push(url)
+  };
+
+  const service1 = new SelfUpdaterService({
+    currentVersion: '1.0.20',
+    currentBuild: 21,
+    windowObj: dom1.windowObj,
+    documentObj: dom1.documentObj,
+    navigatorObj: { userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    storage: null,
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        tag_name: 'v1.0.22',
+        assets: [
+          {
+            name: 'web-bundle.zip',
+            browser_download_url: 'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.22/web-bundle.zip'
+          }
+        ]
+      })
+    })
+  });
+
+  assert.equal(
+    service1.getWebOtaBundleUrl({
+      version: '1.0.22',
+      build: 23,
+      webBundleUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip'
+    }),
+    'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.22/web-bundle.zip?v=1.0.22-23'
+  );
+
+  const fallbackRes = await service1.enforceMandatoryUpdate({
+    latestVersion: '1.0.22',
+    latestBuild: 23,
+    minNativeBuild: 23,
+    apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk',
+    webBundleUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip'
+  });
+
+  assert.equal(fallbackRes.enforced, true);
+  assert.equal(fallbackRes.deliveryMode, 'web-ota');
+  assert.equal(fallbackRes.fallbackFromApk, true);
+  assert.equal(apkCalls1.length, 0);
+  assert.deepEqual(webOtaCalls1, [
+    'https://github.com/larxe1/Audiobook-Player/releases/download/v1.0.22/web-bundle.zip?v=1.0.22-23'
+  ]);
+  assert.equal(dom1.elementsById.get('mandatory-update-action-btn').style.display, 'none');
+  service1.destroy();
+
+  // Case 2: Entire release tag is 404 (CI still running) -> waits cleanly, hides action button, never calls 404 URL
+  const dom2 = createMockDom();
+  const webOtaCalls2 = [];
+  const apkCalls2 = [];
+  dom2.windowObj.location.origin = 'https://localhost';
+  dom2.windowObj.location.protocol = 'https:';
+  dom2.windowObj.Capacitor = { isNativePlatform: () => true };
+  dom2.windowObj.AudiobookUpdaterNative = {
+    getNativeBuild: () => 21,
+    startWebOtaUpdate: (url) => webOtaCalls2.push(url),
+    startApkUpdate: (url) => apkCalls2.push(url)
+  };
+
+  const service2 = new SelfUpdaterService({
+    currentVersion: '1.0.20',
+    currentBuild: 21,
+    windowObj: dom2.windowObj,
+    documentObj: dom2.documentObj,
+    navigatorObj: { userAgent: 'Mozilla/5.0 (Linux; Android 14)' },
+    storage: null,
+    fetchImpl: async () => ({ ok: false, status: 404 })
+  });
+
+  const waitRes = await service2.enforceMandatoryUpdate(
+    {
+      latestVersion: '1.0.22',
+      latestBuild: 23,
+      minNativeBuild: 23,
+      apkDownloadUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk',
+      webBundleUrl: 'https://github.com/larxe1/Audiobook-Player/releases/latest/download/web-bundle.zip'
+    },
+    { enablePolling: false }
+  );
+
+  assert.equal(waitRes.enforced, true);
+  assert.equal(waitRes.waitingForCi, true);
+  assert.equal(apkCalls2.length, 0);
+  assert.equal(webOtaCalls2.length, 0);
+  assert.equal(dom2.elementsById.get('mandatory-update-action-btn').style.display, 'none');
+  service2.destroy();
 });

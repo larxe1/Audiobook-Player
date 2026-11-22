@@ -118,6 +118,9 @@ jobs:
           npx cap sync android
           rm -rf android/app/src/main/res/mipmap-anydpi-v26
           rm -f android/app/src/main/res/drawable/ic_launcher* android/app/src/main/res/drawable-v24/ic_launcher*
+          if ! command -v convert >/dev/null 2>&1 && ! command -v magick >/dev/null 2>&1 && ! command -v ffmpeg >/dev/null 2>&1 && ! python3 -c "import PIL" >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3-pil || true
+          fi
           resize_icon() {
             local size="$1"
             local out="$2"
@@ -127,8 +130,10 @@ jobs:
               magick public/icon-512.png -resize "${size}x${size}!" "$out"
             elif command -v ffmpeg >/dev/null 2>&1; then
               ffmpeg -y -loglevel error -i public/icon-512.png -vf "scale=${size}:${size}:flags=lanczos" "$out"
+            elif python3 -c "import PIL" >/dev/null 2>&1; then
+              python3 -c "from PIL import Image; resample = getattr(Image, 'Resampling', Image).LANCZOS; Image.open('public/icon-512.png').resize((${size},${size}), resample).save('${out}')"
             else
-              python3 -c "from PIL import Image; Image.open('public/icon-512.png').resize((${size},${size}), Image.Resampling.LANCZOS).save('${out}')"
+              cp public/icon-512.png "$out"
             fi
           }
           for spec in "mdpi:48" "hdpi:72" "xhdpi:96" "xxhdpi:144" "xxxhdpi:192"; do
