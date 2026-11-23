@@ -133,8 +133,8 @@ test('importing self-updater.js in a browser/DOM env does not auto-start a block
 });
 
 test('isNewerUpdate and appendCacheBustParam handle GitHub Releases null builds and custom builds', () => {
-  assert.equal(LOCAL_VERSION, '1.0.23');
-  assert.equal(LOCAL_BUILD, 24);
+  assert.equal(LOCAL_VERSION, '1.0.24');
+  assert.equal(LOCAL_BUILD, 25);
   assert.equal(isNewerUpdate('1.0.24', null, '1.0.23', 24), true);
   assert.equal(isNewerUpdate('1.0.23', null, '1.0.23', 24), false);
   assert.equal(isNewerUpdate('1.0.23', 25, '1.0.23', 24), true);

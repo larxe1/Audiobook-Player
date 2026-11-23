@@ -2486,3 +2486,131 @@ test('Search scope isolation, PC left Back button, In-App Volume control, and Tr
     env.restore();
   }
 });
+
+test('Desktop Now Playing panel, transport bar, and Android mobile mini-player dock stay visible across viewports', () => {
+  const env = createDomEnv({ innerWidth: 900 });
+  let app = null;
+  try {
+    let viewTransitionCalls = 0;
+    env.mockDocument.startViewTransition = (cb) => {
+      viewTransitionCalls += 1;
+      cb();
+      return { finished: Promise.resolve() };
+    };
+
+    app = new AudiobookApp(env.rootEl);
+    app._enrichSingleBookInBackground = async () => {};
+    app._runBackgroundMetadataEnrichment = async () => {};
+    app.guestLocalMode = true;
+    const book = makeBook(1, { title: 'Foundation', author: 'Isaac Asimov', series: '' });
+
+    // a & b: Desktop at 900px, 960px, and 1280px in both active and idle states
+    for (const width of [900, 960, 1280]) {
+      env.mockWindow.innerWidth = width;
+
+      // Active state
+      app.books = [book];
+      app.state.activeBookKey = book.bookKey;
+      app.state.rightPanelOpen = true;
+      app.render();
+
+      const shell = env.rootEl.querySelector('.app-viewport-shell');
+      assert.ok(shell, `Desktop ${width}px must render .app-viewport-shell`);
+      const panelActive = shell.querySelector('#desktopNowPlayingPanel');
+      assert.ok(panelActive, `Desktop ${width}px active state must render #desktopNowPlayingPanel`);
+      assert.equal(panelActive.classList.contains('hidden'), false, `#desktopNowPlayingPanel must not have hidden at ${width}px`);
+      assert.equal(panelActive.classList.contains('lg:flex'), false, `#desktopNowPlayingPanel must not have lg:flex at ${width}px`);
+      assert.ok(panelActive.classList.contains('desktop-now-playing-panel'));
+      assert.ok(shell.querySelector('#desktopTransportBar'), `Desktop ${width}px active state must render #desktopTransportBar inside .app-viewport-shell`);
+
+      // Idle state (no books)
+      app.books = [];
+      app.state.activeBookKey = null;
+      app.render();
+
+      const shellIdle = env.rootEl.querySelector('.app-viewport-shell');
+      assert.ok(shellIdle, `Desktop ${width}px idle state must render .app-viewport-shell`);
+      const panelIdle = shellIdle.querySelector('#desktopNowPlayingPanel');
+      assert.ok(panelIdle, `Desktop ${width}px idle state must render #desktopNowPlayingPanel`);
+      assert.equal(panelIdle.classList.contains('hidden'), false);
+      assert.equal(panelIdle.classList.contains('lg:flex'), false);
+      assert.ok(shellIdle.querySelector('#desktopTransportBar'), `Desktop ${width}px idle state must render #desktopTransportBar inside .app-viewport-shell`);
+    }
+
+    // Restore active book at 960px and verify toggle-right-panel & toggle-sidebar are zero-blink
+    env.mockWindow.innerWidth = 960;
+    app.books = [book];
+    app.state.activeBookKey = book.bookKey;
+    app.state.rightPanelOpen = true;
+    app.state.sidebarCollapsed = false;
+    app.render();
+
+    const toggleRightBtn = env.rootEl.querySelector('[data-action="toggle-right-panel"]');
+    assert.ok(toggleRightBtn);
+    viewTransitionCalls = 0;
+    toggleRightBtn.click();
+    assert.equal(app.state.rightPanelOpen, false);
+    assert.equal(env.rootEl.querySelector('#desktopNowPlayingPanel'), null, '#desktopNowPlayingPanel must disappear when toggled off');
+    assert.equal(viewTransitionCalls, 0, 'toggle-right-panel must not call document.startViewTransition');
+
+    toggleRightBtn.click();
+    assert.equal(app.state.rightPanelOpen, true);
+    assert.ok(env.rootEl.querySelector('#desktopNowPlayingPanel'));
+    assert.equal(viewTransitionCalls, 0, 're-opening right panel must not call document.startViewTransition');
+
+    const toggleSidebarBtn = env.rootEl.querySelector('[data-action="toggle-sidebar"]');
+    assert.ok(toggleSidebarBtn);
+    toggleSidebarBtn.click();
+    assert.equal(app.state.sidebarCollapsed, true);
+    assert.equal(viewTransitionCalls, 0, 'toggle-sidebar must not call document.startViewTransition');
+
+    // c: Mobile at 390px (active + idle + full sheet)
+    env.mockWindow.innerWidth = 390;
+
+    // Mobile active state
+    app.books = [book];
+    app.state.activeBookKey = book.bookKey;
+    app.state.mobileSheetOpen = false;
+    app.render();
+
+    const mainActive = env.rootEl.querySelector('main');
+    assert.ok(mainActive, 'Mobile active state must render <main>');
+    assert.equal(mainActive.classList.contains('app-viewport-shell'), true);
+    assert.equal(mainActive.classList.contains('h-screen'), false);
+    const dockActive = mainActive.querySelector('#mobileMiniPlayerDock');
+    assert.ok(dockActive, 'Mobile active state must render #mobileMiniPlayerDock');
+    assert.equal(dockActive.classList.contains('mobile-mini-player-dock'), true);
+    assert.equal(dockActive.classList.contains('shrink-0'), true);
+    assert.equal(dockActive.classList.contains('absolute'), false);
+    assert.equal(dockActive.classList.contains('bottom-3'), false);
+
+    // Mobile full sheet uses fixed inset-0
+    app.state.mobileSheetOpen = true;
+    app.render();
+    const sheetEl = env.rootEl.querySelector('#mobileSheetScroll');
+    assert.ok(sheetEl, 'Mobile full sheet must render #mobileSheetScroll');
+    assert.equal(sheetEl.classList.contains('fixed'), true);
+    assert.equal(sheetEl.classList.contains('inset-0'), true);
+    assert.equal(sheetEl.classList.contains('absolute'), false);
+
+    // Mobile idle state (no books)
+    app.state.mobileSheetOpen = false;
+    app.books = [];
+    app.state.activeBookKey = null;
+    app.render();
+
+    const mainIdle = env.rootEl.querySelector('main');
+    assert.ok(mainIdle);
+    assert.equal(mainIdle.classList.contains('app-viewport-shell'), true);
+    assert.equal(mainIdle.classList.contains('h-screen'), false);
+    const dockIdle = mainIdle.querySelector('#mobileMiniPlayerDock');
+    assert.ok(dockIdle, 'Mobile idle state must render #mobileMiniPlayerDock');
+    assert.equal(dockIdle.classList.contains('mobile-mini-player-dock'), true);
+    assert.equal(dockIdle.classList.contains('shrink-0'), true);
+    assert.equal(dockIdle.classList.contains('absolute'), false);
+    assert.equal(dockIdle.classList.contains('bottom-3'), false);
+  } finally {
+    app?.destroy?.();
+    env.restore();
+  }
+});

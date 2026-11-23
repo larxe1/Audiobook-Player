@@ -1,5 +1,5 @@
-export const LOCAL_VERSION = '1.0.23';
-export const LOCAL_BUILD = 24;
+export const LOCAL_VERSION = '1.0.24';
+export const LOCAL_BUILD = 25;
 
 export const DEFAULT_MANIFEST_URL =
   'https://api.github.com/repos/larxe1/Audiobook-Player/releases/latest';

@@ -74,6 +74,7 @@ body {
   margin: 0;
   padding: 0;
   min-height: 100%;
+  height: 100%;
   background-color: var(--bg-canvas);
   color: var(--text-primary);
   font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -81,6 +82,10 @@ body {
   -moz-osx-font-smoothing: grayscale;
   overflow-x: hidden;
   transition: background-color 300ms var(--ease-spring), color 300ms var(--ease-spring);
+}
+
+#appRoot {
+  height: 100%;
 }
 
 .watchCoverBackdrop {
@@ -551,6 +556,35 @@ input[type="range"]::-moz-range-thumb {
   animation: livePulse 1.8s ease-in-out infinite;
 }
 
+/* Viewport & Layout Shell Guards */
+.app-viewport-shell {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
+}
+
+.desktop-transport-bar {
+  flex-shrink: 0;
+  min-height: 5rem;
+}
+
+.desktop-now-playing-panel {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.mobile-mini-player-dock {
+  flex-shrink: 0;
+  position: relative;
+  z-index: 20;
+}
+
 /* Mobile Safe Area & Scrollbar Utilities */
 .mobile-safe-top {
   padding-top: calc(0.75rem + max(env(safe-area-inset-top, 0px), var(--android-safe-top, 0px))) !important;
@@ -566,6 +600,10 @@ input[type="range"]::-moz-range-thumb {
 
 .mobile-safe-miniplayer {
   bottom: calc(0.75rem + max(env(safe-area-inset-bottom, 0px), var(--android-safe-bottom, 0px))) !important;
+}
+
+.mobile-safe-miniplayer-dock {
+  padding-bottom: calc(0.75rem + max(env(safe-area-inset-bottom, 0px), var(--android-safe-bottom, 0px))) !important;
 }
 
 .mobile-safe-scroll-bottom {

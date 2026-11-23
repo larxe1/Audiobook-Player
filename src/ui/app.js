@@ -6821,9 +6821,9 @@ class AudiobookApp {
       }">${label}</button>`;
 
     return `
-      <main class="relative w-full h-screen h-[100dvh] ambient-surface overflow-hidden flex flex-col">
+      <main class="app-viewport-shell relative w-full ambient-surface overflow-hidden flex flex-col">
         <!-- Mobile Top Header -->
-        <div class="px-4 pb-2 mobile-safe-top flex items-center justify-between gap-2">
+        <div class="px-4 pb-2 mobile-safe-top shrink-0 flex items-center justify-between gap-2">
           <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar min-w-0">
             <div class="flex items-center gap-1.5 shrink-0 pr-1">
               <img src="./public/icon-192.png" alt="" class="app-brand-icon" style="width:22px;height:22px;border-radius:6px;object-fit:cover;flex-shrink:0;" />
@@ -6843,7 +6843,7 @@ class AudiobookApp {
         ${this._renderWorkspaceBanners()}
 
         <!-- Mobile Scrollable Content -->
-        <div id="mobileMainScroll" class="ui-view-enter flex-1 overflow-y-auto px-4 pb-24 mobile-safe-scroll-bottom space-y-6 min-w-0 flex flex-col">
+        <div id="mobileMainScroll" class="ui-view-enter flex-1 overflow-y-auto px-4 pb-4 min-h-0 space-y-6 min-w-0 flex flex-col">
           ${this._renderContinueFromDeviceCard()}
           ${
             isPodcastTab && filtered.length === 0
@@ -6930,39 +6930,43 @@ class AudiobookApp {
         ${
           activeBook
             ? `
-        <div class="absolute inset-x-3 bottom-3 mobile-safe-miniplayer z-20 rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
-          <div class="p-2.5 flex items-center gap-3 min-w-0">
-            <button data-action="open-mobile-sheet" class="w-11 h-11 rounded-xl overflow-hidden shrink-0">
-              ${this._renderCoverImg(activeBook)}
-            </button>
-            <button data-action="open-mobile-sheet" class="min-w-0 flex-1 text-left">
-              <div class="text-xs font-semibold text-white truncate">${escapeHtml(activeBook.title)}</div>
-              <div class="text-[11px] text-[var(--text-secondary)] truncate">${escapeHtml(activeBook.chapters?.[snap.chapterIndex]?.title || activeBook.author)}</div>
-            </button>
-            <button data-action="bookmark" aria-label="Bookmark" class="btn-press p-2 text-[#1ed760] shrink-0">${ICON_BOOKMARK(17)}</button>
-            <button data-action="toggle-play" aria-label="Play or Pause" class="play-fab w-9 h-9 shrink-0">
-              ${snap.playing ? ICON_PAUSE(16) : ICON_PLAY(16)}
-            </button>
-          </div>
-          <div class="h-0.5 w-full bg-white/10">
-            <div data-ab-progress-fill class="h-full bg-[#1ed760]" style="width:${pct.toFixed(2)}%"></div>
+        <div id="mobileMiniPlayerDock" class="mobile-mini-player-dock shrink-0 px-3 pt-2 mobile-safe-miniplayer-dock z-20">
+          <div class="rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
+            <div class="p-2.5 flex items-center gap-3 min-w-0">
+              <button data-action="open-mobile-sheet" class="w-11 h-11 rounded-xl overflow-hidden shrink-0">
+                ${this._renderCoverImg(activeBook)}
+              </button>
+              <button data-action="open-mobile-sheet" class="min-w-0 flex-1 text-left">
+                <div class="text-xs font-semibold text-white truncate">${escapeHtml(activeBook.title)}</div>
+                <div class="text-[11px] text-[var(--text-secondary)] truncate">${escapeHtml(activeBook.chapters?.[snap.chapterIndex]?.title || activeBook.author)}</div>
+              </button>
+              <button data-action="bookmark" aria-label="Bookmark" class="btn-press p-2 text-[#1ed760] shrink-0">${ICON_BOOKMARK(17)}</button>
+              <button data-action="toggle-play" aria-label="Play or Pause" class="play-fab w-9 h-9 shrink-0">
+                ${snap.playing ? ICON_PAUSE(16) : ICON_PLAY(16)}
+              </button>
+            </div>
+            <div class="h-0.5 w-full bg-white/10">
+              <div data-ab-progress-fill class="h-full bg-[#1ed760]" style="width:${pct.toFixed(2)}%"></div>
+            </div>
           </div>
         </div>`
             : `
-        <div class="absolute inset-x-3 bottom-3 mobile-safe-miniplayer z-20 rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
-          <div class="p-2.5 flex items-center gap-3 min-w-0">
-            <div class="w-11 h-11 rounded-xl bg-white/5 border border-[var(--border-subtle)] flex items-center justify-center text-[var(--text-muted)] shrink-0">
-              ${ICON_LIBRARY(18)}
+        <div id="mobileMiniPlayerDock" class="mobile-mini-player-dock shrink-0 px-3 pt-2 mobile-safe-miniplayer-dock z-20">
+          <div class="rounded-2xl surface-panel border border-white/10 shadow-2xl overflow-hidden backdrop-blur-xl">
+            <div class="p-2.5 flex items-center gap-3 min-w-0">
+              <div class="w-11 h-11 rounded-xl bg-white/5 border border-[var(--border-subtle)] flex items-center justify-center text-[var(--text-muted)] shrink-0">
+                ${ICON_LIBRARY(18)}
+              </div>
+              <div class="min-w-0 flex-1">
+                <div class="text-xs font-semibold text-white truncate">No audiobook playing</div>
+                <div class="text-[11px] text-[var(--text-secondary)] truncate">Library idle</div>
+              </div>
+              <button disabled aria-label="Play or Pause" class="play-fab w-9 h-9 shrink-0 opacity-40 cursor-not-allowed">
+                ${ICON_PLAY(16)}
+              </button>
             </div>
-            <div class="min-w-0 flex-1">
-              <div class="text-xs font-semibold text-white truncate">No audiobook playing</div>
-              <div class="text-[11px] text-[var(--text-secondary)] truncate">Library idle</div>
-            </div>
-            <button disabled aria-label="Play or Pause" class="play-fab w-9 h-9 shrink-0 opacity-40 cursor-not-allowed">
-              ${ICON_PLAY(16)}
-            </button>
+            <div class="h-0.5 w-full bg-white/10"></div>
           </div>
-          <div class="h-0.5 w-full bg-white/10"></div>
         </div>`
         }
 
@@ -6985,7 +6989,7 @@ class AudiobookApp {
         : '';
 
     return `
-      <div id="mobileSheetScroll" class="sheet-modal${noAnimCls} ambient-surface absolute inset-0 z-30 flex flex-col px-5 mobile-safe-sheet-top mobile-safe-bottom overflow-y-auto">
+      <div id="mobileSheetScroll" class="sheet-modal${noAnimCls} ambient-surface fixed inset-0 z-30 flex flex-col px-5 mobile-safe-sheet-top mobile-safe-bottom overflow-y-auto">
         <div class="flex items-center justify-between gap-2 pb-4">
           <button data-action="close-mobile-sheet" aria-label="Minimize Player" class="btn-press p-2 rounded-full hover:bg-white/10 text-white">
             ${ICON_CHEVRON('down', 20)}
@@ -7114,10 +7118,10 @@ class AudiobookApp {
     const activeBookmarks = activeBook ? this.state.bookmarksByBook[activeBook.bookKey] || [] : [];
 
     return `
-      <div class="h-screen flex flex-col overflow-hidden">
+      <div class="app-viewport-shell flex flex-col overflow-hidden">
         <div class="flex-1 flex gap-2 p-2 min-h-0 overflow-hidden">
           <!-- Left Collapsible Library Sidebar -->
-          <aside class="${sidebarCollapsed ? 'w-[72px]' : 'w-64 lg:w-72'} shrink-0 surface-panel rounded-2xl flex flex-col overflow-hidden transition-all duration-300">
+          <aside class="${sidebarCollapsed ? 'w-[72px]' : 'w-52 lg:w-64 xl:w-72'} shrink-0 surface-panel rounded-2xl flex flex-col overflow-hidden transition-all duration-300">
             <div class="p-3 space-y-2 border-b border-[var(--border-subtle)]">
               <div class="flex items-center ${sidebarCollapsed ? 'justify-center' : 'gap-2.5 px-2.5'} py-1">
                 <img src="./public/icon-192.png" alt="" class="app-brand-icon" style="width:22px;height:22px;border-radius:6px;object-fit:cover;flex-shrink:0;" />
@@ -7245,7 +7249,7 @@ class AudiobookApp {
             rightPanelOpen
               ? activeBook
                 ? `
-          <aside class="hidden lg:flex w-80 shrink-0 surface-panel rounded-2xl flex-col overflow-hidden">
+          <aside id="desktopNowPlayingPanel" class="desktop-now-playing-panel flex w-64 lg:w-72 xl:w-80 shrink-0 surface-panel rounded-2xl flex-col overflow-hidden">
             <div class="px-4 py-3 border-b border-[var(--border-subtle)] flex items-center justify-between gap-2">
               <span class="text-xs font-bold uppercase tracking-wider text-[var(--text-secondary)] truncate">Now Playing</span>
               <button data-action="toggle-right-panel" aria-label="Close Panel" class="btn-press p-1 rounded-lg hover:bg-white/10 text-[var(--text-secondary)]">${ICON_CLOSE(15)}</button>
@@ -7304,7 +7308,7 @@ class AudiobookApp {
             </div>
           </aside>`
                 : `
-          <aside class="hidden lg:flex w-80 shrink-0 surface-panel rounded-2xl flex-col overflow-hidden">
+          <aside id="desktopNowPlayingPanel" class="desktop-now-playing-panel flex w-64 lg:w-72 xl:w-80 shrink-0 surface-panel rounded-2xl flex-col overflow-hidden">
             <div class="px-4 py-3 border-b border-[var(--border-subtle)] flex items-center justify-between gap-2">
               <span class="text-xs font-bold uppercase tracking-wider text-[var(--text-secondary)] truncate">Now Playing</span>
               <button data-action="toggle-right-panel" aria-label="Close Panel" class="btn-press p-1 rounded-lg hover:bg-white/10 text-[var(--text-secondary)]">${ICON_CLOSE(15)}</button>
@@ -7327,8 +7331,8 @@ class AudiobookApp {
         ${
           activeBook
             ? `
-        <footer class="h-20 shrink-0 px-4 border-t border-[var(--border-subtle)] bg-[var(--bg-canvas)] flex items-center justify-between gap-4">
-          <div class="flex items-center gap-3 w-64 lg:w-72 min-w-0">
+        <footer id="desktopTransportBar" class="desktop-transport-bar h-20 shrink-0 px-4 border-t border-[var(--border-subtle)] bg-[var(--bg-canvas)] flex items-center justify-between gap-3 lg:gap-4">
+          <div class="flex items-center gap-3 w-48 lg:w-64 xl:w-72 min-w-0">
             <button data-action="open-detail" data-book="${escapeHtml(activeBook.bookKey)}" class="w-12 h-12 rounded-lg overflow-hidden shrink-0">
               ${this._renderCoverImg(activeBook)}
             </button>
@@ -7355,7 +7359,7 @@ class AudiobookApp {
             </div>
           </div>
 
-          <div class="hidden md:flex items-center justify-end gap-2 w-80 lg:w-[26rem] shrink-0">
+          <div class="hidden md:flex items-center justify-end gap-2 shrink-0">
             ${this._renderVolumeControl({ compact: true })}
             <button data-action="cycle-speed" class="btn-press px-2.5 py-1 rounded-full surface-card text-xs font-semibold text-white tabular-nums">${formatPlaybackRate(snap.playbackRate)}</button>
             <button data-action="cycle-sleep" class="btn-press inline-flex items-center gap-1 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white">
@@ -7369,8 +7373,8 @@ class AudiobookApp {
           </div>
         </footer>`
             : `
-        <footer class="h-20 shrink-0 px-4 border-t border-[var(--border-subtle)] bg-[var(--bg-canvas)] flex items-center justify-between gap-4">
-          <div class="flex items-center gap-3 w-64 lg:w-72 min-w-0">
+        <footer id="desktopTransportBar" class="desktop-transport-bar h-20 shrink-0 px-4 border-t border-[var(--border-subtle)] bg-[var(--bg-canvas)] flex items-center justify-between gap-3 lg:gap-4">
+          <div class="flex items-center gap-3 w-48 lg:w-64 xl:w-72 min-w-0">
             <div class="w-12 h-12 rounded-lg bg-white/5 border border-[var(--border-subtle)] flex items-center justify-center text-[var(--text-muted)] shrink-0">
               ${ICON_LIBRARY(18)}
             </div>
@@ -7395,7 +7399,7 @@ class AudiobookApp {
             </div>
           </div>
 
-          <div class="hidden md:flex items-center justify-end gap-2 w-80 lg:w-[26rem] shrink-0">
+          <div class="hidden md:flex items-center justify-end gap-2 shrink-0">
             ${this._renderVolumeControl({ compact: true })}
             <button data-action="cycle-speed" class="btn-press px-2.5 py-1 rounded-full surface-card text-xs font-semibold text-white tabular-nums">${formatPlaybackRate(snap.playbackRate)}</button>
             <button data-action="cycle-device" class="btn-press inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full surface-card text-xs text-[var(--text-secondary)] hover:text-white max-w-[120px]">
@@ -7918,7 +7922,7 @@ class AudiobookApp {
     }
 
     this.rootEl.innerHTML = `
-      <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
+      <div class="min-h-[100dvh] flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
         <div id="appMainLayer" class="flex-1 flex flex-col min-h-0"></div>
         <div id="appOverlayProfile"></div>
         <div id="appOverlaySettings"></div>
@@ -8233,7 +8237,7 @@ class AudiobookApp {
           ? this._renderAuthRestoringView()
           : this._renderLoginView();
         this.rootEl.innerHTML = `
-          <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
+          <div class="min-h-[100dvh] flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
             ${unauthView}
             ${this._renderWipeSyncedModal()}
             ${this._renderStatusToast()}
@@ -8256,7 +8260,7 @@ class AudiobookApp {
               ? this._renderAndroidMobileView(activeBook, snap)
               : this._renderDesktopView(activeBook, snap);
       this.rootEl.innerHTML = `
-        <div class="min-h-screen flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
+        <div class="min-h-[100dvh] flex flex-col bg-[var(--bg-canvas)] text-[var(--text-primary)]">
           ${bodyView}
           ${this._renderProfilePopover()}
           ${this._renderSettingsModal()}
@@ -8846,12 +8850,12 @@ class AudiobookApp {
           }
           case 'toggle-sidebar': {
             this.state.sidebarCollapsed = !this.state.sidebarCollapsed;
-            this._runWithViewTransition(() => this.render());
+            this.render();
             break;
           }
           case 'toggle-right-panel': {
             this.state.rightPanelOpen = !this.state.rightPanelOpen;
-            this._runWithViewTransition(() => this.render());
+            this.render();
             break;
           }
           case 'toggle-shade': {

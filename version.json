@@ -1,12 +1,12 @@
 {
-  "version": "1.0.23",
-  "build": 24,
+  "version": "1.0.24",
+  "build": 25,
   "minNativeBuild": 24,
   "channel": "stable",
-  "publishedAt": "2026-11-22T02:35:00Z",
+  "publishedAt": "2026-11-23T22:15:00Z",
   "manifestUrl": "https://api.github.com/repos/larxe1/Audiobook-Player/releases/latest",
   "apkDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.apk",
   "exeDownloadUrl": "https://github.com/larxe1/Audiobook-Player/releases/latest/download/Audiobook-Player.exe",
   "otaBundleUrl": "https://larxe1.github.io/Audiobook-Player/",
-  "releaseNotes": "Removed update lockout, added background download with restart prompt for Windows and Web updates, and switched Android APK updates to Obtainium and GitHub Releases."
+  "releaseNotes": "Keep the Now Playing panel and mini-player bar visible across all Windows desktop window sizes and Android viewports."
 }

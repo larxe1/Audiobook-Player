@@ -16,8 +16,8 @@ test('version.json matches LOCAL_VERSION, LOCAL_BUILD, GitHub Releases manifestU
   const raw = await readFile(new URL('../version.json', import.meta.url), 'utf8');
   assert.equal(raw.charCodeAt(0) === 0xfeff, false, 'version.json must not have UTF-8 BOM');
   const data = JSON.parse(raw);
-  assert.equal(LOCAL_VERSION, '1.0.23');
-  assert.equal(LOCAL_BUILD, 24);
+  assert.equal(LOCAL_VERSION, '1.0.24');
+  assert.equal(LOCAL_BUILD, 25);
   assert.equal(data.version, LOCAL_VERSION);
   assert.equal(data.build, LOCAL_BUILD);
   assert.equal(data.channel, 'stable');
